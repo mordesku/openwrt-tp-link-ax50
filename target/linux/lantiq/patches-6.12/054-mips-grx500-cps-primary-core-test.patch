@@ -1,0 +1,70 @@
+--- a/arch/mips/kernel/smp-cps.c
++++ b/arch/mips/kernel/smp-cps.c
+@@ -217,12 +217,25 @@
+ 	mips_mt_set_cpuoptions();
+ 
+-	if (!core_entry_reg) {
++	if (!core_entry_reg && !IS_ENABLED(CONFIG_SOC_GRX500)) {
+ 		pr_err("core_entry address unsuitable, disabling smp-cps\n");
+ 		goto err_out;
+ 	}
+ 
++#ifdef CONFIG_SOC_GRX500
++	/* Hypothesis: sibling VPE startup needs boot config, not reset vectors.
++	 * Restrict both masks and the boot callback: never reset another core.
++	 */
++	for_each_possible_cpu(c) {
++		if (cpus_are_siblings(0, c))
++			continue;
++		set_cpu_present(c, false);
++		set_cpu_possible(c, false);
++	}
++	pr_info("GRX500 CPS: primary-core-only test; reset vectors unused\n");
++#endif
++
+ 	/* Detect whether the CCA is unsuited to multi-core SMP */
+ 	cca = read_c0_config() & CONF_CM_CMASK;
+ 	switch (cca) {
+ 	case 0x4: /* CWBE */
+ 	case 0x5: /* CWB */
+@@ -253,7 +266,8 @@
+ 			(cca_unsuitable && cpu_has_dc_aliases) ? " & " : "",
+ 			cpu_has_dc_aliases ? "dcache aliasing" : "");
+ 
+-	setup_cps_vecs();
++	if (!IS_ENABLED(CONFIG_SOC_GRX500))
++		setup_cps_vecs();
+ 
+ 	/* Allocate core boot configuration structs */
+ 	ncores = mips_cps_numcores(0);
+@@ -386,11 +400,28 @@
+ 	unsigned core = cpu_core(&cpu_data[cpu]);
+ 	unsigned vpe_id = cpu_vpe_id(&cpu_data[cpu]);
+-	struct core_boot_config *core_cfg = &mips_cps_core_bootcfg[core];
+-	struct vpe_boot_config *vpe_cfg = &core_cfg->vpe_config[vpe_id];
++	struct core_boot_config *core_cfg;
++	struct vpe_boot_config *vpe_cfg;
+ 	unsigned int remote;
+ 	int err;
+ 
++	if (IS_ENABLED(CONFIG_SOC_GRX500) && !cpus_are_siblings(cpu, 0)) {
++		pr_err("GRX500 CPS: refusing CPU%d outside the primary core\n", cpu);
++		return -EPERM;
++	}
++	if (!mips_cps_core_bootcfg) {
++		pr_err("CPS: refusing CPU%d without boot configuration\n", cpu);
++		return -ENODEV;
++	}
++	core_cfg = &mips_cps_core_bootcfg[core];
++	if (!core_cfg->vpe_config)
++		return -ENODEV;
++	vpe_cfg = &core_cfg->vpe_config[vpe_id];
++	if (IS_ENABLED(CONFIG_SOC_GRX500))
++		pr_info("GRX500 CPS: booting CPU%d core=%u VPE=%u pc=%lx sp=%lx gp=%lx\n",
++			cpu, core, vpe_id, (unsigned long)&smp_bootstrap,
++			__KSTK_TOS(idle), (unsigned long)task_thread_info(idle));
++
+ 	/* We don't yet support booting CPUs in other clusters */
+ 	if (cpu_cluster(&cpu_data[cpu]) != cpu_cluster(&raw_current_cpu_data))
+ 		return -ENOSYS;
+ 
