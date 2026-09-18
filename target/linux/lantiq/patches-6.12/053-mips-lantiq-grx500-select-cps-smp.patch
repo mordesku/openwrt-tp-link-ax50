@@ -1,0 +1,40 @@
+--- a/arch/mips/lantiq/prom.c
++++ b/arch/mips/lantiq/prom.c
+@@ -12,6 +12,8 @@
+ #include <asm/bootinfo.h>
+ #include <asm/time.h>
+ #include <asm/prom.h>
++#include <asm/mips-cps.h>
++#include <asm/mips-cm.h>
+ 
+ #include <lantiq.h>
+ 
+@@ -107,6 +109,28 @@
+ 	pr_info("SoC: %s\n", soc_info.sys_type);
+ 	prom_init_cmdline();
+ 
++#ifdef CONFIG_SOC_GRX500
++	/* Hypothesis: local-core VSMP is not the GRX500 cluster boot model.
++	 * Test upstream CPS explicitly; never hide failure with VSMP fallback.
++	 */
++	{
++		int ret;
++
++		if (!mips_cm_present())
++			panic("GRX500 SMP: CPS test requires CM");
++		pr_info("GRX500 SMP: CM config=%016llx GIC status=%08x CPC status=%08x CPC base=%016llx\n",
++			(unsigned long long)read_gcr_config(), read_gcr_gic_status(),
++			read_gcr_cpc_status(), (unsigned long long)read_gcr_cpc_base());
++		ret = mips_cpc_probe();
++		pr_info("GRX500 SMP: CPC probe=%d present=%u\n",
++			ret, !!mips_cpc_present());
++		ret = register_cps_smp_ops();
++		if (ret)
++			panic("GRX500 SMP: CPS registration failed (%d)", ret);
++		pr_info("GRX500 SMP: selected CPS (VSMP fallback disabled)\n");
++		return;
++	}
++#endif
+ #if defined(CONFIG_MIPS_MT_SMP)
+ 	lantiq_smp_ops = vsmp_smp_ops;
+ 	if (cpu_has_mipsmt)

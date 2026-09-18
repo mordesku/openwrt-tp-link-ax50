@@ -31,6 +31,12 @@
 
 #define COMP_GRX500	"lantiq,grx500"
 
+/* Vendor GRX500 lantiq_soc.h: CPC_BASE_ADDR. Used only if CPC is disabled. */
+phys_addr_t mips_cpc_default_phys_base(void)
+{
+	return 0x12310000;
+}
+
 #define PART_SHIFT	12
 #define PART_MASK	0x0FFFFFFF
 #define REV_SHIFT	28
