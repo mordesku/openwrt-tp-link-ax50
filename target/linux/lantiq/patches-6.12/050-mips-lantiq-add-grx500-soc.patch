@@ -1,0 +1,41 @@
+--- a/arch/mips/lantiq/Kconfig
++++ b/arch/mips/lantiq/Kconfig
+@@ -28,6 +28,18 @@
+ 	bool "FALCON"
+ 	select PINCTRL_FALCON
+ 
++config SOC_GRX500
++	bool "GRX500"
++	select HAVE_PCI
++	select ARCH_HAS_RESET_CONTROLLER
++	select RESET_CONTROLLER
++	select MIPS_GIC
++	select CLKSRC_MIPS_GIC
++	select SYS_SUPPORTS_MIPS_CM
++	select SYS_SUPPORTS_MIPS_CPS
++	select MIPS_CPS
++	select MIPS_CPU_SCACHE
++
+ endchoice
+ 
+ choice
+--- a/arch/mips/lantiq/Makefile
++++ b/arch/mips/lantiq/Makefile
+@@ -5,6 +5,9 @@
+-obj-y := irq.o clk.o prom.o
++obj-y := clk.o prom.o
++obj-$(CONFIG_SOC_TYPE_XWAY) += irq.o
++obj-$(CONFIG_SOC_FALCON) += irq.o
+ 
+ obj-$(CONFIG_EARLY_PRINTK) += early_printk.o
+ 
+ obj-$(CONFIG_SOC_TYPE_XWAY) += xway/
+ obj-$(CONFIG_SOC_FALCON) += falcon/
++obj-$(CONFIG_SOC_GRX500) += grx500/
+--- a/arch/mips/lantiq/Platform
++++ b/arch/mips/lantiq/Platform
+@@ -7,2 +7,3 @@
+ cflags-$(CONFIG_SOC_TYPE_XWAY)	+= -I$(srctree)/arch/mips/include/asm/mach-lantiq/xway
+ cflags-$(CONFIG_SOC_FALCON)	+= -I$(srctree)/arch/mips/include/asm/mach-lantiq/falcon
++cflags-$(CONFIG_SOC_GRX500)	+= -I$(srctree)/arch/mips/include/asm/mach-lantiq/grx500
+
