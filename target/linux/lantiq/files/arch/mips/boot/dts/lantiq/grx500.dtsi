@@ -111,7 +111,7 @@
 			lantiq,clkout = <23>;
 		};
 
-		pcie2: pcie@E00000 {
+		pcie2: pcie@e00000 {
 			status = "disabled";
 			compatible = "lantiq,pcie-xrx500";
 			#address-cells = <3>;
@@ -152,7 +152,7 @@
 		reg = <0x16000000 0x2000000>;
 		ranges = <0x0 0x16000000 0x02000000>;
 
-		rcu0: reset-controller@0000000 {
+		rcu0: reset-controller@0 {
 			compatible = "lantiq,rcu-grx500", "lantiq,rcu-xrx500";
 			reg = <0x000000 0x80000>;
 			#reset-cells = <1>;
@@ -161,6 +161,13 @@
 		cgu0: cgu@200000 {
 			compatible = "lantiq,cgu-grx500", "lantiq,cgu-xrx500";
 			reg = <0x200000 0x100000>;
+		};
+
+		ebu0: ebu@f00000 {
+			compatible = "lantiq,ebu-grx500", "lantiq,ebu-xrx500";
+			reg = <0xf00000 0x100000>,
+			      <0x1000000 0x100000>;
+			reg-names = "ebunand_reg", "hsnand_reg";
 		};
 
 		asc0: serial@600000 {
