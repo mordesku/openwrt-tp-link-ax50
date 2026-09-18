@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include <dt-bindings/interrupt-controller/mips-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
 / {
 	#address-cells = <1>;
 	#size-cells = <1>;
@@ -180,14 +182,19 @@
 			compatible = "lantiq,asc";
 			reg = <0x600000 0x100000>;
 			interrupt-parent = <&gic>;
-			interrupts = <111 113 114>;
+			/* Vendor Linux IRQs 111/113/114 minus MIPS_GIC_IRQ_BASE=8. */
+			interrupts = <GIC_SHARED 103 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 105 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 106 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
 		asc1: serial@700000 {
 			compatible = "lantiq,asc";
 			reg = <0x700000 0x100000>;
 			interrupt-parent = <&gic>;
-			interrupts = <84 86 87>;
+			interrupts = <GIC_SHARED 76 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 78 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 79 IRQ_TYPE_LEVEL_HIGH>;
 			status = "disabled";
 		};
 	};
@@ -200,7 +207,7 @@
 		ranges = <0x0 0x12000000 0x02000000>;
 
 		gic: gic@320000 {
-			#interrupt-cells = <1>;
+			#interrupt-cells = <3>;
 			interrupt-controller;
 			compatible = "lantiq,gic-grx500", "mti,gic";
 			reg = <0x320000 0x20000>;
