@@ -10,7 +10,10 @@
 #include <linux/io.h>
 #include <linux/export.h>
 #include <linux/irqchip.h>
+#include <linux/of.h>
 #include <asm/bootinfo.h>
+#include <asm/irq.h>
+#include <asm/irq_cpu.h>
 #include <asm/time.h>
 #include <asm/mips-cps.h>
 #include <asm/mips-gic.h>
@@ -73,13 +76,36 @@ void __init ltq_soc_detect(struct ltq_soc_info *i)
 	}
 }
 
+unsigned int get_c0_compare_int(void)
+{
+	if (mips_gic_present())
+		return gic_get_c0_compare_int();
+
+	return MIPS_CPU_IRQ_BASE + cp0_compare_irq;
+}
+EXPORT_SYMBOL_GPL(get_c0_compare_int);
+
 int get_c0_perfcount_int(void)
 {
-	return gic_get_c0_perfcount_int();
+	if (mips_gic_present())
+		return gic_get_c0_perfcount_int();
+
+	if (cp0_perfcount_irq < 0)
+		return -1;
+
+	return MIPS_CPU_IRQ_BASE + cp0_perfcount_irq;
 }
 EXPORT_SYMBOL_GPL(get_c0_perfcount_int);
 
 void __init arch_init_irq(void)
 {
+	struct device_node *intc_node;
+
+	intc_node = of_find_compatible_node(NULL, NULL,
+					    "mti,cpu-interrupt-controller");
+	if (!cpu_has_veic && !intc_node)
+		mips_cpu_irq_init();
+	of_node_put(intc_node);
+
 	irqchip_init();
 }

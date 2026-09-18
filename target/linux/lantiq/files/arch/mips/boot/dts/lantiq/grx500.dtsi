@@ -38,6 +38,12 @@
 		};
 	};
 
+	cpu_intc: interrupt-controller {
+		compatible = "mti,cpu-interrupt-controller";
+		interrupt-controller;
+		#interrupt-cells = <1>;
+	};
+
 	ssx3@18000000 {
 		#address-cells = <1>;
 		#size-cells = <1>;
@@ -198,6 +204,7 @@
 			interrupt-controller;
 			compatible = "lantiq,gic-grx500", "mti,gic";
 			reg = <0x320000 0x20000>;
+			interrupt-parent = <&cpu_intc>;
 		};
 	};
 };
