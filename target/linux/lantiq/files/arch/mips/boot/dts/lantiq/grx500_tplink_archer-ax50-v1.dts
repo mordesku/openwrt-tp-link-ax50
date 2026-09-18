@@ -19,6 +19,29 @@
 		device_type = "memory";
 		reg = <0x20000000 0x0e000000>; /* Vendor DDR base; retain conservative 224 MiB test size. */
 	};
+
+	/* Vendor VMB CPU_LAUNCH=0xa0000000 maps to DDR 0x20000000.
+	 * Four 176-byte mailbox slots fit in one page. Keep them out of the
+	 * Linux allocator; retain the direct map for uncached diagnostics.
+	 */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		vmb-mailbox@20000000 {
+			reg = <0x20000000 0x1000>;
+		};
+
+		/* Vendor bootmem implicitly retains RAM below kernel _text.
+		 * SPL/IBL begins at a0001000; kernel load starts at a0020000.
+		 * Hypothesis: retain this complete pre-kernel firmware window,
+		 * not just its mailbox. This does not assert an exact IBL size.
+		 */
+		ibl-firmware@20001000 {
+			reg = <0x20001000 0x1f000>;
+		};
+	};
 };
 
 &asc0 {

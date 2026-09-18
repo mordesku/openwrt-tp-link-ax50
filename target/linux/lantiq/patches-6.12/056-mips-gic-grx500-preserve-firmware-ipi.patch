@@ -1,0 +1,16 @@
+--- a/drivers/irqchip/irq-mips-gic.c
++++ b/drivers/irqchip/irq-mips-gic.c
+@@ -817,6 +817,13 @@
+ 
+ 	/* Setup defaults */
+ 	for (i = 0; i < gic_shared_intrs; i++) {
++		/* GRX500 vendor irq-gic.c leaves these IBL/VMB channels intact.
++		 * Hypothesis: the boot firmware still needs its edge/IPI setup
++		 * while core1 awaits a mailbox handoff. Do not send a command.
++		 */
++		if (IS_ENABLED(CONFIG_SOC_GRX500) &&
++		    (i == 20 || i == 21 || i == 85))
++			continue;
+ 		change_gic_pol(i, GIC_POL_ACTIVE_HIGH);
+ 		change_gic_trig(i, GIC_TRIG_LEVEL);
+ 		write_gic_rmask(i);

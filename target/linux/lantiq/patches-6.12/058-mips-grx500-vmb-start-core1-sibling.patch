@@ -1,0 +1,24 @@
+--- a/arch/mips/kernel/smp-cps.c
++++ b/arch/mips/kernel/smp-cps.c
+@@ -478,3 +478,21 @@
+ 	preempt_disable();
+ 
++#ifdef CONFIG_SOC_GRX500
++	/* Hypothesis: CPU3 is still running IBL, not a halted CPS TC.
++	 * Use the same firmware handoff as CPU2; do not run remote_vpe_boot
++	 * against a firmware-owned VPE or force its TC into halt/reset.
++	 */
++	if (core == 1) {
++		if (!grx500_vmb_enabled || (cpu != 2 && cpu != 3) ||
++		    (cpu == 3 && !cpu_online(2)))
++			err = -ENODEV;
++		else {
++			pr_info("GRX500 CPS: CPU%d using firmware VMB handoff\n", cpu);
++			err = grx500_vmb_launch(cpu, vpe_cfg->pc,
++					vpe_cfg->sp, vpe_cfg->gp);
++		}
++		preempt_enable();
++		return err;
++	}
++#endif
+ 	if (!test_bit(core, core_power)) {
