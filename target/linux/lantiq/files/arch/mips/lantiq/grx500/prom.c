@@ -16,7 +16,10 @@
 #include <asm/irq_cpu.h>
 #include <asm/time.h>
 #include <asm/mips-cps.h>
+#include <asm/mips-cm.h>
 #include <asm/mips-gic.h>
+#include <asm/traps.h>
+#include <asm/mipsregs.h>
 
 #include <lantiq_soc.h>
 
@@ -33,9 +36,61 @@
 #define REV_MASK	0x70000000
 
 
+static const char * const grx500_cm_causes[32] = {
+	"None", "GC_WR_ERR", "GC_RD_ERR", "COH_WR_ERR",
+	"COH_RD_ERR", "MMIO_WR_ERR", "MMIO_RD_ERR", "0x07",
+	"0x08", "0x09", "0x0a", "0x0b",
+	"0x0c", "0x0d", "0x0e", "0x0f",
+	"0x10", "0x11", "0x12", "0x13",
+	"0x14", "0x15", "0x16", "INTVN_WR_ERR",
+	"INTVN_RD_ERR", "0x19", "0x1a", "0x1b",
+	"0x1c", "0x1d", "0x1e", "0x1f"
+};
+
+static int grx500_be_handler(struct pt_regs *regs, int is_fixup)
+{
+	int retval = is_fixup ? MIPS_BE_FIXUP : MIPS_BE_FATAL;
+
+	if (mips_cm_present()) {
+		unsigned long cm_error = read_gcr_error_cause();
+		unsigned long cm_addr = read_gcr_error_addr();
+		unsigned long cm_other = read_gcr_error_mult();
+		unsigned long cause = (cm_error >> 27) & 0x1f;
+		unsigned long cca = (cm_error >> 15) & 0x7;
+		unsigned long ocause = cm_other & 0x1f;
+
+		pr_err("==================== MIPS CM2 BUS ERROR ====================\n");
+		pr_err("CPU%d epc=%08lx badvaddr=%08lx is_fixup=%d\n",
+		       smp_processor_id(), regs->cp0_epc, regs->cp0_badvaddr, is_fixup);
+		pr_err("CM_ERROR_CAUSE: 0x%08lx [%s] (CCA=%lu)\n",
+		       cm_error, grx500_cm_causes[cause], cca);
+		pr_err("CM_ERROR_ADDR : 0x%08lx\n", cm_addr);
+		pr_err("CM_ERROR_MULT : 0x%08lx [%s]\n",
+		       cm_other, grx500_cm_causes[ocause]);
+		pr_err("============================================================\n");
+
+		write_gcr_error_cause(0);
+	} else {
+		pr_err("=== BUS ERROR: CM not present! CPU%d epc=%08lx badvaddr=%08lx ===\n",
+		       smp_processor_id(), regs->cp0_epc, regs->cp0_badvaddr);
+	}
+
+	return retval;
+}
+
 void __init ltq_soc_detect(struct ltq_soc_info *i)
 {
 	u32 chipid_raw = ltq_r32(LTQ_MPS_CHIPID);
+
+	mips_set_be_handler(grx500_be_handler);
+
+	/* Verify the assembly EVA setup before any TLB-backed allocations. */
+	pr_info("GRX500 EVA: Config0=%08x Config5=%08x\n",
+		read_c0_config(), read_c0_config5());
+	pr_info("GRX500 EVA: SegCtl0=%08x SegCtl1=%08x SegCtl2=%08x\n",
+		read_c0_segctl0(), read_c0_segctl1(), read_c0_segctl2());
+	pr_info("GRX500 EVA: PAGE_OFFSET=%08lx PHYS_OFFSET=%08lx\n",
+		(unsigned long)PAGE_OFFSET, (unsigned long)PHYS_OFFSET);
 
 	i->partnum = (chipid_raw & PART_MASK) >> PART_SHIFT;
 	i->rev = (chipid_raw & REV_MASK) >> REV_SHIFT;

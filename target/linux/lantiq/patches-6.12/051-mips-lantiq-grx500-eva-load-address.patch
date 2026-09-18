@@ -1,0 +1,10 @@
+--- a/arch/mips/lantiq/Platform
++++ b/arch/mips/lantiq/Platform
+@@ -4,3 +4,7 @@
+ cflags-$(CONFIG_LANTIQ)		+= -I$(srctree)/arch/mips/include/asm/mach-lantiq
++ifeq ($(CONFIG_SOC_GRX500),y)
++load-$(CONFIG_LANTIQ)		= 0xffffffff60020000
++else
+ load-$(CONFIG_LANTIQ)		= 0xffffffff80002000
++endif
+ cflags-$(CONFIG_SOC_TYPE_XWAY)	+= -I$(srctree)/arch/mips/include/asm/mach-lantiq/xway

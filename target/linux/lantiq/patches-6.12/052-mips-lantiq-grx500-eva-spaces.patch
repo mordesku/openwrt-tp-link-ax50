@@ -1,0 +1,12 @@
+--- a/arch/mips/include/asm/mach-lantiq/spaces.h
++++ b/arch/mips/include/asm/mach-lantiq/spaces.h
+@@ -4,5 +4,9 @@
+ 
+ #define IO_SPACE_LIMIT  0xffffffff
+ 
++#ifdef CONFIG_SOC_GRX500
++#include <asm/mach-lantiq/grx500/spaces.h>
++#else
+ #include <asm/mach-generic/spaces.h>
++#endif
+ #endif

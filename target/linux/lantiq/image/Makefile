@@ -8,6 +8,12 @@
 KERNEL_LOADADDR = 0x80002000
 KERNEL_ENTRY = 0x80002000
 
+ifeq ($(SUBTARGET),xrx500)
+# Vendor-compatible uncached bootstrap alias; kernel links at 0x60020000.
+KERNEL_LOADADDR = 0xa0020000
+KERNEL_ENTRY = 0xa0020000
+endif
+
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/image.mk
 

@@ -1,11 +1,12 @@
 --- a/arch/mips/lantiq/Kconfig
 +++ b/arch/mips/lantiq/Kconfig
-@@ -28,6 +28,18 @@
+@@ -28,6 +28,19 @@
  	bool "FALCON"
  	select PINCTRL_FALCON
  
 +config SOC_GRX500
 +	bool "GRX500"
++	select EVA
 +	select HAVE_PCI
 +	select ARCH_HAS_RESET_CONTROLLER
 +	select RESET_CONTROLLER
@@ -38,4 +39,3 @@
  cflags-$(CONFIG_SOC_TYPE_XWAY)	+= -I$(srctree)/arch/mips/include/asm/mach-lantiq/xway
  cflags-$(CONFIG_SOC_FALCON)	+= -I$(srctree)/arch/mips/include/asm/mach-lantiq/falcon
 +cflags-$(CONFIG_SOC_GRX500)	+= -I$(srctree)/arch/mips/include/asm/mach-lantiq/grx500
-
