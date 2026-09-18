@@ -1,0 +1,31 @@
+--- a/arch/mips/kernel/smp-cps.c
++++ b/arch/mips/kernel/smp-cps.c
+@@ -216,6 +216,28 @@
+ 
+ 	mips_mt_set_cpuoptions();
+ 
++#ifdef CONFIG_SOC_GRX500
++	/* Hypothesis: CM2 BEV overlay and early MMIO translation must both
++	 * survive a DDR reset trampoline. Read configuration before any reset;
++	 * retain the hardware-tested primary-core-only startup restriction.
++	 */
++	pr_info("GRX500 CPS reset-map: GCR=%px CPC=%px vector_pa=%pa reset_pc=%08x\n",
++		mips_gcr_base, mips_cpc_base, &cps_vec_pa, core_entry_reg);
++	for (c = 0; c < mips_cps_numcores(0); c++) {
++		mips_cm_lock_other(0, c, 0, CM_GCR_Cx_OTHER_BLOCK_LOCAL);
++		pr_info("GRX500 CPS reset-map: core=%u reset_base=%08x reset_ext=%08x coherence=%08x\n",
++			c, read_gcr_co_reset_base(), read_gcr_co_reset_ext_base(),
++			read_gcr_co_coherence());
++		if (mips_cpc_present()) {
++			mips_cpc_lock_other(c);
++			pr_info("GRX500 CPS reset-map: core=%u CPC_STAT_CONF=%08x\n",
++				c, read_cpc_co_stat_conf());
++			mips_cpc_unlock_other();
++		}
++		mips_cm_unlock_other();
++	}
++#endif
++
+ 	if (!core_entry_reg && !IS_ENABLED(CONFIG_SOC_GRX500)) {
+ 		pr_err("core_entry address unsuitable, disabling smp-cps\n");
+ 		goto err_out;
