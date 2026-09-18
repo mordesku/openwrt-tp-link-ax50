@@ -11,6 +11,7 @@
 #include <linux/export.h>
 #include <linux/irqchip.h>
 #include <linux/of.h>
+#include <linux/smp.h>
 #include <asm/bootinfo.h>
 #include <asm/irq.h>
 #include <asm/irq_cpu.h>
@@ -46,6 +47,21 @@ static const char * const grx500_cm_causes[32] = {
 	"INTVN_RD_ERR", "0x19", "0x1a", "0x1b",
 	"0x1c", "0x1d", "0x1e", "0x1f"
 };
+
+/* Hypothesis: all online VPEs must inherit the same vendor EVA map. */
+static void grx500_log_cpu_eva(void *unused)
+{
+	pr_info("GRX500 EVA CPU%u: Config0=%08x Config5=%08x SegCtl0=%08x SegCtl1=%08x SegCtl2=%08x\n",
+		smp_processor_id(), read_c0_config(), read_c0_config5(),
+		read_c0_segctl0(), read_c0_segctl1(), read_c0_segctl2());
+}
+
+static int __init grx500_check_online_eva(void)
+{
+	on_each_cpu(grx500_log_cpu_eva, NULL, 1);
+	return 0;
+}
+late_initcall(grx500_check_online_eva);
 
 static int grx500_be_handler(struct pt_regs *regs, int is_fixup)
 {

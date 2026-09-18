@@ -12,7 +12,6 @@
 	};
 
 	chosen {
-		bootargs = "console=ttyLTQ0,115200 earlycon cca=5 maxcpus=1";
 		stdout-path = "serial0:115200n8";
 	};
 
