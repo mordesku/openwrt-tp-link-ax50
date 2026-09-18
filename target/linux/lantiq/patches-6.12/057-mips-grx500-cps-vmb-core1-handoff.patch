@@ -1,0 +1,51 @@
+--- a/arch/mips/kernel/smp-cps.c
++++ b/arch/mips/kernel/smp-cps.c
+@@ -43,1 +43,7 @@
+ struct core_boot_config *mips_cps_core_bootcfg;
++#ifdef CONFIG_SOC_GRX500
++extern bool grx500_vmb_ready(unsigned int cpu);
++extern int grx500_vmb_launch(unsigned int cpu, unsigned long pc,
++			    unsigned long sp, unsigned long gp);
++#endif
++static bool grx500_vmb_enabled;
+@@ -250,2 +256,4 @@
+ 	for_each_possible_cpu(c) {
+-		if (cpus_are_siblings(0, c))
++		if (c == 0)
++			grx500_vmb_enabled = grx500_vmb_ready(2);
++		if (cpus_are_siblings(0, c) || grx500_vmb_enabled)
+@@ -258,1 +266,4 @@
+-	pr_info("GRX500 CPS: primary-core-only test; reset vectors unused\n");
++	pr_info("GRX500 CPS: %s; reset vectors unused\n",
++		grx500_vmb_enabled ? "core1 VMB handoff enabled" : "primary-core-only fallback");
++	/* Hypothesis: firmware owns core1's reset/EVA state; adopt via VMB,
++	 * then let an online CPU2 start its sibling through standard CPS. */
+@@ -431,1 +442,2 @@
+-	if (IS_ENABLED(CONFIG_SOC_GRX500) && !cpus_are_siblings(cpu, 0)) {
++	if (IS_ENABLED(CONFIG_SOC_GRX500) && !cpus_are_siblings(cpu, 0) &&
++	    !grx500_vmb_enabled) {
+@@ -465,2 +477,13 @@
+ 	if (!test_bit(core, core_power)) {
++#ifdef CONFIG_SOC_GRX500
++		if (core) {
++			if (core != 1 || vpe_id != 0 || !grx500_vmb_enabled)
++				err = -ENODEV;
++			else
++				err = grx500_vmb_launch(cpu, vpe_cfg->pc,
++					vpe_cfg->sp, vpe_cfg->gp);
++			preempt_enable();
++			return err;
++		}
++#endif
+ 		/* Boot a VPE on a powered down core */
+@@ -531,1 +554,10 @@
+ 	int core = cpu_core(&current_cpu_data);
++#ifdef CONFIG_SOC_GRX500
++	if (core && grx500_vmb_enabled) {
++		/* Only an executing Linux secondary may mark core1 adopted. */
++		set_bit(core, core_power);
++		pr_info("GRX500 VMB adopted: CPU%u core=%d coherence=%08x\n",
++			smp_processor_id(), core, read_gcr_cl_coherence());
++	}
++#endif
++
