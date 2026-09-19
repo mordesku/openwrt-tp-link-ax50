@@ -20,6 +20,20 @@
 		reg = <0x20000000 0x0e000000>; /* Vendor DDR base; retain conservative 224 MiB test size. */
 	};
 
+	/* Vendor boot log: CS1, parallel 8-bit NAND at 0x17c00000.
+	 * The first experiment exposes one read-only whole-chip MTD device;
+	 * no partition table, UBI attach or flash writes are requested.
+	 */
+	nand@17c00000 {
+		compatible = "lantiq,nand-xway";
+		reg = <0x17c00000 0x02000000>;
+		lantiq,cs = <1>;
+		nand-bus-width = <8>;
+		nand-ecc-mode = "soft_bch";
+		nand-ecc-strength = <4>;
+		nand-ecc-step-size = <512>;
+	};
+
 	/* Vendor VMB CPU_LAUNCH=0xa0000000 maps to DDR 0x20000000.
 	 * Four 176-byte mailbox slots fit in one page. Keep them out of the
 	 * Linux allocator; retain the direct map for uncached diagnostics.
