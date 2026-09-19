@@ -1,0 +1,58 @@
+--- a/drivers/mtd/nand/raw/Kconfig
++++ b/drivers/mtd/nand/raw/Kconfig
+@@ -311,7 +311,7 @@ config MTD_NAND_FSMC
+ config MTD_NAND_XWAY
+ 	bool "Lantiq XWAY NAND controller"
+-	depends on LANTIQ && SOC_TYPE_XWAY
++	depends on LANTIQ && (SOC_TYPE_XWAY || SOC_GRX500)
+ 	help
+ 	  Enables support for NAND Flash chips on Lantiq XWAY SoCs. NAND is attached
+ 	  to the External Bus Unit (EBU).
+
+--- a/drivers/mtd/nand/raw/xway_nand.c
++++ b/drivers/mtd/nand/raw/xway_nand.c
+@@ -165,6 +165,8 @@ static const struct nand_controller_ops
+ static int xway_nand_probe(struct platform_device *pdev)
+ {
+ 	struct xway_nand_data *data;
++	struct resource *res;
++	bool grx500 = of_machine_is_compatible("lantiq,grx500");
+ 	struct mtd_info *mtd;
+ 	int err;
+ 	u32 cs;
+@@ -176,6 +178,11 @@ static int xway_nand_probe(struct pla
+ 	if (!data)
+ 		return -ENOMEM;
+ 
++	/* EBU ADDSEL needs the bus address, never the EVA ioremap alias. */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res || res->start > U32_MAX)
++		return -EINVAL;
++
+ 	data->nandaddr = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(data->nandaddr))
+ 		return PTR_ERR(data->nandaddr);
+@@ -207,5 +214,6 @@ static int xway_nand_probe(struct pla
+-	/* setup the EBU to run in NAND mode on our base addr */
+-	ltq_ebu_w32(CPHYSADDR(data->nandaddr)
+-		    | ADDSEL1_MASK(3) | ADDSEL1_REGEN, EBU_ADDSEL1);
++	/* Vendor GRX500 uses a 32 MiB CS1 window (mask 5), unlike XWAY. */
++	ltq_ebu_w32((u32)res->start |
++		    ADDSEL1_MASK(grx500 ? 5 : 3) | ADDSEL1_REGEN,
++		    EBU_ADDSEL1);
+ 
+ 	ltq_ebu_w32(BUSCON1_SETUP | BUSCON1_BCGEN_RES | BUSCON1_WAITWRC2
+@@ -228,4 +236,13 @@ static int xway_nand_probe(struct pla
+ 	if (err)
+ 		return err;
+ 
++	/* The AX50 RAM bring-up exposes NAND only for inspection. This must
++	 * remain before mtd_device_register(), including any partitions.
++	 * Do not enable writes until ECC and recovery are independently proven.
++	 */
++	if (of_machine_is_compatible("tplink,archer-ax50-v1")) {
++		mtd->flags &= ~MTD_WRITEABLE;
++		dev_info(&pdev->dev, "GRX500 NAND registered read-only for bring-up\n");
++	}
++
+ 	err = mtd_device_register(mtd, NULL, 0);
