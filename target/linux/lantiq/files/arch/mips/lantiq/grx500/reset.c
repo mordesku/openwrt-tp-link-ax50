@@ -327,6 +327,16 @@ void ltq_rst_init(void)
 		reset_controller_register(&reset_dev);
 }
 
+/* The vendor platform setup registered this provider before PHY drivers.
+ * The Linux 6.12 DT platform path no longer calls ltq_rst_init() itself.
+ */
+static int __init grx500_reset_controller_init(void)
+{
+	ltq_rst_init();
+	return 0;
+}
+arch_initcall(grx500_reset_controller_init);
+
 static void ltq_machine_restart(char *command)
 {
 	local_irq_disable();
