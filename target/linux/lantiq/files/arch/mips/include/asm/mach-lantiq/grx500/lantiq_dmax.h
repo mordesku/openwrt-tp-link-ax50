@@ -839,6 +839,8 @@ extern int ltq_dma_chan_desc_free(u32 chan);
  * \ref ltq_dma_chan_desc_free
  */
 extern int ltq_dma_chan_data_buf_alloc(u32 chan);
+extern int ltq_dma_chan_p2p_shared_buffer_cfg(u32 chan);
+extern int ltq_dma_chan_p2p_snapshot(u32 chan);
 
 /*!
  * \fn int ltq_dma_chan_data_buf_free(u32 chan)
@@ -1078,4 +1080,3 @@ extern int ltq_dma_chan_write(u32 chan, char *dataptr, int len, int sop,
 	int eop, void *opt);
 /* @ } */
 #endif /* LANTIQ_DMAX_H */
-

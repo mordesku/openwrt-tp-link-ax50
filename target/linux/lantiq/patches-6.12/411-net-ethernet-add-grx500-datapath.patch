@@ -1,0 +1,22 @@
+--- a/drivers/net/ethernet/Kconfig
++++ b/drivers/net/ethernet/Kconfig
+@@ -1,3 +1,11 @@
+ # SPDX-License-Identifier: GPL-2.0-only
++config GRX500_DATAPATH
++	tristate "GRX500 CBM/TMU packet path (bring-up)"
++	depends on LANTIQ && OF
++	help
++	  Provide the AX50 LAN1 netdevice through the GRX500 CBM/TMU packet
++	  path, with DMA, NAPI receive and read-only bring-up diagnostics.
++	  Other Ethernet ports are not exposed as netdevices yet.
++
+ #
+ # Ethernet device configuration
+ #
+--- a/drivers/net/ethernet/Makefile
++++ b/drivers/net/ethernet/Makefile
+@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_GRX500_DATAPATH) += grx500-datapath.o
+ #
+ # Makefile for the Linux network Ethernet device drivers.

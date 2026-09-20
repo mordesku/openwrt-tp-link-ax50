@@ -16,8 +16,12 @@
 #include <linux/clk.h>
 #include <linux/err.h>
 #include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/bitmap.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
+#include <linux/irqchip/chained_irq.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
@@ -1073,6 +1077,9 @@ static void dma_chan_global_buf_len_cfg(struct dmax_chan *ch, int data_len)
 static int dma_chan_desc_alloc(struct dmax_chan *pch, u32 desc_num)
 {
 	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
+	void *desc;
+	dma_addr_t desc_dma;
+	size_t desc_bytes;
 
 	if (desc_num == 0 || desc_num > DMA_MAX_DESC_NUM) {
 		dev_err(pctrl->dev,
@@ -1087,26 +1094,42 @@ static int dma_chan_desc_alloc(struct dmax_chan *pch, u32 desc_num)
 		return -EINVAL;
 	}
 
-	pch->desc_len = desc_num;
-
-	pch->desc_base = (u32)dma_alloc_coherent(pctrl->dev,
-				pch->desc_len * pctrl->desc_size,
-				&pch->desc_phys, GFP_DMA);
-	if (pch->desc_base == 0)
+	/* GRX500 EVA cannot dereference the CKSEG1-style virtual address
+	 * returned by dma_alloc_coherent(). Keep a normal CPU mapping and
+	 * explicitly synchronize the streaming descriptor mapping at each
+	 * ownership handoff. P2P channels only touch descriptors at startup
+	 * and after both DMA engines have stopped.
+	 */
+	desc_bytes = desc_num * pctrl->desc_size;
+	desc = kzalloc(desc_bytes, GFP_KERNEL | GFP_DMA);
+	if (!desc)
 		return -ENOMEM;
+	desc_dma = dma_map_single(pctrl->dev, desc, desc_bytes,
+				  DMA_BIDIRECTIONAL);
+	if (dma_mapping_error(pctrl->dev, desc_dma)) {
+		kfree(desc);
+		return -EIO;
+	}
+	pch->desc_len = desc_num;
+	pch->desc_base = (u32)desc;
+	pch->desc_phys = desc_dma;
 	dev_dbg(pctrl->dev,
 		"%s chan %d desc_base 0x%08x desc_phys 0x%08x\n",
 		dma_get_name_by_cid(pctrl->cid), pch->nr, pch->desc_base,
 		(u32)pch->desc_phys);
-	memset((void *)pch->desc_base, 0, pch->desc_len * pctrl->desc_size);
-
-	dma_chan_desc_hw_cfg(pch, pch->desc_phys, pch->desc_len);
 
 	/* Save opt address pointer */
 	pch->opt = (void **)devm_kzalloc(pctrl->dev,
 		pch->desc_len * sizeof(void *), GFP_KERNEL);
-	if (pch->opt == NULL)
+	if (pch->opt == NULL) {
+		dma_unmap_single(pctrl->dev, pch->desc_phys, desc_bytes,
+				 DMA_BIDIRECTIONAL);
+		kfree(desc);
+		pch->desc_base = 0;
+		pch->desc_len = 0;
 		return -ENOMEM;
+	}
+	dma_chan_desc_hw_cfg(pch, pch->desc_phys, pch->desc_len);
 	return 0;
 }
 
@@ -1129,8 +1152,9 @@ static void dma_chan_desc_free(struct dmax_chan *pch)
 
 	if (WARN_ON(!pch->desc_base))
 		return;
-	dma_free_coherent(pctrl->dev, pch->desc_len * pctrl->desc_size,
-		(void *)pch->desc_base, pch->desc_phys);
+	dma_unmap_single(pctrl->dev, pch->desc_phys,
+			 pch->desc_len * pctrl->desc_size, DMA_BIDIRECTIONAL);
+	kfree((void *)pch->desc_base);
 	pch->desc_base = 0;
 	pch->desc_len = 0;
 	pch->curr_desc = 0;
@@ -1159,6 +1183,8 @@ static int dma_rx_chan_data_buf_4dws_alloc(struct dmax_chan *pch)
 	char *buffer;
 	struct dma_rx_desc *rx_desc_p;
 	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
+	enum dma_data_direction direction = pch->p2p_shared_buffer ?
+		DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
 
 	for (i = 0; i < pch->desc_len; i++) {
 		rx_desc_p = (struct dma_rx_desc *)pch->desc_base + i;
@@ -1170,7 +1196,7 @@ static int dma_rx_chan_data_buf_4dws_alloc(struct dmax_chan *pch)
 			return -ENOMEM;
 		}
 		rx_desc_p->data_pointer = dma_map_single(pctrl->dev, buffer,
-			pch->pkt_size, DMA_FROM_DEVICE);
+			pch->pkt_size, direction);
 		if (dma_mapping_error(pctrl->dev, rx_desc_p->data_pointer)) {
 			dev_err(pctrl->dev,
 				"%s DMA map failed\n", __func__);
@@ -1377,14 +1403,77 @@ static int dma_chan_data_buf_alloc(struct dmax_chan *pch)
 		return dma_chan_data_buf_2dws_alloc(pch);
 }
 
-int ltq_dma_chan_data_buf_alloc(u32 chan)
+/* The RX-owned P2P ring is also read by the TX DMA controller. Configure
+ * the mapping direction before allocating its data buffers.
+ */
+int ltq_dma_chan_p2p_shared_buffer_cfg(u32 chan)
 {
 	struct dmax_chan *pch = dma_chan_l2p(chan);
 
+	if (IS_ERR_OR_NULL(pch) || !dma_chan_rx(pch) || !pch->desc_len)
+		return -EINVAL;
+	if (pch->p2p_shared_buffer)
+		return 0;
+	pch->p2p_shared_buffer = true;
+	return 0;
+}
+EXPORT_SYMBOL(ltq_dma_chan_p2p_shared_buffer_cfg);
+
+/* Inspect the stopped RX-owned P2P ring before its buffers are released.
+ * The P2P DMA uses the same descriptors from two controllers, so live proc
+ * reads without DMA synchronization can report stale completion and length.
+ * A post-stop frame sample distinguishes a valid switch/PMAC handoff from
+ * counters that merely advanced on the ingress side.
+ */
+int ltq_dma_chan_p2p_snapshot(u32 chan)
+{
+	struct dmax_chan *pch = dma_chan_l2p(chan);
+	struct dma_ctrl *pctrl;
+	struct dma_rx_desc *desc;
+	u8 *data;
+	int i;
+
+	if (!pch || !dma_chan_rx(pch) || !pch->p2p_shared_buffer ||
+	    !pch->desc_base || !pch->desc_len)
+		return -EINVAL;
+	if (pch->onoff)
+		return -EBUSY;
+	pctrl = dma_chan_get_controller(pch);
+	dma_sync_single_for_cpu(pctrl->dev, pch->desc_phys,
+				pch->desc_len * pctrl->desc_size,
+				DMA_BIDIRECTIONAL);
+	for (i = 0; i < pch->desc_len; i++) {
+		desc = (struct dma_rx_desc *)pch->desc_base + i;
+		if (!desc->data_pointer)
+			continue;
+		dma_sync_single_for_cpu(pctrl->dev, desc->data_pointer,
+					pch->pkt_size, DMA_BIDIRECTIONAL);
+		data = phys_to_virt(desc->data_pointer);
+		dev_info(pctrl->dev,
+			 "P2P RX chan %u desc %02d status=%08x data=%08x first32=%*phN\n",
+			 chan, i, desc->status.all, desc->data_pointer,
+			 32, data);
+	}
+	return 0;
+}
+EXPORT_SYMBOL(ltq_dma_chan_p2p_snapshot);
+
+int ltq_dma_chan_data_buf_alloc(u32 chan)
+{
+	struct dmax_chan *pch = dma_chan_l2p(chan);
+	struct dma_ctrl *pctrl;
+	int ret;
+
 	if (WARN_ON(!pch))
 		return -EINVAL;
-	dma_chan_data_buf_alloc(pch);
-	return 0;
+	ret = dma_chan_data_buf_alloc(pch);
+	if (!ret) {
+		pctrl = dma_chan_get_controller(pch);
+		dma_sync_single_for_device(pctrl->dev, pch->desc_phys,
+					   pch->desc_len * pctrl->desc_size,
+					   DMA_BIDIRECTIONAL);
+	}
+	return ret;
 }
 EXPORT_SYMBOL(ltq_dma_chan_data_buf_alloc);
 
@@ -1393,6 +1482,8 @@ static int dma_rx_chan_data_buf_4dws_free(struct dmax_chan *pch)
 	int i;
 	struct dma_rx_desc *rx_desc_p;
 	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
+	enum dma_data_direction direction = pch->p2p_shared_buffer ?
+		DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
 
 	for (i = 0; i < pch->desc_len; i++) {
 		rx_desc_p = (struct dma_rx_desc *)pch->desc_base + i;
@@ -1401,7 +1492,7 @@ static int dma_rx_chan_data_buf_4dws_free(struct dmax_chan *pch)
 			|| ((rx_desc_p->status.field.own == DMA_OWN)
 			&& rx_desc_p->status.field.data_len > 0)) {
 			dma_unmap_single(pctrl->dev, rx_desc_p->data_pointer,
-				pch->pkt_size, DMA_FROM_DEVICE);
+				pch->pkt_size, direction);
 			pch->free(__va(rx_desc_p->data_pointer),
 					(void *)pch->opt[i]);
 		}
@@ -1529,9 +1620,14 @@ static int dma_chan_data_buf_free(struct dmax_chan *pch)
 int ltq_dma_chan_data_buf_free(u32 chan)
 {
 	struct dmax_chan *pch = dma_chan_l2p(chan);
+	struct dma_ctrl *pctrl;
 
 	if (WARN_ON(!pch))
 		return -EINVAL;
+	pctrl = dma_chan_get_controller(pch);
+	dma_sync_single_for_cpu(pctrl->dev, pch->desc_phys,
+				pch->desc_len * pctrl->desc_size,
+				DMA_BIDIRECTIONAL);
 	dma_chan_data_buf_free(pch);
 	return 0;
 }
@@ -2560,15 +2656,16 @@ static void dma_mask_and_ack_irq(struct irq_data *d)
 	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
 }
 
-static void dma_irq_handler(unsigned int irq, struct irq_desc *desc)
+static void dma_irq_handler(struct irq_desc *desc)
 {
 	int offset;
 	unsigned long irncr;
 	unsigned long irncr1;
-	struct dma_ctrl *pctrl = irq_get_handler_data(irq);
+	struct dma_ctrl *pctrl = irq_desc_get_handler_data(desc);
 
 	if (unlikely(!pctrl))
 		return;
+	chained_irq_enter(irq_desc_get_chip(desc), desc);
 
 	irncr = ltq_dma_r32(pctrl, DMA_IRNCR);
 	if (pctrl->chans > 32)
@@ -2583,6 +2680,7 @@ static void dma_irq_handler(unsigned int irq, struct irq_desc *desc)
 		for_each_set_bit(offset, &irncr1, pctrl->chans - 32)
 			generic_handle_irq(pctrl->irq_base + 32 + offset);
 	}
+	chained_irq_exit(irq_desc_get_chip(desc), desc);
 }
 
 
@@ -2611,12 +2709,6 @@ static const struct irq_domain_ops dma_irq_domain_ops = {
 	.map = dma_irq_map,
 };
 
-static struct irqaction dma_cascade = {
-	.handler = no_action,
-	.flags = 0,
-	.name = "dma_cascade",
-};
-
 static void dma_irq_chip_init(struct dma_ctrl *pctrl)
 {
 	struct resource irqres;
@@ -2627,9 +2719,8 @@ static void dma_irq_chip_init(struct dma_ctrl *pctrl)
 		pctrl->chained_irq = irqres.start;
 		irq_domain_add_legacy(node, pctrl->chans, pctrl->irq_base, 0,
 					&dma_irq_domain_ops, pctrl);
-		setup_irq(irqres.start, &dma_cascade);
-		irq_set_handler_data(irqres.start, pctrl);
-		irq_set_chained_handler(irqres.start, dma_irq_handler);
+		irq_set_chained_handler_and_data(irqres.start,
+						 dma_irq_handler, pctrl);
 		/*
 		 * NB DMA3 TOE and Memcpy doesn't use controller irq but it re
 		 * direct to their individual module. channel level interrupt
@@ -2706,16 +2797,16 @@ static int dma_chan_reg_seq_open(struct inode *inode, struct file *file)
 
 	if (ret == 0) {
 		struct seq_file *m = file->private_data;
-		m->private = PDE_DATA(inode);
+		m->private = pde_data(inode);
 	}
 	return ret;
 }
 
-static const struct file_operations dma_chan_reg_proc_fops = {
-	.open = dma_chan_reg_seq_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = seq_release,
+static const struct proc_ops dma_chan_reg_proc_fops = {
+	.proc_open = dma_chan_reg_seq_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = seq_release,
 };
 
 static void *dma_chan_desc_seq_start(struct seq_file *s, loff_t *pos)
@@ -3119,16 +3210,16 @@ static int dma_chan_desc_seq_open(struct inode *inode, struct file *file)
 
 	if (!ret) {
 		struct seq_file *m = file->private_data;
-		m->private = PDE_DATA(inode);
+		m->private = pde_data(inode);
 	}
 	return ret;
 }
 
-static const struct file_operations dma_chan_desc_proc_fops = {
-	.open = dma_chan_desc_seq_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = seq_release,
+static const struct proc_ops dma_chan_desc_proc_fops = {
+	.proc_open = dma_chan_desc_seq_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = seq_release,
 };
 
 static int dma_ctrl_port_read_proc(struct seq_file *s, void *v)
@@ -3168,14 +3259,14 @@ static int dma_ctrl_port_read_proc(struct seq_file *s, void *v)
 
 static int dma_ctrl_port_read_proc_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, dma_ctrl_port_read_proc, PDE_DATA(inode));
+	return single_open(file, dma_ctrl_port_read_proc, pde_data(inode));
 }
 
-static const struct file_operations dma_ctrl_port_proc_fops = {
-	.open           = dma_ctrl_port_read_proc_open,
-	.read           = seq_read,
-	.llseek         = seq_lseek,
-	.release        = single_release,
+static const struct proc_ops dma_ctrl_port_proc_fops = {
+	.proc_open      = dma_ctrl_port_read_proc_open,
+	.proc_read      = seq_read,
+	.proc_lseek     = seq_lseek,
+	.proc_release   = single_release,
 };
 
 static int dma_ctrl_cfg_read_proc(struct seq_file *s, void *v)
@@ -3221,14 +3312,14 @@ static int dma_ctrl_cfg_read_proc(struct seq_file *s, void *v)
 
 static int dma_ctrl_cfg_read_proc_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, dma_ctrl_cfg_read_proc, PDE_DATA(inode));
+	return single_open(file, dma_ctrl_cfg_read_proc, pde_data(inode));
 }
 
-static const struct file_operations dma_ctrl_cfg_proc_fops = {
-	.open           = dma_ctrl_cfg_read_proc_open,
-	.read           = seq_read,
-	.llseek         = seq_lseek,
-	.release        = single_release,
+static const struct proc_ops dma_ctrl_cfg_proc_fops = {
+	.proc_open      = dma_ctrl_cfg_read_proc_open,
+	.proc_read      = seq_read,
+	.proc_lseek     = seq_lseek,
+	.proc_release   = single_release,
 };
 
 static void *dma_port_cfg_seq_start(struct seq_file *s, loff_t *pos)
@@ -3307,16 +3398,16 @@ static int dma_port_cfg_seq_open(struct inode *inode, struct file *file)
 	int ret = seq_open(file, &dma_port_cfg_seq_ops);
 	if (!ret) {
 		struct seq_file *m = file->private_data;
-		m->private = PDE_DATA(inode);
+		m->private = pde_data(inode);
 	}
 	return ret;
 }
 
-static const struct file_operations dma_port_cfg_proc_fops = {
-	.open = dma_port_cfg_seq_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = seq_release,
+static const struct proc_ops dma_port_cfg_proc_fops = {
+	.proc_open = dma_port_cfg_seq_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = seq_release,
 };
 
 static void *dma_chan_cfg_seq_start(struct seq_file *s, loff_t *pos)
@@ -3417,16 +3508,16 @@ static int dma_chan_cfg_seq_open(struct inode *inode, struct file *file)
 	int ret = seq_open(file, &dma_chan_cfg_seq_ops);
 	if (ret == 0) {
 		struct seq_file *m = file->private_data;
-		m->private = PDE_DATA(inode);
+		m->private = pde_data(inode);
 	}
 	return ret;
 }
 
-static const struct file_operations dma_chan_cfg_proc_fops = {
-	.open = dma_chan_cfg_seq_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = seq_release,
+static const struct proc_ops dma_chan_cfg_proc_fops = {
+	.proc_open = dma_chan_cfg_seq_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = seq_release,
 };
 
 static int dma_proc_init(struct dma_ctrl *pctrl)
@@ -3722,30 +3813,30 @@ static int ltq_dma_probe(struct platform_device *pdev)
 	pctrl->dev = &pdev->dev;
 	memres = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!memres)
-		panic("Failed to get dma resource");
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "missing DMA register resource\n");
 
 	/* remap dma register range */
 	pctrl->membase = devm_ioremap_resource(&pdev->dev, memres);
 	if (IS_ERR(pctrl->membase))
-		panic("Failed to remap dma resource");
+		return PTR_ERR(pctrl->membase);
 
-	err = dma_set_mask(pctrl->dev, DMA_BIT_MASK(32));
-	if (err) {
-		err = dma_set_coherent_mask(pctrl->dev, DMA_BIT_MASK(32));
-		if (err) {
-			devm_iounmap(&pdev->dev, pctrl->membase);
-			dev_err(&pdev->dev,
-			"No usable DMA configuration, aborting\n");
-			return err;
-		}
-	}
+	err = dma_set_mask_and_coherent(pctrl->dev, DMA_BIT_MASK(32));
+	if (err)
+		return dev_err_probe(&pdev->dev, err,
+				     "no usable 32-bit DMA configuration\n");
 
 	if ((pctrl->cid == DMA0) || (pctrl->cid == DMA3)) {
 		/* power up and reset the dma engine */
 		clk = clk_get(&pdev->dev, NULL);
 		if (IS_ERR(clk))
-			panic("Failed to get dma clock");
-		clk_enable(clk);
+			return dev_err_probe(&pdev->dev, PTR_ERR(clk),
+					     "failed to get DMA clock\n");
+		err = clk_prepare_enable(clk);
+		clk_put(clk);
+		if (err)
+			return dev_err_probe(&pdev->dev, err,
+					     "failed to enable DMA clock\n");
 	}
 
 	id = ltq_dma_r32(pctrl, DMA_ID);
@@ -3796,4 +3887,3 @@ postcore_initcall(ltq_dma_init);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Chuanhua.Lei@lantiq.com");
 MODULE_DESCRIPTION("LTQ CPE High Permance DMA Driver");
-MODULE_SUPPORTED_DEVICE("LTQ CPE Devices GRX35X, GRX5XX");
