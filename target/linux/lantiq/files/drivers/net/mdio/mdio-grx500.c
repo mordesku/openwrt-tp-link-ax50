@@ -485,9 +485,14 @@ static int grx500_mdio_wait(void __iomem *base)
 	int tries;
 
 	for (tries = 0; tries < 10000; tries++) {
+		/* Match the vendor GSWIP 3.0 read/write sequence: wait before
+		 * even the first busy read. An immediate idle observation after
+		 * a command may otherwise expose the previous MDIO result and
+		 * report a false PHY link transition. Keep the bounded timeout.
+		 */
+		udelay(1);
 		if (!(__raw_readl(base + GRX500_MDCTRL) & GRX500_MDCTRL_BUSY))
 			return 0;
-		udelay(1);
 	}
 	return -ETIMEDOUT;
 }
@@ -748,7 +753,7 @@ static int grx500_mdio_probe(struct platform_device *pdev)
 		mdiobus_unregister(bus);
 		return ret;
 	}
-	dev_info(&pdev->dev, "MDIO bus registered; GPHY firmware and packet path are separate\n");
+	dev_info(&pdev->dev, "MDIO bus registered; GPHY firmware and packet path are separate; vendor 1us pre-poll delay\n");
 	return 0;
 }
 
