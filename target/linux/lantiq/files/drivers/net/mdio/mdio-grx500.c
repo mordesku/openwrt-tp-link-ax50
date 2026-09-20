@@ -40,6 +40,7 @@
 #define GRX500_PMAC_EGCFG                2
 #define GRX500_PMAC_CTRL2                0xd05
 #define GRX500_PMAC_CTRL4                0xd07
+#define GRX500_FDMA_PASR                 0xa47
 #define GRX500_FDMA_PCTRL                0xa80
 #define GRX500_SDMA_PCTRL                0xbc0
 #define GRX500_PCE_PCTRL                 0x480
@@ -233,6 +234,10 @@ int grx500_gswip_prepare_pmac(struct mii_bus *bus, bool right)
 					    "lantiq,wait-for-gphy"))
 		return -EINVAL;
 	base = bus->priv;
+	/* No acceleration parser prefix: RX always begins with the 8-byte PMAC.
+	 * Vendor GSW_CPU_PortCfgSet uses FDMA_PASR bits 7:0 for CPU/MPE modes.
+	 */
+	grx500_gswip_update_bits(base, GRX500_FDMA_PASR, GENMASK(7, 0), 0);
 	/* The vendor table indexing below uses traffic class, not flags. */
 	if (grx500_gswip_read(base, GRX500_PMAC_CTRL4) & BIT(0))
 		return -EOPNOTSUPP;
@@ -259,6 +264,15 @@ int grx500_gswip_prepare_pmac(struct mii_bus *bus, bool right)
 			if (ret)
 				return ret;
 		}
+		/* Separate Linux interfaces: unknown traffic goes only to CPU.
+		 * Disable hardware learning so software bridge/routing owns the FDB.
+		 * CPU TX still uses the explicit PMAC destination port bitmap.
+		 */
+		grx500_gswip_write(base, GRX500_PCE_PMAP2, BIT(0));
+		grx500_gswip_write(base, GRX500_PCE_PMAP3, BIT(0));
+		for (port = 0; port <= 5; port++)
+			grx500_gswip_update_bits(base, GRX500_PCE_PCTRL_3 + 10 * port,
+						 BIT(15), BIT(15));
 		/* GSWIP-L CPU port 0: ingress special tag, no egress tag. */
 		grx500_gswip_update_bits(base, GRX500_FDMA_PCTRL, BIT(1), 0);
 		grx500_gswip_update_bits(base, GRX500_PCE_PCTRL, BIT(11), BIT(11));
@@ -310,6 +324,8 @@ int grx500_gswip_prepare_pmac(struct mii_bus *bus, bool right)
 					GRX500_MAC_CTRL + 12 * (port - 1),
 					BIT(7), BIT(7));
 		}
+		grx500_gswip_update_bits(base, GRX500_PCE_PCTRL_3 + 10 * 15,
+					 BIT(15), BIT(15));
 		/* Vendor ltq_gsw_pmac_init() sends unknown traffic to port 0
 		 * on GSWIP-R after the LAN-switch DMA P2P handoff.
 		 */
@@ -335,24 +351,8 @@ int grx500_gswip_enable_port(struct mii_bus *bus, bool right, u8 port)
 	    port > (right ? 15 : 5))
 		return -EINVAL;
 	base = bus->priv;
-	if ((!right && (port == 0 || port == 5)) || right) {
-		/* GSW_PortCfgSet() populates default flood maps and
-		 * GSW_STP_PortCfgSet() changes PSTATE to forwarding (7).
-		 * The vendor enables every GSWIP-R port; enabling its SDMA/FDMA
-		 * without forwarding could leave an internal ingress port such
-		 * as port 5 unable to reach the CPU-facing destination on port 0.
-		 * Keep GSWIP-L limited to the CPU and LAN1 ports for this test.
-		 */
-		if (!right) {
-			grx500_gswip_update_bits(base, GRX500_PCE_PMAP2,
-						 BIT(0) | BIT(5), BIT(0) | BIT(5));
-			grx500_gswip_update_bits(base, GRX500_PCE_PMAP3,
-						 BIT(0) | BIT(5), BIT(0) | BIT(5));
-		}
-		grx500_gswip_update_bits(base, GRX500_PCE_PCTRL + 10 * port,
-					 GENMASK(2, 0),
-					 GRX500_PCE_PORT_FORWARDING);
-	}
+	grx500_gswip_update_bits(base, GRX500_PCE_PCTRL + 10 * port,
+				 GENMASK(2, 0), GRX500_PCE_PORT_FORWARDING);
 	grx500_gswip_update_bits(base, GRX500_SDMA_PCTRL + 6 * port,
 				 BIT(0), BIT(0));
 	grx500_gswip_update_bits(base, GRX500_FDMA_PCTRL + 6 * port,
@@ -653,11 +653,11 @@ static ssize_t switch_counters_show(struct device *dev,
 	u32 count[ARRAY_SIZE(ports)][ARRAY_SIZE(indices)];
 	u32 right5_count[ARRAY_SIZE(right5_indices)];
 	size_t len = 0;
-	int nports = right ? ARRAY_SIZE(ports) : 2;
+	int nports = right ? ARRAY_SIZE(ports) : 6;
 	int port, index, ret;
 
 	for (port = 0; port < nports; port++)
-		ports[port] = right ? port : (port ? 5 : 0);
+		ports[port] = port;
 	mutex_lock(&grx500_gswip_bm_lock);
 	for (port = 0; port < nports; port++) {
 		for (index = 0; index < ARRAY_SIZE(indices); index++) {

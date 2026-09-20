@@ -5,7 +5,7 @@ Hypothesis: the unaccounted LAN1 tx_dropped increments originate in the
 network core before ndo_start_xmit, possibly while preparing ARP packets.
 Record validation stage and errno, noqueue/direct failures, and the caller
 of every core TX-drop increment. Only CONFIG_GRX500_DATAPATH builds and
-lan1 emit messages, with rate limits. Packet ownership and return values
+lan1-lan4 and wan emit messages, with rate limits. Packet ownership and return values
 are unchanged. This is temporary diagnostic instrumentation, not a fix.
 
 --- a/net/core/dev.c
@@ -22,11 +22,11 @@ are unchanged. This is temporary diagnostic instrumentation, not a fix.
 +                             u16 protocol, unsigned int len, int error,
 +                             netdev_features_t features)
 +{
-+	if (IS_ENABLED(CONFIG_GRX500_DATAPATH) && !strcmp(dev->name, "lan1"))
-+		pr_warn_ratelimited("AX50 TX core stage=%s proto=%04x len=%u error=%d features=%016llx up=%u running=%u carrier=%u\n",
++	if (IS_ENABLED(CONFIG_GRX500_DATAPATH) && (!strncmp(dev->name, "lan", 3) || !strcmp(dev->name, "wan")))
++		pr_warn_ratelimited("AX50 TX core stage=%s proto=%04x len=%u error=%d features=%016llx up=%u running=%u carrier=%u dev=%s\n",
 +			stage, protocol, len, error, (unsigned long long)features,
 +			!!(dev->flags & IFF_UP), netif_running(dev),
-+			netif_carrier_ok(dev));
++			netif_carrier_ok(dev), dev->name);
 +}
 +
  static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev, bool *again)
@@ -162,9 +162,9 @@ are unchanged. This is temporary diagnostic instrumentation, not a fix.
  	this_cpu_inc(*field);
 +	if (IS_ENABLED(CONFIG_GRX500_DATAPATH) &&
 +	    offset == offsetof(struct net_device_core_stats, tx_dropped) &&
-+	    !strcmp(dev->name, "lan1"))
-+		pr_warn_ratelimited("AX50 TX core counter=tx_dropped caller=%pS\n",
-+			(void *)_RET_IP_);
++	    (!strncmp(dev->name, "lan", 3) || !strcmp(dev->name, "wan")))
++		pr_warn_ratelimited("AX50 TX core counter=tx_dropped caller=%pS dev=%s\n",
++			(void *)_RET_IP_, dev->name);
  }
  EXPORT_SYMBOL_GPL(netdev_core_stats_inc);
  

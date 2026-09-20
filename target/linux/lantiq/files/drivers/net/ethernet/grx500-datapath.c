@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* GRX500 CBM/TMU CPU packet path for the AX50 LAN1 bring-up. */
+/* GRX500 CBM/TMU CPU packet path for the AX50 five-port bring-up. */
 #include <linux/bitops.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
@@ -16,6 +16,7 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/phy.h>
 #include <linux/platform_device.h>
+#include <linux/rtnetlink.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/sysfs.h>
@@ -152,10 +153,10 @@
 #define GRX500_CBM_DMA_ROUTES	(GRX500_LAN_DQM_ROUTES + GRX500_LAN_EQM_ROUTES)
 #define GRX500_LAN_P2P_CLASSES	4
 #define GRX500_GSWIP_R_PORTS	16
-#define GRX500_LAN1_ENDPOINT	5
+#define GRX500_PORTS		5
+#define GRX500_WAN_ENDPOINT	15
 /* Vendor dma_tx_desc_1 (big-endian): EP occupies DW1 bits 11:8. */
 #define GRX500_TX_DW1_EP_SHIFT	8
-#define GRX500_LAN1_GSWIP_PORT	5
 #define GRX500_CBM_FRAME_OFFSET	(CBM_DMA_DATA_OFFSET + NET_IP_ALIGN + NET_SKB_PAD)
 #define CBM_DMA_DATA_OFFSET	128
 #define GRX500_PMAC_SIZE	8
@@ -268,17 +269,49 @@ struct grx500_tx_diagnostics {
 	struct grx500_tx_event ring[GRX500_TX_EVENTS];
 };
 
+/* Connector-to-PHY mapping was verified on AX50 hardware. Keep the logical
+ * datapath endpoint separate from the physical switch port used for link
+ * gating and the PMAC source port used on RX. WAN uses endpoint 15 while its
+ * physical GSWIP-R port and PMAC source port are both 1.
+ */
+struct grx500_port_config {
+	const char *name;
+	u8 endpoint;
+	u8 switch_id;
+	u8 phy_addr;
+	u8 switch_port;
+	u8 rx_port;
+};
+
+static const struct grx500_port_config grx500_ports[] = {
+	{ "lan1", 5, 0, 5, 5, 5 }, { "lan2", 4, 0, 4, 4, 4 },
+	{ "lan3", 3, 0, 3, 3, 3 }, { "lan4", 2, 0, 2, 2, 2 },
+	/* Vendor GSWIP-R ingress channel 15 supplies SPPID/source port 0. */
+	{ "wan", 15, 1, 1, 1, 0 },
+};
+
+struct grx500_port {
+	struct grx500_datapath *dp;
+	const struct grx500_port_config *config;
+	struct net_device *ndev;
+	struct phy_device *phy;
+	bool opened;
+	struct grx500_tx_diagnostics tx_diag;
+};
+
 struct grx500_datapath {
 	struct device *dev;
-	struct net_device *ndev;
+	struct net_device *ndev; /* Stable NAPI anchor: lan1, even when down. */
+	struct grx500_port *ports[GRX500_PORTS];
 	struct napi_struct napi;
-	struct phy_device *phy;
+	u32 rx_bad_descriptor;
+	u32 rx_bad_pmac;
+	u32 rx_closed_port;
 	dma_addr_t pool_dma[GRX500_POOL_COUNT];
 	bool pool_mapped[GRX500_POOL_COUNT];
 	bool started;
 	bool poisoned;
 	spinlock_t tx_lock;
-	struct grx500_tx_diagnostics tx_diag;
 	void __iomem *base[GRX500_RESOURCE_COUNT];
 	spinlock_t tmu_lock;
 	phys_addr_t pool_phys[GRX500_POOL_COUNT];
@@ -286,6 +319,7 @@ struct grx500_datapath {
 	struct grx500_eqm_route lan_eqm[GRX500_LAN_EQM_ROUTES];
 	struct grx500_eqm_route gswr_eqm;
 	struct grx500_dqm_route lan_dqm[GRX500_LAN_DQM_ROUTES];
+	struct grx500_dqm_route wan_dqm;
 	u32 cpu_dqm_port;
 	u32 cpu_dqm_queue;
 	u32 dma_channels[GRX500_CBM_DMA_ROUTES];
@@ -301,12 +335,15 @@ struct grx500_datapath {
 	struct mii_bus *gswip[2];
 };
 
-/* netdev_priv stores a pointer to the devm-managed datapath object, not
- * the object itself. Keep every netdevice callback on the same accessor.
- */
-static struct grx500_datapath *grx500_lan1_dp(struct net_device *ndev)
+static struct grx500_port *grx500_port_priv(struct net_device *ndev)
 {
-	return *(struct grx500_datapath **)netdev_priv(ndev);
+	return netdev_priv(ndev);
+}
+
+static const struct grx500_dqm_route *grx500_port_route(struct grx500_port *port)
+{
+	return port->config->switch_id ? &port->dp->wan_dqm :
+		&port->dp->lan_dqm[port->config->endpoint - 1];
 }
 
 static void grx500_cbm_release_switch_buses(void *data)
@@ -855,11 +892,11 @@ static int grx500_tmu_create_lan_paths(struct grx500_datapath *dp)
 	 * the vendor's queue 16..27 and egress port 6..17 layout. TMU ACT must
 	 * stay clear until CBM dequeue, DMA descriptors and IRQs are ready.
 	 */
-	for (i = 0; i <= GRX500_LAN_DQM_ROUTES; i++) {
-		u32 port = i == GRX500_LAN_DQM_ROUTES ?
-			   dp->cpu_dqm_port : dp->lan_dqm[i].port;
-		u32 queue = i == GRX500_LAN_DQM_ROUTES ?
-			    dp->cpu_dqm_queue : dp->lan_dqm[i].tmu_queue;
+	for (i = 0; i <= GRX500_LAN_DQM_ROUTES + 1; i++) {
+		u32 port = i == GRX500_LAN_DQM_ROUTES + 1 ? dp->wan_dqm.port :
+			   i == GRX500_LAN_DQM_ROUTES ? dp->cpu_dqm_port : dp->lan_dqm[i].port;
+		u32 queue = i == GRX500_LAN_DQM_ROUTES + 1 ? dp->wan_dqm.tmu_queue :
+			    i == GRX500_LAN_DQM_ROUTES ? dp->cpu_dqm_queue : dp->lan_dqm[i].tmu_queue;
 		u32 sbid = queue - 16;
 		u32 sbin = sbid << 3;
 		const u32 scheduler_output[] = {
@@ -951,13 +988,14 @@ static void __maybe_unused grx500_cbm_prepare_cpu_qidt(struct grx500_datapath *d
 	for (key = 0; key < 0x4000; key++) {
 		u32 endpoint = (key >> 4) & 0xf;
 
-		if (endpoint < 1 || endpoint > 6)
+		if (endpoint != GRX500_WAN_ENDPOINT && (endpoint < 2 || endpoint > 5))
 			continue;
 		word = key >> 2;
 		shift = (key & 3) * 8;
 		value = __raw_readl(qidt + word * sizeof(u32));
 		value &= ~(0xffu << shift);
-		value |= dp->lan_dqm[endpoint - 1].tmu_queue << shift;
+		value |= (endpoint == GRX500_WAN_ENDPOINT ? dp->wan_dqm.tmu_queue :
+			  dp->lan_dqm[endpoint - 1].tmu_queue) << shift;
 		__raw_writel(value, qidt + word * sizeof(u32));
 	}
 }
@@ -1235,72 +1273,73 @@ static int grx500_cbm_prepare_eqm_descriptors(struct grx500_datapath *dp,
 	return 0;
 }
 
-static int grx500_cbm_prepare_lan1_descriptors(struct grx500_datapath *dp)
+static int grx500_cbm_prepare_port_descriptors(struct grx500_datapath *dp)
 {
-	const struct grx500_dqm_route *dqm = &dp->lan_dqm[GRX500_LAN1_ENDPOINT - 1];
 	void __iomem *desc = dp->base[GRX500_DMA_DESC];
-	int i, ret;
+	int p, i, ret;
 
 	ret = grx500_cbm_prepare_eqm_descriptors(dp, &dp->lan_eqm[0]);
 	if (ret)
 		return ret;
-	/* Hypothesis from the ARP-in-P2P hardware result: GSWIP-R cannot
-	 * drain to CPU because DMA1RX0/EQM7 was absent. The vendor axepoint
-	 * EQ7 tuple supplies this final receive leg, independent of PPA.
-	 */
 	ret = grx500_cbm_prepare_eqm_descriptors(dp, &dp->gswr_eqm);
 	if (ret)
 		return ret;
-	for (i = 0; i < dqm->descriptors; i++) {
-		void __iomem *ring = desc + 0x40000 +
-				     (dqm->port - 5) * 0x1000 + i * 16;
+	for (p = 0; p < GRX500_PORTS; p++) {
+		const struct grx500_dqm_route *dqm = grx500_port_route(dp->ports[p]);
 
-		__raw_writel(0, ring);
-		__raw_writel(0, ring + 4);
-		__raw_writel(0, ring + 8);
-		__raw_writel(0, ring + 12);
+		for (i = 0; i < dqm->descriptors; i++) {
+			void __iomem *ring = desc + 0x40000 +
+				(dqm->port - 5) * 0x1000 + i * 16;
+
+			__raw_writel(0, ring);
+			__raw_writel(0, ring + 4);
+			__raw_writel(0, ring + 8);
+			__raw_writel(0, ring + 12);
+		}
+		__raw_writel(0x101 | (dqm->port << 16),
+			     dp->base[GRX500_DQM] + GRX500_DQM_DMA_CFG +
+			     (dqm->port - 6) * 0x1000);
 	}
-	__raw_writel(0x101 | (dqm->port << 16),
-		     dp->base[GRX500_DQM] + GRX500_DQM_DMA_CFG +
-		     (dqm->port - 6) * 0x1000);
 	return 0;
 }
 
-static int grx500_cbm_start_lan1_dma(struct grx500_datapath *dp)
+static int grx500_cbm_start_port_dma(struct grx500_datapath *dp)
 {
-	const struct grx500_dqm_route *dqm = &dp->lan_dqm[4];
-	const struct grx500_eqm_route *eqm = &dp->lan_eqm[0];
 	phys_addr_t base = grx500_layout[GRX500_DMA_DESC].start;
-	int ret;
+	int p, ret;
 
-	ret = grx500_cbm_request_dma_channel(dp, DMA2TX, dqm->dma_channel,
-			base + 0x40000 + (dqm->port - 5) * 0x1000);
-	if (ret)
-		return ret;
-	ret = grx500_cbm_request_dma_channel(dp, DMA2RX, eqm->dma_channel,
-			base + (eqm->port - 5) * 0x1000);
-	if (ret)
-		return ret;
-	ret = grx500_cbm_request_dma_channel(dp, DMA1RX,
-			dp->gswr_eqm.dma_channel,
+	/* Start the shared GSWIP-R CPU sink before any producer. */
+	ret = grx500_cbm_request_dma_channel(dp, DMA1RX, dp->gswr_eqm.dma_channel,
 			base + (dp->gswr_eqm.port - 5) * 0x1000);
 	if (ret)
 		return ret;
-	/* The GSWIP-R sink must be ready before the P2P producer starts. */
-	ret = ltq_dma_chan_on(dp->dma_channels[2]);
+	ret = grx500_cbm_request_dma_channel(dp, DMA2RX, dp->lan_eqm[0].dma_channel,
+			base + (dp->lan_eqm[0].port - 5) * 0x1000);
 	if (ret)
 		return ret;
-	ret = ltq_dma_chan_on(dp->dma_channels[0]);
-	if (ret)
-		return ret;
-	return ltq_dma_chan_on(dp->dma_channels[1]);
+	for (p = 0; p < GRX500_PORTS; p++) {
+		struct grx500_port *port = dp->ports[p];
+		const struct grx500_dqm_route *dqm = grx500_port_route(port);
+
+		ret = grx500_cbm_request_dma_channel(dp,
+			port->config->switch_id ? DMA1TX : DMA2TX, dqm->dma_channel,
+			base + 0x40000 + (dqm->port - 5) * 0x1000);
+		if (ret)
+			return ret;
+	}
+	for (p = 0; p < dp->dma_channels_acquired; p++) {
+		ret = ltq_dma_chan_on(dp->dma_channels[p]);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
-static void grx500_lan1_adjust_link(struct net_device *ndev)
+static void grx500_adjust_link(struct net_device *ndev)
 {
-	struct grx500_datapath *dp = grx500_lan1_dp(ndev);
+	struct grx500_port *port = grx500_port_priv(ndev);
 
-	if (dp->phy->link)
+	if (port->phy->link)
 		netif_carrier_on(ndev);
 	else
 		netif_carrier_off(ndev);
@@ -1324,7 +1363,7 @@ static void grx500_cbm_irq_unmask(struct grx500_datapath *dp)
 		     GRX500_RX_CBM_LINE * GRX500_CBM_IRQ_STRIDE + 8);
 }
 
-static irqreturn_t grx500_lan1_irq(int irq, void *data)
+static irqreturn_t grx500_irq(int irq, void *data)
 {
 	struct grx500_datapath *dp = data;
 
@@ -1336,10 +1375,9 @@ static irqreturn_t grx500_lan1_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static int grx500_lan1_poll(struct napi_struct *napi, int budget)
+static int grx500_poll(struct napi_struct *napi, int budget)
 {
 	struct grx500_datapath *dp = container_of(napi, struct grx500_datapath, napi);
-	struct net_device *ndev = dp->ndev;
 	void __iomem *ls = dp->base[GRX500_LS] +
 			   GRX500_RX_LS_PORT * GRX500_LS_PORT_STRIDE;
 	int done = 0;
@@ -1348,9 +1386,11 @@ static int grx500_lan1_poll(struct napi_struct *napi, int budget)
 	       ((__raw_readl(ls + GRX500_LS_PORT_STATUS) >> 7) & 0xf)) {
 		phys_addr_t frame;
 		struct sk_buff *skb;
+		struct net_device *ndev;
+		struct grx500_port *port = NULL;
 		u32 ptr, flags, len, offset;
 		u8 *data;
-		int pool, hdr;
+		int pool, p;
 
 		(void)__raw_readl(ls);
 		(void)__raw_readl(ls + 4);
@@ -1362,10 +1402,10 @@ static int grx500_lan1_poll(struct napi_struct *napi, int budget)
 		if (pool != GRX500_STANDARD_POOL ||
 		    ptr + offset + len > frame + 2048 ||
 		    len < GRX500_PMAC_SIZE + ETH_HLEN) {
-			if (ndev->stats.rx_errors < 4)
+			if (dp->rx_bad_descriptor < 4)
 				dev_info(dp->dev, "RX descriptor rejected ptr=%08x flags=%08x pool=%d\n",
 					 ptr, flags, pool);
-			ndev->stats.rx_errors++;
+			dp->rx_bad_descriptor++;
 			if (pool >= 0)
 				grx500_cbm_cpu_return(dp, 0, frame);
 			done++;
@@ -1374,28 +1414,31 @@ static int grx500_lan1_poll(struct napi_struct *napi, int budget)
 		dma_sync_single_for_cpu(dp->dev, ptr & ~7u,
 					len + offset, DMA_BIDIRECTIONAL);
 		data = phys_to_virt(ptr + offset);
-		/* Hardware may prepend 0, 8 or 48 parser bytes. Require a
-		 * GSWIP-L source port 5 PMAC before accepting any LAN1 frame.
+		/* Both switches explicitly disable FDMA parser prefixes. Do not
+		 * search packet payload for a nibble that resembles a port ID.
 		 */
-		for (hdr = 0; hdr <= 48; hdr += hdr == 0 ? 8 : 40) {
-			if (len >= hdr + GRX500_PMAC_SIZE + ETH_HLEN &&
-			    (data[hdr + 2] >> 4) == GRX500_LAN1_ENDPOINT)
+		for (p = 0; p < GRX500_PORTS; p++)
+			if ((data[2] >> 4) == dp->ports[p]->config->rx_port) {
+				port = dp->ports[p];
 				break;
-		}
-		if (hdr > 48) {
-			if (ndev->stats.rx_dropped < 4)
+			}
+		if (!port) {
+			if (dp->rx_bad_pmac < 4)
 				dev_info(dp->dev, "RX PMAC mismatch ptr=%08x flags=%08x first32=%*phN\n",
 					 ptr, flags, (int)min_t(u32, len, 32), data);
-			ndev->stats.rx_dropped++;
+			dp->rx_bad_pmac++;
+		} else if (!READ_ONCE(port->opened)) {
+			dp->rx_closed_port++;
 		} else {
-			len -= hdr + GRX500_PMAC_SIZE;
+			ndev = port->ndev;
+			len -= GRX500_PMAC_SIZE;
 			/* napi_alloc_skb() already reserves NET_SKB_PAD +
 			 * NET_IP_ALIGN. A second reserve misaligns the IP header
 			 * by two bytes and triggers MIPS address-error emulation.
 			 */
 			skb = napi_alloc_skb(napi, len);
 			if (skb) {
-				skb_put_data(skb, data + hdr + GRX500_PMAC_SIZE, len);
+				skb_put_data(skb, data + GRX500_PMAC_SIZE, len);
 				skb->protocol = eth_type_trans(skb, ndev);
 				/* Never hand a misaligned L3 header to the stack on
 				 * this strict-alignment CPU. Check after ETH_HLEN is
@@ -1455,11 +1498,12 @@ static unsigned int grx500_tx_protocol(__be16 protocol)
  * Keep a bounded history in RAM; printing every retry would perturb UART
  * timing. The caller holds tx_lock and still owns the skb.
  */
-static void grx500_tx_failure(struct grx500_datapath *dp,
+static void grx500_tx_failure(struct grx500_port *port,
 			     struct sk_buff *skb, enum grx500_tx_result result,
 			     int error, u32 alloc_ptr)
 {
-	struct grx500_tx_diagnostics *diag = &dp->tx_diag;
+	struct grx500_datapath *dp = port->dp;
+	struct grx500_tx_diagnostics *diag = &port->tx_diag;
 	struct grx500_tx_event *event = &diag->ring[diag->events % GRX500_TX_EVENTS];
 	__be16 arp_op = 0;
 
@@ -1479,10 +1523,11 @@ static void grx500_tx_failure(struct grx500_datapath *dp,
 	diag->events++;
 }
 
-static netdev_tx_t grx500_lan1_xmit(struct sk_buff *skb,
+static netdev_tx_t grx500_xmit(struct sk_buff *skb,
 				    struct net_device *ndev)
 {
-	struct grx500_datapath *dp = grx500_lan1_dp(ndev);
+	struct grx500_port *port = grx500_port_priv(ndev);
+	struct grx500_datapath *dp = port->dp;
 	void __iomem *desc = dp->base[GRX500_EQM] + GRX500_EQM_CPU_DESC;
 	unsigned long irqflags;
 	phys_addr_t frame;
@@ -1492,10 +1537,10 @@ static netdev_tx_t grx500_lan1_xmit(struct sk_buff *skb,
 	int ret;
 
 	spin_lock_irqsave(&dp->tx_lock, irqflags);
-	dp->tx_diag.counts[GRX500_TX_ATTEMPT][protocol]++;
+	port->tx_diag.counts[GRX500_TX_ATTEMPT][protocol]++;
 	if (unlikely(skb->len > ETH_FRAME_LEN + VLAN_HLEN ||
 		     skb->len < ETH_HLEN)) {
-		grx500_tx_failure(dp, skb, GRX500_TX_DROP_LENGTH, -EMSGSIZE, 0);
+		grx500_tx_failure(port, skb, GRX500_TX_DROP_LENGTH, -EMSGSIZE, 0);
 		spin_unlock_irqrestore(&dp->tx_lock, irqflags);
 		ndev->stats.tx_dropped++;
 		dev_kfree_skb_any(skb);
@@ -1503,7 +1548,7 @@ static netdev_tx_t grx500_lan1_xmit(struct sk_buff *skb,
 	}
 	ret = grx500_cbm_cpu_alloc_standard(dp, 0, &frame, &alloc_ptr);
 	if (ret) {
-		grx500_tx_failure(dp, skb, ret == -ENOBUFS ?
+		grx500_tx_failure(port, skb, ret == -ENOBUFS ?
 			GRX500_TX_BUSY_EMPTY : GRX500_TX_BUSY_INVALID, ret, alloc_ptr);
 		spin_unlock_irqrestore(&dp->tx_lock, irqflags);
 		return NETDEV_TX_BUSY;
@@ -1514,13 +1559,17 @@ static netdev_tx_t grx500_lan1_xmit(struct sk_buff *skb,
 	 */
 	len = max_t(u32, skb->len, ETH_ZLEN) + GRX500_PMAC_SIZE;
 	data = phys_to_virt(addr);
-	/* Vendor LAN TX PMAC: port_map_en, class_en, destination EP5. */
+	/* Vendor Ethernet PMAC: CPU source, explicit destination bitmap. */
 	memset(data, 0, GRX500_PMAC_SIZE);
-	data[3] = 0x90;
-	data[7] = BIT(GRX500_LAN1_ENDPOINT);
+	/* Big-endian PMAC TX layout: CPU SPPID=0, port_map_en=0x80. */
+	data[3] = 0x80;
+	data[6] = BIT(port->config->endpoint) >> 8;
+	data[7] = BIT(port->config->endpoint) & 0xff;
+	if (port->config->switch_id)
+		data[4] = BIT(6); /* Vendor WAN redirect bit. */
 	ret = skb_copy_bits(skb, 0, data + GRX500_PMAC_SIZE, skb->len);
 	if (unlikely(ret)) {
-		grx500_tx_failure(dp, skb, GRX500_TX_DROP_COPY, ret, alloc_ptr);
+		grx500_tx_failure(port, skb, GRX500_TX_DROP_COPY, ret, alloc_ptr);
 		grx500_cbm_cpu_return(dp, 0, frame);
 		spin_unlock_irqrestore(&dp->tx_lock, irqflags);
 		ndev->stats.tx_dropped++;
@@ -1539,13 +1588,13 @@ static netdev_tx_t grx500_lan1_xmit(struct sk_buff *skb,
 	 * counted by the netdev never selected the LAN1 CBM/TMU route.
 	 */
 	__raw_writel(0, desc);
-	__raw_writel(GRX500_LAN1_ENDPOINT << GRX500_TX_DW1_EP_SHIFT,
+	__raw_writel(port->config->endpoint << GRX500_TX_DW1_EP_SHIFT,
 		     desc + 4);
 	__raw_writel(addr & ~7u, desc + 8);
 	wmb();
 	__raw_writel(BIT(29) | BIT(28) | ((addr & 7) << 23) | len,
 		     desc + 12);
-	dp->tx_diag.counts[GRX500_TX_SUBMITTED][protocol]++;
+	port->tx_diag.counts[GRX500_TX_SUBMITTED][protocol]++;
 	spin_unlock_irqrestore(&dp->tx_lock, irqflags);
 	ndev->stats.tx_packets++;
 	ndev->stats.tx_bytes += skb->len;
@@ -1553,17 +1602,14 @@ static netdev_tx_t grx500_lan1_xmit(struct sk_buff *skb,
 	return NETDEV_TX_OK;
 }
 
-static int grx500_lan1_open(struct net_device *ndev)
+static int grx500_start(struct grx500_datapath *dp)
 {
-	struct grx500_datapath *dp = grx500_lan1_dp(ndev);
-	struct phy_device *phy;
 	int i, ret;
 
+	if (dp->started)
+		return 0;
 	if (dp->poisoned)
 		return -EIO;
-	phy = mdiobus_get_phy(dp->gswip[0], GRX500_LAN1_GSWIP_PORT);
-	if (!phy)
-		return -ENODEV;
 	ret = dma_set_mask_and_coherent(dp->dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
@@ -1588,28 +1634,23 @@ static int grx500_lan1_open(struct net_device *ndev)
 	grx500_cbm_prepare_load_spreader(dp);
 	__raw_writel(0x11, dp->base[GRX500_DQM] + GRX500_DQM_CTRL);
 	__raw_writel(0x11, dp->base[GRX500_EQM] + GRX500_EQM_CTRL);
-	ret = grx500_cbm_prepare_lan1_descriptors(dp);
+	ret = grx500_cbm_prepare_port_descriptors(dp);
 	if (ret)
 		goto err_engines;
 	grx500_cbm_prepare_cpu_qidt(dp);
 	ret = grx500_cbm_prepare_switches(dp);
 	if (ret)
 		goto err_engines;
-	ret = request_irq(dp->irq[GRX500_RX_IRQ_INDEX], grx500_lan1_irq, 0, "grx500-lan1", dp);
+	ret = request_irq(dp->irq[GRX500_RX_IRQ_INDEX], grx500_irq, 0, "grx500-ports", dp);
 	if (ret)
 		goto err_engines;
 	napi_enable(&dp->napi);
-	ret = grx500_cbm_start_lan1_dma(dp);
+	ret = grx500_cbm_start_port_dma(dp);
 	if (ret)
 		goto err_dma;
 	ret = grx500_cbm_start_p2p(dp);
 	if (ret)
 		goto err_dma;
-	ret = phy_connect_direct(ndev, phy, grx500_lan1_adjust_link,
-				 PHY_INTERFACE_MODE_RGMII);
-	if (ret)
-		goto err_dma;
-	dp->phy = phy;
 	/* Keep the tested vendor gates and weights. Hardware sends this
 	 * DQM2 stream to LS2 even with SPR_EN set only on port 0; NAPI and
 	 * IRQ selection must therefore consume LS2 rather than assuming LS0.
@@ -1629,52 +1670,45 @@ static int grx500_lan1_open(struct net_device *ndev)
 	for (i = 0; i < GRX500_GSWIP_R_PORTS; i++) {
 		ret = grx500_gswip_enable_port(dp->gswip[1], true, i);
 		if (ret)
-			goto err_phy;
+			goto err_ports;
 	}
 	ret = grx500_gswip_enable_port(dp->gswip[0], false, 0);
-	if (!ret)
-		ret = grx500_gswip_enable_port(dp->gswip[0], false,
-					GRX500_LAN1_GSWIP_PORT);
 	if (ret)
-		goto err_phy;
+		goto err_ports;
 	dp->started = true;
-	netif_carrier_off(ndev);
-	phy_start(phy);
-	netif_start_queue(ndev);
-	dev_info(dp->dev, "LAN1 CBM/TMU path active: EP5 Q20 DQM10 DMA2TX5/RX14, DMA2RX0-3 to DMA1TX0-3 P2P, DMA1RX0 EQM7 CPU RX\n");
+	dev_info(dp->dev, "AX50 shared CBM/TMU active: LAN DMA2TX2-5, WAN DMA1TX15; DMA1RX0 EQM7 CPU RX\n");
 	return 0;
 
-err_phy:
+err_ports:
 	grx500_gswip_disable_port(dp->gswip[0], false, 0);
 	for (i = 0; i < GRX500_GSWIP_R_PORTS; i++)
 		grx500_gswip_disable_port(dp->gswip[1], true, i);
 	grx500_cbm_irq_mask(dp);
-	phy_disconnect(phy);
-	dp->phy = NULL;
 err_dma:
 	grx500_cbm_release_p2p(dp);
 	grx500_cbm_release_dma(dp);
 	napi_disable(&dp->napi);
 	free_irq(dp->irq[GRX500_RX_IRQ_INDEX], dp);
 err_engines:
+	__raw_writel(0, dp->base[GRX500_LS] + GRX500_LS_GLOBAL_CTRL);
+	__raw_writel(__raw_readl(dp->base[GRX500_TMU] + GRX500_TMU_CTRL) & ~1u,
+		     dp->base[GRX500_TMU] + GRX500_TMU_CTRL);
 	__raw_writel(0, dp->base[GRX500_EQM] + GRX500_EQM_CTRL);
 	__raw_writel(0, dp->base[GRX500_DQM] + GRX500_DQM_CTRL);
 err_unmap:
 	grx500_cbm_unmap_pools(dp);
-	dev_err(dp->dev, "LAN1 start failed (%d); reboot RAM image before retry\n", ret);
+	dev_err(dp->dev, "Shared datapath start failed (%d); reboot RAM image before retry\n", ret);
 	return ret;
 }
 
-static int grx500_lan1_stop(struct net_device *ndev)
+static void grx500_shutdown(struct grx500_datapath *dp)
 {
-	struct grx500_datapath *dp = grx500_lan1_dp(ndev);
 	int i;
 
-	netif_stop_queue(ndev);
-	netif_carrier_off(ndev);
-	phy_stop(dp->phy);
-	grx500_gswip_disable_port(dp->gswip[0], false,
-				 GRX500_LAN1_GSWIP_PORT);
+	if (!dp->started)
+		return;
+	for (i = 2; i <= 5; i++)
+		grx500_gswip_disable_port(dp->gswip[0], false, i);
 	grx500_gswip_disable_port(dp->gswip[0], false, 0);
 	for (i = 0; i < GRX500_GSWIP_R_PORTS; i++)
 		grx500_gswip_disable_port(dp->gswip[1], true, i);
@@ -1688,17 +1722,71 @@ static int grx500_lan1_stop(struct net_device *ndev)
 		     dp->base[GRX500_TMU] + GRX500_TMU_CTRL);
 	__raw_writel(0, dp->base[GRX500_EQM] + GRX500_EQM_CTRL);
 	__raw_writel(0, dp->base[GRX500_DQM] + GRX500_DQM_CTRL);
-	phy_disconnect(dp->phy);
-	dp->phy = NULL;
 	dp->started = false;
 	grx500_cbm_unmap_pools(dp);
+}
+
+/* RTNL serializes port open/close and shared startup. Keep DMA pools and
+ * the NAPI anchor alive across port closes; full shutdown is remove-only.
+ * This permits cable-by-cable tests and later simultaneous software routing.
+ */
+static int grx500_open(struct net_device *ndev)
+{
+	struct grx500_port *port = grx500_port_priv(ndev);
+	struct grx500_datapath *dp = port->dp;
+	struct phy_device *phy;
+	int ret;
+
+	phy = mdiobus_get_phy(dp->gswip[port->config->switch_id], port->config->phy_addr);
+	if (!phy)
+		return -ENODEV;
+	ret = grx500_start(dp);
+	if (ret)
+		return ret;
+	ret = phy_connect_direct(ndev, phy, grx500_adjust_link, PHY_INTERFACE_MODE_RGMII);
+	if (ret)
+		return ret;
+	port->phy = phy;
+	ret = grx500_gswip_enable_port(dp->gswip[port->config->switch_id],
+				      port->config->switch_id, port->config->switch_port);
+	if (ret) {
+		phy_disconnect(phy);
+		port->phy = NULL;
+		return ret;
+	}
+	WRITE_ONCE(port->opened, true);
+	netif_carrier_off(ndev);
+	phy_start(phy);
+	netif_start_queue(ndev);
 	return 0;
 }
 
-static const struct net_device_ops grx500_lan1_ops = {
-	.ndo_open = grx500_lan1_open,
-	.ndo_stop = grx500_lan1_stop,
-	.ndo_start_xmit = grx500_lan1_xmit,
+static int grx500_stop(struct net_device *ndev)
+{
+	struct grx500_port *port = grx500_port_priv(ndev);
+	struct grx500_datapath *dp = port->dp;
+
+	netif_stop_queue(ndev);
+	phy_stop(port->phy);
+	netif_carrier_off(ndev);
+	WRITE_ONCE(port->opened, false);
+	/* LAN logical ports also carry internal GSWIP-R P2P traffic. Only
+	 * gate the physical left port, or the right WAN endpoint itself.
+	 */
+	grx500_gswip_disable_port(dp->gswip[port->config->switch_id],
+				 port->config->switch_id, port->config->switch_port);
+	synchronize_net();
+	phy_disconnect(port->phy);
+	port->phy = NULL;
+	return 0;
+}
+
+static const struct net_device_ops grx500_ops = {
+	.ndo_open = grx500_open,
+	.ndo_stop = grx500_stop,
+	.ndo_start_xmit = grx500_xmit,
+	.ndo_set_mac_address = eth_mac_addr,
+	.ndo_validate_addr = eth_validate_addr,
 };
 
 static int grx500_read_lan_routes(struct platform_device *pdev,
@@ -1716,6 +1804,7 @@ static int grx500_read_lan_routes(struct platform_device *pdev,
 	    of_property_count_u32_elems(np, "lantiq,lan-dqm-routes") !=
 	    ARRAY_SIZE(dp->lan_dqm) * 5 ||
 	    of_property_count_u32_elems(np, "lantiq,gswr-eqm-route") != 5 ||
+	    of_property_count_u32_elems(np, "lantiq,wan-dqm-route") != 5 ||
 	    of_property_count_u32_elems(np, "lantiq,cpu-dqm-port") != 2)
 		return dev_err_probe(&pdev->dev, -EINVAL,
 				     "CBM route table has wrong tuple count\n");
@@ -1745,6 +1834,14 @@ static int grx500_read_lan_routes(struct platform_device *pdev,
 	    dp->gswr_eqm.descriptors != 2)
 		return dev_err_probe(&pdev->dev, -EINVAL,
 				     "GSWIP-R CBM enqueue route is invalid\n");
+	ret = of_property_read_u32_array(np, "lantiq,wan-dqm-route",
+					 (u32 *)&dp->wan_dqm, 5);
+	if (ret)
+		return ret;
+	if (dp->wan_dqm.port != 19 || dp->wan_dqm.tmu_queue != 28 ||
+	    dp->wan_dqm.dma_controller != 1 || dp->wan_dqm.dma_channel != 15 ||
+	    dp->wan_dqm.descriptors != 2)
+		return dev_err_probe(&pdev->dev, -EINVAL, "WAN CBM dequeue route is invalid\n");
 	for (i = 0; i < GRX500_LAN_EQM_ROUTES; i++) {
 		const struct grx500_eqm_route *r = &dp->lan_eqm[i];
 
@@ -1873,7 +1970,7 @@ static ssize_t status_show(struct device *dev,
 		"std_pool=%pa jumbo_pool=%pa cpu_dqm=%u:%u\n"
 		"cbm_sba0=%08x sba1=%08x jba0=%08x jba1=%08x\n"
 		"lan_eqm=%u/%u lan_dqm=%u-%u queues=%u-%u\n"
-		"eqm_irq=%d cpu_dqm_irqs=%d,%d,%d,%d (requested only while lan1 is up)\n",
+		"eqm_irq=%d cpu_dqm_irqs=%d,%d,%d,%d (shared after first port activation)\n",
 		tmu, !!(tmu & 1), cbm, !!(cbm & 1),
 		eqm, !!(eqm & 1), dqm, !!(dqm & 1), igp0, egp2,
 		eqm_pocc, ls_status, ls_irq,
@@ -1946,14 +2043,18 @@ static ssize_t status_show(struct device *dev,
 				__raw_readl(ring + d * 16 + 8),
 				__raw_readl(ring + d * 16 + 12));
 	}
+	len += sysfs_emit_at(buf, len,
+		"rx_bad_descriptor=%u rx_bad_pmac=%u rx_closed_port=%u\n",
+		READ_ONCE(dp->rx_bad_descriptor), READ_ONCE(dp->rx_bad_pmac),
+		READ_ONCE(dp->rx_closed_port));
 	return len;
 }
 static DEVICE_ATTR_RO(status);
 
-static ssize_t tx_diagnostics_show(struct device *dev,
-				  struct device_attribute *attr, char *buf)
+static ssize_t grx500_tx_diagnostics(struct grx500_port *port, char *buf)
 {
-	struct grx500_datapath *dp = dev_get_drvdata(dev);
+	struct grx500_datapath *dp = port->dp;
+	struct net_device *ndev = port->ndev;
 	struct grx500_tx_diagnostics snapshot;
 	const struct net_device_core_stats __percpu *core;
 	u64 core_drops = 0;
@@ -1964,16 +2065,16 @@ static ssize_t tx_diagnostics_show(struct device *dev,
 
 	/* Snapshot software state only. Never allocate/dequeue during a read. */
 	spin_lock_irqsave(&dp->tx_lock, flags);
-	snapshot = dp->tx_diag;
+	snapshot = port->tx_diag;
 	spin_unlock_irqrestore(&dp->tx_lock, flags);
 	/* Like dev_get_stats(), sample core counters without clearing them. */
-	core = READ_ONCE(dp->ndev->core_stats);
+	core = READ_ONCE(ndev->core_stats);
 	if (core)
 		for_each_possible_cpu(cpu)
 			core_drops += READ_ONCE(per_cpu_ptr(core, cpu)->tx_dropped);
 	len = sysfs_emit(buf, "tx_diag_v2 columns=arp,ipv4,ipv6,other counters=u32 attempts_include_retries\n");
 	len += sysfs_emit_at(buf, len, "driver_tx_dropped=%lu core_tx_dropped=%llu sampled_separately\n",
-			    READ_ONCE(dp->ndev->stats.tx_dropped),
+			    READ_ONCE(ndev->stats.tx_dropped),
 			    (unsigned long long)core_drops);
 	for (i = 0; i < GRX500_TX_RESULTS; i++)
 		len += sysfs_emit_at(buf, len, "%s=%u,%u,%u,%u\n",
@@ -1995,6 +2096,72 @@ static ssize_t tx_diagnostics_show(struct device *dev,
 	}
 	return len;
 }
+static ssize_t tx_diagnostics_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct grx500_datapath *dp = dev_get_drvdata(dev);
+
+	return grx500_tx_diagnostics(dp->ports[0], buf);
+}
+
+static ssize_t port_tx_diagnostics_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	return grx500_tx_diagnostics(grx500_port_priv(to_net_dev(dev)), buf);
+}
+
+static ssize_t port_mapping_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct grx500_port *port = grx500_port_priv(to_net_dev(dev));
+	const struct grx500_dqm_route *route = grx500_port_route(port);
+
+	return sysfs_emit(buf, "name=%s switch=%c phy=%u switch_port=%u endpoint=%u rx_port=%u queue=%u dqm=%u dma=%u tx_channel=%u rx=DMA1RX0/EQM7/Q35/DQM2/LS2\n",
+		port->ndev->name, port->config->switch_id ? 'R' : 'L',
+		port->config->phy_addr, port->config->switch_port,
+		port->config->endpoint, port->config->rx_port, route->tmu_queue,
+		route->port, route->dma_controller, route->dma_channel);
+}
+
+static DEVICE_ATTR_RO(port_mapping);
+static ssize_t port_hardware_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct grx500_port *port = grx500_port_priv(to_net_dev(dev));
+	struct grx500_datapath *dp = port->dp;
+	const struct grx500_dqm_route *r = grx500_port_route(port);
+	void __iomem *cfg = dp->base[GRX500_DQM] + GRX500_DQM_DMA_CFG +
+			   (r->port - 6) * 0x1000;
+	void __iomem *ring = dp->base[GRX500_DMA_DESC] + 0x40000 +
+			    (r->port - 5) * 0x1000;
+	size_t len;
+	int i;
+
+	if (!READ_ONCE(dp->started))
+		return sysfs_emit(buf, "shared_datapath_active=0\n");
+	/* Live observations only; no LS dequeue reads or ownership writes. */
+	len = sysfs_emit(buf, "queue=%u enqueued=%u dequeued=%u dqm=%u cfg=%08x\n",
+		r->tmu_queue,
+		__raw_readl(dp->base[GRX500_QEQCNT] + r->tmu_queue * sizeof(u32)),
+		__raw_readl(dp->base[GRX500_QDQCNT] + r->tmu_queue * sizeof(u32)),
+		r->port, __raw_readl(cfg));
+	for (i = 0; i < r->descriptors; i++)
+		len += sysfs_emit_at(buf, len, "desc%d_live=%08x:%08x:%08x:%08x\n",
+			i, __raw_readl(ring + i * 16), __raw_readl(ring + i * 16 + 4),
+			__raw_readl(ring + i * 16 + 8), __raw_readl(ring + i * 16 + 12));
+	return len;
+}
+static DEVICE_ATTR_RO(port_hardware);
+static struct device_attribute dev_attr_port_tx_diagnostics =
+	__ATTR(tx_diagnostics, 0444, port_tx_diagnostics_show, NULL);
+static struct attribute *grx500_port_attrs[] = {
+	&dev_attr_port_tx_diagnostics.attr, &dev_attr_port_mapping.attr,
+	&dev_attr_port_hardware.attr, NULL,
+};
+static const struct attribute_group grx500_port_group = {
+	.attrs = grx500_port_attrs,
+};
+
 static DEVICE_ATTR_RO(tx_diagnostics);
 
 static struct attribute *grx500_tx_attrs[] = {
@@ -2046,37 +2213,55 @@ static int grx500_datapath_probe(struct platform_device *pdev)
 	ret = device_create_file(&pdev->dev, &dev_attr_status);
 	if (ret)
 		return ret;
-	dp->ndev = alloc_etherdev(sizeof(struct grx500_datapath *));
-	if (!dp->ndev) {
-		ret = -ENOMEM;
-		goto err_attr;
+	for (i = 0; i < GRX500_PORTS; i++) {
+		struct net_device *ndev = alloc_etherdev(sizeof(struct grx500_port));
+		struct grx500_port *port;
+
+		if (!ndev) {
+			ret = -ENOMEM;
+			goto err_alloc;
+		}
+		port = grx500_port_priv(ndev);
+		port->dp = dp;
+		port->ndev = ndev;
+		port->config = &grx500_ports[i];
+		dp->ports[i] = port;
+		strscpy(ndev->name, port->config->name, IFNAMSIZ);
+		SET_NETDEV_DEV(ndev, &pdev->dev);
+		ndev->netdev_ops = &grx500_ops;
+		ndev->min_mtu = ETH_MIN_MTU;
+		ndev->max_mtu = ETH_DATA_LEN;
+		ndev->features &= ~(NETIF_F_SG | NETIF_F_HW_CSUM | NETIF_F_TSO);
+		ndev->sysfs_groups[0] = &grx500_port_group;
+		eth_hw_addr_random(ndev);
+		netif_carrier_off(ndev);
 	}
-	*(struct grx500_datapath **)netdev_priv(dp->ndev) = dp;
-	strscpy(dp->ndev->name, "lan1", IFNAMSIZ);
-	SET_NETDEV_DEV(dp->ndev, &pdev->dev);
-	dp->ndev->netdev_ops = &grx500_lan1_ops;
-	dp->ndev->min_mtu = ETH_MIN_MTU;
-	dp->ndev->max_mtu = ETH_DATA_LEN;
-	dp->ndev->features &= ~(NETIF_F_SG | NETIF_F_HW_CSUM | NETIF_F_TSO);
-	eth_hw_addr_random(dp->ndev);
-	netif_carrier_off(dp->ndev);
-	netif_napi_add(dp->ndev, &dp->napi, grx500_lan1_poll);
-	ret = register_netdev(dp->ndev);
-	if (ret)
-		goto err_netdev;
-	/* Drop totals dereference ndev; publish only after registration. */
+	dp->ndev = dp->ports[0]->ndev;
+	netif_napi_add(dp->ndev, &dp->napi, grx500_poll);
+	rtnl_lock();
+	for (i = 0; i < GRX500_PORTS; i++) {
+		ret = register_netdevice(dp->ports[i]->ndev);
+		if (ret)
+			goto err_registered;
+	}
+	/* Retain the old platform attribute as a LAN1 compatibility alias. */
 	ret = sysfs_create_group(&pdev->dev.kobj, &grx500_tx_group);
-	if (ret) {
-		unregister_netdev(dp->ndev);
-		goto err_netdev;
-	}
-	dev_info(&pdev->dev, "LAN1 netdev registered; CBM/TMU starts when interface is brought up\n");
+	if (ret)
+		goto err_registered;
+	rtnl_unlock();
+	dev_info(&pdev->dev, "AX50 lan1-lan4/wan registered; shared CBM/TMU starts on first open\n");
 	return 0;
 
-err_netdev:
+err_registered:
+	while (i--)
+		unregister_netdevice(dp->ports[i]->ndev);
+	rtnl_unlock();
+	grx500_shutdown(dp);
 	netif_napi_del(&dp->napi);
-	free_netdev(dp->ndev);
-err_attr:
+err_alloc:
+	for (i = 0; i < GRX500_PORTS; i++)
+		if (dp->ports[i])
+			free_netdev(dp->ports[i]->ndev);
 	device_remove_file(&pdev->dev, &dev_attr_status);
 	return ret;
 }
@@ -2084,12 +2269,21 @@ err_attr:
 static void grx500_datapath_remove(struct platform_device *pdev)
 {
 	struct grx500_datapath *dp = platform_get_drvdata(pdev);
+	int i;
 
-	/* Drain sysfs readers before unregister frees the core statistics. */
 	sysfs_remove_group(&pdev->dev.kobj, &grx500_tx_group);
-	unregister_netdev(dp->ndev);
+	/* Stop every producer before destroying the shared NAPI anchor. */
+	rtnl_lock();
+	for (i = 0; i < GRX500_PORTS; i++)
+		if (netif_running(dp->ports[i]->ndev))
+			dev_close(dp->ports[i]->ndev);
+	grx500_shutdown(dp);
+	for (i = GRX500_PORTS - 1; i >= 0; i--)
+		unregister_netdevice(dp->ports[i]->ndev);
+	rtnl_unlock();
 	netif_napi_del(&dp->napi);
-	free_netdev(dp->ndev);
+	for (i = 0; i < GRX500_PORTS; i++)
+		free_netdev(dp->ports[i]->ndev);
 	device_remove_file(&pdev->dev, &dev_attr_status);
 }
 
