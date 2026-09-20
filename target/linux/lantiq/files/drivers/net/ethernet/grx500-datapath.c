@@ -8,6 +8,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/of.h>
@@ -231,6 +232,42 @@ static const resource_size_t grx500_pool_alignment[] = {
 	[GRX500_JUMBO_POOL] = 0x2000,
 };
 
+#define GRX500_TX_EVENTS 16
+
+enum grx500_tx_result {
+	GRX500_TX_ATTEMPT,
+	GRX500_TX_SUBMITTED,
+	GRX500_TX_DROP_LENGTH,
+	GRX500_TX_DROP_COPY,
+	GRX500_TX_BUSY_EMPTY,
+	GRX500_TX_BUSY_INVALID,
+	GRX500_TX_RESULTS,
+};
+
+static const char * const grx500_tx_result_names[] = {
+	"attempt", "submitted", "drop_length", "drop_copy",
+	"busy_empty", "busy_invalid",
+};
+
+struct grx500_tx_event {
+	u64 us;
+	u32 len;
+	u32 alloc_ptr;
+	u32 pocc;
+	int error;
+	u16 protocol;
+	u16 arp_op;
+	u8 result;
+	u8 cpu;
+};
+
+struct grx500_tx_diagnostics {
+	/* Columns: ARP, IPv4, IPv6, other. Protected by tx_lock. */
+	u32 counts[GRX500_TX_RESULTS][4];
+	u32 events;
+	struct grx500_tx_event ring[GRX500_TX_EVENTS];
+};
+
 struct grx500_datapath {
 	struct device *dev;
 	struct net_device *ndev;
@@ -241,6 +278,7 @@ struct grx500_datapath {
 	bool started;
 	bool poisoned;
 	spinlock_t tx_lock;
+	struct grx500_tx_diagnostics tx_diag;
 	void __iomem *base[GRX500_RESOURCE_COUNT];
 	spinlock_t tmu_lock;
 	phys_addr_t pool_phys[GRX500_POOL_COUNT];
@@ -954,7 +992,8 @@ static int grx500_cbm_frame_base(struct grx500_datapath *dp,
  * 0xfffff800 when empty. The caller must own the current CPU's EQM port.
  */
 static int __maybe_unused grx500_cbm_cpu_alloc_standard(struct grx500_datapath *dp,
-						 u32 cpu, phys_addr_t *frame)
+						 u32 cpu, phys_addr_t *frame,
+						 u32 *observed)
 {
 	void __iomem *reg;
 	phys_addr_t base;
@@ -970,6 +1009,9 @@ static int __maybe_unused grx500_cbm_cpu_alloc_standard(struct grx500_datapath *
 		if ((addr & 0xfffff800) != 0xfffff800)
 			break;
 	}
+	/* Do not read NEW_SPTR again for diagnostics: each read allocates. */
+	if (observed)
+		*observed = addr;
 	if (i > GRX500_CBM_ALLOC_RETRIES)
 		return -ENOBUFS;
 	id = grx500_cbm_frame_base(dp, addr, &base);
@@ -1175,7 +1217,7 @@ static int grx500_cbm_prepare_eqm_descriptors(struct grx500_datapath *dp,
 	 * In big-endian mode the DMA descriptor's control word is at +8.
 	 */
 	for (i = 0; i < eqm->descriptors; i++) {
-		ret = grx500_cbm_cpu_alloc_standard(dp, 0, &frame);
+		ret = grx500_cbm_cpu_alloc_standard(dp, 0, &frame, NULL);
 		if (ret)
 			return ret;
 		addr = frame + GRX500_RX_BUFFER_OFFSET;
@@ -1397,6 +1439,46 @@ static int grx500_lan1_poll(struct napi_struct *napi, int budget)
 	return done;
 }
 
+static unsigned int grx500_tx_protocol(__be16 protocol)
+{
+	switch (protocol) {
+	case htons(ETH_P_ARP): return 0;
+	case htons(ETH_P_IP): return 1;
+	case htons(ETH_P_IPV6): return 2;
+	default: return 3;
+	}
+}
+
+/* Hypothesis: failed ARP transmission delays queued ICMP until ARP retries.
+ * Record every driver failure without changing ownership/retry behavior.
+ * BUSY is not a driver drop: the caller may retry or discard the skb.
+ * Keep a bounded history in RAM; printing every retry would perturb UART
+ * timing. The caller holds tx_lock and still owns the skb.
+ */
+static void grx500_tx_failure(struct grx500_datapath *dp,
+			     struct sk_buff *skb, enum grx500_tx_result result,
+			     int error, u32 alloc_ptr)
+{
+	struct grx500_tx_diagnostics *diag = &dp->tx_diag;
+	struct grx500_tx_event *event = &diag->ring[diag->events % GRX500_TX_EVENTS];
+	__be16 arp_op = 0;
+
+	diag->counts[result][grx500_tx_protocol(skb->protocol)]++;
+	if (skb->protocol == htons(ETH_P_ARP) &&
+	    skb_copy_bits(skb, ETH_HLEN + 6, &arp_op, sizeof(arp_op)))
+		arp_op = 0;
+	event->us = ktime_to_us(ktime_get());
+	event->len = skb->len;
+	event->alloc_ptr = alloc_ptr;
+	event->pocc = __raw_readl(dp->base[GRX500_EQM] + GRX500_EQM_CPU_POCC);
+	event->error = error;
+	event->protocol = ntohs(skb->protocol);
+	event->arp_op = ntohs(arp_op);
+	event->result = result;
+	event->cpu = raw_smp_processor_id();
+	diag->events++;
+}
+
 static netdev_tx_t grx500_lan1_xmit(struct sk_buff *skb,
 				    struct net_device *ndev)
 {
@@ -1404,19 +1486,25 @@ static netdev_tx_t grx500_lan1_xmit(struct sk_buff *skb,
 	void __iomem *desc = dp->base[GRX500_EQM] + GRX500_EQM_CPU_DESC;
 	unsigned long irqflags;
 	phys_addr_t frame;
-	u32 addr, len;
+	u32 addr, len, alloc_ptr = 0;
+	unsigned int protocol = grx500_tx_protocol(skb->protocol);
 	u8 *data;
 	int ret;
 
+	spin_lock_irqsave(&dp->tx_lock, irqflags);
+	dp->tx_diag.counts[GRX500_TX_ATTEMPT][protocol]++;
 	if (unlikely(skb->len > ETH_FRAME_LEN + VLAN_HLEN ||
 		     skb->len < ETH_HLEN)) {
+		grx500_tx_failure(dp, skb, GRX500_TX_DROP_LENGTH, -EMSGSIZE, 0);
+		spin_unlock_irqrestore(&dp->tx_lock, irqflags);
 		ndev->stats.tx_dropped++;
 		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
 	}
-	spin_lock_irqsave(&dp->tx_lock, irqflags);
-	ret = grx500_cbm_cpu_alloc_standard(dp, 0, &frame);
+	ret = grx500_cbm_cpu_alloc_standard(dp, 0, &frame, &alloc_ptr);
 	if (ret) {
+		grx500_tx_failure(dp, skb, ret == -ENOBUFS ?
+			GRX500_TX_BUSY_EMPTY : GRX500_TX_BUSY_INVALID, ret, alloc_ptr);
 		spin_unlock_irqrestore(&dp->tx_lock, irqflags);
 		return NETDEV_TX_BUSY;
 	}
@@ -1432,6 +1520,7 @@ static netdev_tx_t grx500_lan1_xmit(struct sk_buff *skb,
 	data[7] = BIT(GRX500_LAN1_ENDPOINT);
 	ret = skb_copy_bits(skb, 0, data + GRX500_PMAC_SIZE, skb->len);
 	if (unlikely(ret)) {
+		grx500_tx_failure(dp, skb, GRX500_TX_DROP_COPY, ret, alloc_ptr);
 		grx500_cbm_cpu_return(dp, 0, frame);
 		spin_unlock_irqrestore(&dp->tx_lock, irqflags);
 		ndev->stats.tx_dropped++;
@@ -1456,6 +1545,7 @@ static netdev_tx_t grx500_lan1_xmit(struct sk_buff *skb,
 	wmb();
 	__raw_writel(BIT(29) | BIT(28) | ((addr & 7) << 23) | len,
 		     desc + 12);
+	dp->tx_diag.counts[GRX500_TX_SUBMITTED][protocol]++;
 	spin_unlock_irqrestore(&dp->tx_lock, irqflags);
 	ndev->stats.tx_packets++;
 	ndev->stats.tx_bytes += skb->len;
@@ -1860,6 +1950,61 @@ static ssize_t status_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(status);
 
+static ssize_t tx_diagnostics_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct grx500_datapath *dp = dev_get_drvdata(dev);
+	struct grx500_tx_diagnostics snapshot;
+	const struct net_device_core_stats __percpu *core;
+	u64 core_drops = 0;
+	int cpu;
+	unsigned long flags;
+	u32 count, first, i;
+	size_t len;
+
+	/* Snapshot software state only. Never allocate/dequeue during a read. */
+	spin_lock_irqsave(&dp->tx_lock, flags);
+	snapshot = dp->tx_diag;
+	spin_unlock_irqrestore(&dp->tx_lock, flags);
+	/* Like dev_get_stats(), sample core counters without clearing them. */
+	core = READ_ONCE(dp->ndev->core_stats);
+	if (core)
+		for_each_possible_cpu(cpu)
+			core_drops += READ_ONCE(per_cpu_ptr(core, cpu)->tx_dropped);
+	len = sysfs_emit(buf, "tx_diag_v2 columns=arp,ipv4,ipv6,other counters=u32 attempts_include_retries\n");
+	len += sysfs_emit_at(buf, len, "driver_tx_dropped=%lu core_tx_dropped=%llu sampled_separately\n",
+			    READ_ONCE(dp->ndev->stats.tx_dropped),
+			    (unsigned long long)core_drops);
+	for (i = 0; i < GRX500_TX_RESULTS; i++)
+		len += sysfs_emit_at(buf, len, "%s=%u,%u,%u,%u\n",
+			grx500_tx_result_names[i], snapshot.counts[i][0],
+			snapshot.counts[i][1], snapshot.counts[i][2], snapshot.counts[i][3]);
+	count = min_t(u32, snapshot.events, GRX500_TX_EVENTS);
+	first = snapshot.events - count;
+	len += sysfs_emit_at(buf, len, "failure_events=%u retained=%u busy_is_not_a_driver_drop\n",
+			     snapshot.events, count);
+	for (i = 0; i < count; i++) {
+		const struct grx500_tx_event *event =
+			&snapshot.ring[(first + i) % GRX500_TX_EVENTS];
+
+		len += sysfs_emit_at(buf, len,
+			"event=%u mono_us=%llu cpu=%u reason=%s proto=%04x arp_op=%u len=%u err=%d alloc=%08x pocc=%08x\n",
+			first + i + 1, (unsigned long long)event->us, event->cpu,
+			grx500_tx_result_names[event->result], event->protocol,
+			event->arp_op, event->len, event->error, event->alloc_ptr, event->pocc);
+	}
+	return len;
+}
+static DEVICE_ATTR_RO(tx_diagnostics);
+
+static struct attribute *grx500_tx_attrs[] = {
+	&dev_attr_tx_diagnostics.attr,
+	NULL,
+};
+static const struct attribute_group grx500_tx_group = {
+	.attrs = grx500_tx_attrs,
+};
+
 static int grx500_datapath_probe(struct platform_device *pdev)
 {
 	struct grx500_datapath *dp;
@@ -1919,6 +2064,12 @@ static int grx500_datapath_probe(struct platform_device *pdev)
 	ret = register_netdev(dp->ndev);
 	if (ret)
 		goto err_netdev;
+	/* Drop totals dereference ndev; publish only after registration. */
+	ret = sysfs_create_group(&pdev->dev.kobj, &grx500_tx_group);
+	if (ret) {
+		unregister_netdev(dp->ndev);
+		goto err_netdev;
+	}
 	dev_info(&pdev->dev, "LAN1 netdev registered; CBM/TMU starts when interface is brought up\n");
 	return 0;
 
@@ -1934,6 +2085,8 @@ static void grx500_datapath_remove(struct platform_device *pdev)
 {
 	struct grx500_datapath *dp = platform_get_drvdata(pdev);
 
+	/* Drain sysfs readers before unregister frees the core statistics. */
+	sysfs_remove_group(&pdev->dev.kobj, &grx500_tx_group);
 	unregister_netdev(dp->ndev);
 	netif_napi_del(&dp->napi);
 	free_netdev(dp->ndev);
