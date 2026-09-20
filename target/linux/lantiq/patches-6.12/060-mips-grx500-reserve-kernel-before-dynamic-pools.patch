@@ -1,0 +1,28 @@
+Subject: [PATCH] MIPS: GRX500: reserve kernel before allocating DT pools
+
+AX50 RAM Ethernet logs place the dynamic jumbo pool at 0x20020000,
+overlapping the running kernel. After enabling GSWIP-R receive, ARP bytes
+replaced setup_frame instructions. arch_mem_init() scans reserved-memory
+before bootmem_init() reserves the kernel, allowing a dynamic allocation
+to claim the kernel range.
+
+Protect GRX500's kernel before the DT allocation pass. The later identical
+reservation in bootmem_init() is harmless. Keep other MIPS platforms on
+their existing path while this port is under hardware bring-up.
+
+--- a/arch/mips/kernel/setup.c
++++ b/arch/mips/kernel/setup.c
+@@ -643,6 +643,13 @@ static void __init arch_mem_init(char **cmdline_p)
+ 
+ 	check_kernel_sections_mem();
+ 
++	/* Dynamic CBM pools must never occupy the running GRX500 kernel.
++	 * bootmem_init() reserves this range too late for the DT scan below.
++	 */
++	if (IS_ENABLED(CONFIG_SOC_GRX500))
++		memblock_reserve(__pa_symbol(&_text),
++				__pa_symbol(&_end) - __pa_symbol(&_text));
++
+ 	early_init_fdt_reserve_self();
+ 	early_init_fdt_scan_reserved_mem();
+ 

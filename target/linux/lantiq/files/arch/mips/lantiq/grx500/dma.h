@@ -138,6 +138,7 @@ struct dmax_chan {
 	enum dma_chan_txwgt txwgt;
 	int pkt_size;
 	int p2pcpy;
+	bool p2p_shared_buffer;
 	int global_buffer_len; /* Used for peri_to_peri */
 	struct mutex ch_lock;
 	const char *device_id;
@@ -197,4 +198,10 @@ struct dma_ctrl {
 	struct proc_dir_entry *proc;
 	u32 budget;
 };
+
+struct dma_ctrl *dma_cid_get_controller(int cid);
+struct dma_port *dma_cid_pid_get_port(int cid, int pid);
+struct dmax_chan *dma_ctrl_pid_nid_get_chan(struct dma_ctrl *pctrl, int pid,
+					   int nid);
+struct dmax_chan *dma_port_nid_get_chan(struct dma_port *port, int nid);
 #endif /* DMA_H */
