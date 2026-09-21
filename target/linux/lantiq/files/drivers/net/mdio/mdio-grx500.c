@@ -43,11 +43,18 @@
 #define GRX500_FDMA_PASR                 0xa47
 #define GRX500_FDMA_PCTRL                0xa80
 #define GRX500_SDMA_PCTRL                0xbc0
+#define GRX500_SDMA_PCTRL_FCSIGN         5
 #define GRX500_PCE_PCTRL                 0x480
 #define GRX500_PCE_PCTRL_3               0x483
+#define GRX500_MAC_PCTRL(port)           (0x903 + 0x0c * (port))
 #define GRX500_MAC_CTRL                  0x903
 #define GRX500_GSW_CTRL                  GRX500_GSW_TOP
 #define GRX500_GSW_CTRL_ENABLE           BIT(15)
+#define GRX500_GSWT_MDCCFG_0             (GRX500_GSW_TOP + 0x007)
+#define GRX500_GSWT_MDCCFG_1             (GRX500_GSW_TOP + 0x008)
+#define GRX500_GSWT_MII_CFG_1            (GRX500_GSW_TOP + 0x009)
+#define GRX500_GSWT_PHY_ADDR_1           (GRX500_GSW_TOP + 0x044)
+#define GRX500_GSWT_MDIO_STAT_1          (GRX500_GSW_TOP + 0x045)
 #define GRX500_PCE_GCTRL                 0x456
 #define GRX500_PCE_GCTRL_MC_VALID        BIT(3)
 #define GRX500_PCE_TFCR_NUM              0x46f
@@ -61,6 +68,9 @@
 #define GRX500_PCE_TBL_CTRL              0x44f
 #define GRX500_PCE_TBL_BUSY              BIT(15)
 #define GRX500_PCE_TBL_WRITE             BIT(5)
+#define GRX500_PCE_QUEUE_MAP_TABLE       0x11
+#define GRX500_PCE_TBL_OPMODE_WRITE      (1 << 5)
+#define GRX500_PCE_TBL_VALID             BIT(12)
 #define GRX500_BM_PCFG                   0x080
 #define GRX500_BM_RMON_CTRL              0x081
 #define GRX500_BM_RAM_VAL1               0x042
@@ -292,10 +302,11 @@ int grx500_gswip_prepare_pmac(struct mii_bus *bus, bool right)
 				}
 			}
 			memset(value, 0, sizeof(value));
-			/* Match vendor ltq_gsw_pmac_init(): channels 0-3 already
-			 * select the default PMAC port-map fields (bits 4 and 6).
-			 * Restricting their map to bit 0 and setting byte 3 to 0x80
-			 * was hardware-tested and did not deliver packets to the CPU.
+			/* GSWIP-R PMAC Ingress Configuration Table:
+			 * Matches vendor ltq_gsw_pmac_init(): channels 0-3 and
+			 * channel 15 enable the default port-map selectors (bits 4 and 6).
+			 * For DMA1TX15 (channel 15), defPmacHdr[6..7] is 0x8000
+			 * (GSWIP-R WAN logical port 15).
 			 */
 			value[1] = port == 15 ? 0x80 : port << 12;
 			value[3] = port == 15 ? 0x8000 : 0xffff;
@@ -309,23 +320,46 @@ int grx500_gswip_prepare_pmac(struct mii_bus *bus, bool right)
 			if (ret)
 				return ret;
 		}
-		for (port = 0; port < 15; port++) {
+		/* GSWIP-R CPU port 0: ingress special tag, no egress tag, SPFDIS. */
+		grx500_gswip_update_bits(base, GRX500_FDMA_PCTRL, BIT(1), 0);
+		grx500_gswip_update_bits(base, GRX500_PCE_PCTRL,
+					 BIT(11) | BIT(14), BIT(11) | BIT(14));
+		grx500_gswip_update_bits(base, GRX500_MAC_CTRL, BIT(7), BIT(7));
+
+		/* GSWIP-R TOP link and PHY interface setup:
+		 * Enable MDIO clock (FREQ=0xFF), enable MCEN, deassert reset (RES).
+		 * Enable MDIO hardware auto-polling for PHY 1 (PEN_1).
+		 * Configure Port 1 link: 1000M full duplex (0x3201).
+		 * Configure Port 1 MAC_CTRL: PADEN, FCS, FDUP, GMII 1000M (0x186).
+		 */
+		grx500_gswip_write(base, GRX500_GSWT_MDCCFG_1, 0x81ff);
+		grx500_gswip_update_bits(base, GRX500_GSWT_MDCCFG_0, GENMASK(6, 1), BIT(1));
+		grx500_gswip_write(base, GRX500_GSWT_PHY_ADDR_1, 0x3201);
+		grx500_gswip_write(base, GRX500_MAC_PCTRL(1), 0x186);
+
+		for (port = 0; port < 16; port++) {
+			/* No egress special tag on physical or forward ports. */
 			grx500_gswip_update_bits(base,
 				GRX500_FDMA_PCTRL + 6 * port, BIT(1), 0);
+			/* Vendor GSW_CPU_PortCfgSet(bFcsCheck=0) explicitly
+			 * disables SDMA FCS checking on every CPU-facing port.
+			 */
 			grx500_gswip_update_bits(base,
-				GRX500_PCE_PCTRL + 10 * port,
-				BIT(11), BIT(11));
+				GRX500_SDMA_PCTRL + 6 * port,
+				BIT(GRX500_SDMA_PCTRL_FCSIGN), 0);
+			/* Wire/external ports (including Port 1 WAN) must NOT
+			 * expect an ingress PMAC special tag (IGSTEN=0). Only CPU
+			 * port 0 has IGSTEN enabled above.
+			 */
+			if (port != 0)
+				grx500_gswip_update_bits(base,
+					GRX500_PCE_PCTRL + 10 * port,
+					BIT(11), 0);
 			/* Vendor GSW_PortCfgSet(bLearning=1) sets LNDIS. */
 			grx500_gswip_update_bits(base,
 				GRX500_PCE_PCTRL_3 + 10 * port,
 				BIT(15), BIT(15));
-			if (port)
-				grx500_gswip_update_bits(base,
-					GRX500_MAC_CTRL + 12 * (port - 1),
-					BIT(7), BIT(7));
 		}
-		grx500_gswip_update_bits(base, GRX500_PCE_PCTRL_3 + 10 * 15,
-					 BIT(15), BIT(15));
 		/* Vendor ltq_gsw_pmac_init() sends unknown traffic to port 0
 		 * on GSWIP-R after the LAN-switch DMA P2P handoff.
 		 */
@@ -357,6 +391,10 @@ int grx500_gswip_enable_port(struct mii_bus *bus, bool right, u8 port)
 				 BIT(0), BIT(0));
 	grx500_gswip_update_bits(base, GRX500_FDMA_PCTRL + 6 * port,
 				 BIT(0), BIT(0));
+	if (right && port == 1) {
+		grx500_gswip_write(base, GRX500_MAC_PCTRL(1), 0x186);
+		grx500_gswip_write(base, GRX500_GSWT_PHY_ADDR_1, 0x3201);
+	}
 	return 0;
 }
 EXPORT_SYMBOL_GPL(grx500_gswip_enable_port);
@@ -568,7 +606,7 @@ static ssize_t switch_status_show(struct device *dev,
 	struct mii_bus *bus = dev_get_drvdata(dev);
 	void __iomem *base = bus->priv;
 	u8 port = 5;
-	u16 ingress[5], egress[5];
+	u16 ingress[5], egress[5], wan_egress[5], wan_ingress[5];
 	ssize_t len;
 	int ret;
 
@@ -580,11 +618,25 @@ static ssize_t switch_status_show(struct device *dev,
 					      egress);
 	if (ret)
 		return ret;
+	ret = grx500_gswip_pmac_table_read(base, 15, GRX500_PMAC_IGCFG,
+					      wan_ingress);
+	if (ret)
+		return ret;
+	/* Endpoint 15 is the vendor Ethernet-WAN destination.  Reading its
+	 * first egress entry makes the PMAC route observable without dumping
+	 * the complete 4096-entry table.
+	 */
+	ret = grx500_gswip_pmac_table_read(base, 15, GRX500_PMAC_EGCFG,
+					      wan_egress);
+	if (ret)
+		return ret;
 
 	len = sysfs_emit(buf,
 		"gsw_ctrl=%08x pce_gctrl=%08x pce_table_ctrl=%08x "
-		"cpu_sdma=%08x cpu_fdma=%08x port%u_sdma=%08x port%u_fdma=%08x\n"
-		"pce_pmap2=%08x pce_pmap3=%08x pce_port0=%08x pce_port%u=%08x tfcr_num=%08x bm_queue_gctrl=%08x\n",
+		"cpu_sdma=%08x cpu_fdma=%08x port%u_sdma=%08x port%u_fdma=%08x "
+		"wan_port1_sdma=%08x wan_port1_fdma=%08x\n"
+		"pce_pmap2=%08x pce_pmap3=%08x pce_port0=%08x pce_port%u=%08x "
+		"wan_pce_port1=%08x tfcr_num=%08x bm_queue_gctrl=%08x\n",
 		grx500_gswip_read(base, GRX500_GSW_CTRL),
 		grx500_gswip_read(base, GRX500_PCE_GCTRL),
 		grx500_gswip_read(base, GRX500_PCE_TBL_CTRL),
@@ -592,16 +644,32 @@ static ssize_t switch_status_show(struct device *dev,
 		grx500_gswip_read(base, GRX500_FDMA_PCTRL),
 		port, grx500_gswip_read(base, GRX500_SDMA_PCTRL + 6 * port),
 		port, grx500_gswip_read(base, GRX500_FDMA_PCTRL + 6 * port),
+		grx500_gswip_read(base, GRX500_SDMA_PCTRL + 6),
+		grx500_gswip_read(base, GRX500_FDMA_PCTRL + 6),
 		grx500_gswip_read(base, GRX500_PCE_PMAP2),
 		grx500_gswip_read(base, GRX500_PCE_PMAP3),
 		grx500_gswip_read(base, GRX500_PCE_PCTRL),
 		port, grx500_gswip_read(base, GRX500_PCE_PCTRL + 10 * port),
+		grx500_gswip_read(base, GRX500_PCE_PCTRL + 10),
 		grx500_gswip_read(base, GRX500_PCE_TFCR_NUM),
 		grx500_gswip_read(base, GRX500_BM_QUEUE_GCTRL));
 	len += sysfs_emit_at(buf, len,
-		"pmac_ig0=%04x:%04x:%04x:%04x:%04x pmac_eg0=%04x:%04x:%04x:%04x:%04x\n",
+		"pmac_ig0=%04x:%04x:%04x:%04x:%04x pmac_eg0=%04x:%04x:%04x:%04x:%04x "
+		"pmac_ig15=%04x:%04x:%04x:%04x:%04x pmac_eg15=%04x:%04x:%04x:%04x:%04x\n",
 		ingress[0], ingress[1], ingress[2], ingress[3], ingress[4],
-		egress[0], egress[1], egress[2], egress[3], egress[4]);
+		egress[0], egress[1], egress[2], egress[3], egress[4],
+		wan_ingress[0], wan_ingress[1], wan_ingress[2], wan_ingress[3],
+		wan_ingress[4],
+		wan_egress[0], wan_egress[1], wan_egress[2], wan_egress[3],
+		wan_egress[4]);
+	len += sysfs_emit_at(buf, len,
+		"mdccfg_0=%08x mdccfg_1=%08x mii_cfg1=%08x phy_addr1=%08x mdio_stat1=%08x mac_ctrl0=%08x\n",
+		grx500_gswip_read(base, GRX500_GSWT_MDCCFG_0),
+		grx500_gswip_read(base, GRX500_GSWT_MDCCFG_1),
+		grx500_gswip_read(base, GRX500_GSWT_MII_CFG_1),
+		grx500_gswip_read(base, GRX500_GSWT_PHY_ADDR_1),
+		grx500_gswip_read(base, GRX500_GSWT_MDIO_STAT_1),
+		grx500_gswip_read(base, GRX500_MAC_CTRL));
 	return len;
 }
 static DEVICE_ATTR_RO(switch_status);

@@ -286,8 +286,8 @@ struct grx500_port_config {
 static const struct grx500_port_config grx500_ports[] = {
 	{ "lan1", 5, 0, 5, 5, 5 }, { "lan2", 4, 0, 4, 4, 4 },
 	{ "lan3", 3, 0, 3, 3, 3 }, { "lan4", 2, 0, 2, 2, 2 },
-	/* Vendor GSWIP-R ingress channel 15 supplies SPPID/source port 0. */
-	{ "wan", 15, 1, 1, 1, 0 },
+	/* GSWIP-R wire ingress supplies PMAC SPPID 15 (0xF) via DMA1TX15. */
+	{ "wan", 15, 1, 1, 1, 15 },
 };
 
 struct grx500_port {
@@ -1417,11 +1417,15 @@ static int grx500_poll(struct napi_struct *napi, int budget)
 		/* Both switches explicitly disable FDMA parser prefixes. Do not
 		 * search packet payload for a nibble that resembles a port ID.
 		 */
-		for (p = 0; p < GRX500_PORTS; p++)
-			if ((data[2] >> 4) == dp->ports[p]->config->rx_port) {
+		for (p = 0; p < GRX500_PORTS; p++) {
+			u8 rx_id = data[2] >> 4;
+
+			if (rx_id == dp->ports[p]->config->rx_port ||
+			    (dp->ports[p]->config->switch_id == 1 && (rx_id == 1 || rx_id == 15))) {
 				port = dp->ports[p];
 				break;
 			}
+		}
 		if (!port) {
 			if (dp->rx_bad_pmac < 4)
 				dev_info(dp->dev, "RX PMAC mismatch ptr=%08x flags=%08x first32=%*phN\n",
@@ -1559,14 +1563,21 @@ static netdev_tx_t grx500_xmit(struct sk_buff *skb,
 	 */
 	len = max_t(u32, skb->len, ETH_ZLEN) + GRX500_PMAC_SIZE;
 	data = phys_to_virt(addr);
-	/* Vendor Ethernet PMAC: CPU source, explicit destination bitmap. */
+	/* Big-endian PMAC TX layout: CPU SPPID=0, port_map_en=0x80.
+	 * Explicit destination port bitmap targets the switch port:
+	 * LAN1..4 -> GSWIP-L ports 5..2; WAN -> GSWIP-R logical port 15.
+	 * For WAN on GSWIP-R, vendor datapath sets redirect = 1 (bit 6 of byte 4)
+	 * and port_map = 0x80 (Port 15, matching SET_PMAC_PORTMAP(pmac, 15)).
+	 */
 	memset(data, 0, GRX500_PMAC_SIZE);
-	/* Big-endian PMAC TX layout: CPU SPPID=0, port_map_en=0x80. */
 	data[3] = 0x80;
-	data[6] = BIT(port->config->endpoint) >> 8;
-	data[7] = BIT(port->config->endpoint) & 0xff;
-	if (port->config->switch_id)
-		data[4] = BIT(6); /* Vendor WAN redirect bit. */
+	if (port->config->switch_id) {
+		data[4] = 0x40; /* redirect = 1 */
+		data[6] = 0x80; /* Port 15 */
+	} else {
+		data[6] = BIT(port->config->switch_port) >> 8;
+		data[7] = BIT(port->config->switch_port) & 0xff;
+	}
 	ret = skb_copy_bits(skb, 0, data + GRX500_PMAC_SIZE, skb->len);
 	if (unlikely(ret)) {
 		grx500_tx_failure(port, skb, GRX500_TX_DROP_COPY, ret, alloc_ptr);
