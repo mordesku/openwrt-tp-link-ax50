@@ -35,3 +35,22 @@ define KernelPackage/dsa-gswip/description
 endef
 
 $(eval $(call KernelPackage,dsa-gswip))
+
+define KernelPackage/grx500-switch
+  SUBMENU:=$(NETWORK_DEVICES_MENU)
+  TITLE:=Lantiq GRX500 GSWIP and Datapath support
+  DEPENDS:=@TARGET_lantiq_xrx500
+  KCONFIG:= \
+	CONFIG_MDIO_GRX500_GSWIP \
+	CONFIG_GRX500_DATAPATH
+  FILES:= \
+	$(LINUX_DIR)/drivers/net/mdio/mdio-grx500.ko \
+	$(LINUX_DIR)/drivers/net/ethernet/grx500-datapath.ko
+  AUTOLOAD:=$(call AutoLoad,40,mdio-grx500 grx500-datapath)
+endef
+
+define KernelPackage/grx500-switch/description
+  Lantiq GRX500 GSWIP MDIO and Datapath network driver
+endef
+
+$(eval $(call KernelPackage,grx500-switch))

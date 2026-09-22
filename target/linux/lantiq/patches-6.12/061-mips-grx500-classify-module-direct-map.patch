@@ -1,0 +1,23 @@
+Subject: [PATCH] MIPS: GRX500: classify module memory using the EVA direct map
+
+The OpenWrt short-call module allocator distinguishes page/kmalloc allocations
+from vmalloc using KSEG0. GRX500 EVA maps cached DDR at PAGE_OFFSET=0x60000000,
+so both PLT cleanup and executable init-memory cleanup incorrectly call vfree
+on direct-map addresses. Use the actual low-memory range for this platform.
+The same predicate also selects the physical versus virtual PLT table.
+
+--- a/arch/mips/kernel/module.c
++++ b/arch/mips/kernel/module.c
+@@ -206,7 +206,11 @@ static inline bool is_phys_addr(void *ptr)
+ {
+-#ifdef CONFIG_64BIT
++#if defined(CONFIG_SOC_GRX500) && defined(CONFIG_EVA)
++	/* EVA cached DDR is not in the conventional KSEG0 segment. */
++	return (unsigned long)ptr >= PAGE_OFFSET &&
++	       (unsigned long)ptr < (unsigned long)high_memory;
++#elif defined(CONFIG_64BIT)
+ 	return (KSEGX((unsigned long)ptr) == CKSEG0);
+ #else
+ 	return (KSEGX(ptr) == KSEG0);
+ #endif
+ }

@@ -9,6 +9,10 @@
 
 	aliases {
 		serial0 = &asc0;
+		dma1 = &dma1tx;
+		dma2 = &dma1rx;
+		dma3 = &dma2tx;
+		dma4 = &dma2rx;
 	};
 
 	chosen {
@@ -21,8 +25,7 @@
 	};
 
 	/* Vendor boot log: CS1, parallel 8-bit NAND at 0x17c00000.
-	 * The first experiment exposes one read-only whole-chip MTD device;
-	 * no partition table, UBI attach or flash writes are requested.
+	 * Hardware partition table matches U-Boot mtdparts.
 	 */
 	nand@17c00000 {
 		compatible = "lantiq,nand-xway";
@@ -32,6 +35,51 @@
 		nand-ecc-mode = "soft_bch";
 		nand-ecc-strength = <4>;
 		nand-ecc-step-size = <512>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "uboot";
+				reg = <0x00000000 0x00100000>;
+				read-only;
+			};
+
+			partition@100000 {
+				label = "ubootconfigA";
+				reg = <0x00100000 0x00040000>;
+			};
+
+			partition@140000 {
+				label = "ubootconfigB";
+				reg = <0x00140000 0x00040000>;
+			};
+
+			partition@180000 {
+				label = "gphyfirmware";
+				reg = <0x00180000 0x00040000>;
+				read-only;
+			};
+
+			partition@1c0000 {
+				label = "calibration";
+				reg = <0x001c0000 0x00100000>;
+				read-only;
+			};
+
+			partition@2c0000 {
+				label = "system_sw";
+				reg = <0x002c0000 0x07c00000>;
+			};
+
+			partition@7ec0000 {
+				label = "res";
+				reg = <0x07ec0000 0x00140000>;
+				read-only;
+			};
+		};
 	};
 
 	/* Vendor VMB CPU_LAUNCH=0xa0000000 maps to DDR 0x20000000.
@@ -49,12 +97,157 @@
 
 		/* Vendor bootmem implicitly retains RAM below kernel _text.
 		 * SPL/IBL begins at a0001000; kernel load starts at a0020000.
-		 * Hypothesis: retain this complete pre-kernel firmware window,
-		 * not just its mailbox. This does not assert an exact IBL size.
 		 */
 		ibl-firmware@20001000 {
 			reg = <0x20001000 0x1f000>;
 		};
+
+		cbm_standard_pool: cbm-standard-pool {
+			size = <0x01200000>;
+			alignment = <0x00000800>;
+		};
+
+		cbm_jumbo_pool: cbm-jumbo-pool {
+			size = <0x00800000>;
+			alignment = <0x00002000>;
+		};
+	};
+
+	/* GSWIP-L DMA2RX0-3 shares buffers with GSWIP-R DMA1TX0-3. */
+	dma1tx: dma@1a100000 {
+		compatible = "lantiq,dma-grx500";
+		reg = <0x1a100000 0x100000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 65 IRQ_TYPE_LEVEL_HIGH>;
+		lantiq,dma-pkt-arb = <2>;
+		lantiq,dma-burst = <16>;
+		lantiq,dma-polling-cnt = <108>;
+		lantiq,dma-chan-fc = <1>;
+		lantiq,dma-desc-fod = <1>;
+		lantiq,dma-desc-in-sram = <1>;
+		lantiq,dma-drb = <0>;
+		lantiq,dma-byte-en = <1>;
+		lantiq,budget = <20>;
+		lantiq,dma-lab-cnt = <2>;
+		status = "okay";
+	};
+
+	dma1rx: dma@1a200000 {
+		compatible = "lantiq,dma-grx500";
+		reg = <0x1a200000 0x100000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 66 IRQ_TYPE_LEVEL_HIGH>;
+		lantiq,dma-pkt-arb = <2>;
+		lantiq,dma-burst = <16>;
+		lantiq,dma-polling-cnt = <24>;
+		lantiq,dma-chan-fc = <0>;
+		lantiq,dma-desc-fod = <1>;
+		lantiq,dma-desc-in-sram = <0>;
+		lantiq,dma-drb = <0>;
+		lantiq,dma-byte-en = <0>;
+		lantiq,budget = <20>;
+		status = "okay";
+	};
+
+	dma2tx: dma@1c100000 {
+		compatible = "lantiq,dma-grx500";
+		reg = <0x1c100000 0x100000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 67 IRQ_TYPE_LEVEL_HIGH>;
+		lantiq,dma-pkt-arb = <2>;
+		lantiq,dma-burst = <16>;
+		lantiq,dma-polling-cnt = <24>;
+		lantiq,dma-chan-fc = <1>;
+		lantiq,dma-desc-fod = <1>;
+		lantiq,dma-desc-in-sram = <0>;
+		lantiq,dma-drb = <0>;
+		lantiq,dma-byte-en = <1>;
+		lantiq,budget = <20>;
+		status = "okay";
+	};
+
+	dma2rx: dma@1c200000 {
+		compatible = "lantiq,dma-grx500";
+		reg = <0x1c200000 0x100000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 68 IRQ_TYPE_LEVEL_HIGH>;
+		lantiq,dma-pkt-arb = <2>;
+		lantiq,dma-burst = <16>;
+		lantiq,dma-polling-cnt = <24>;
+		lantiq,dma-chan-fc = <0>;
+		lantiq,dma-desc-fod = <1>;
+		lantiq,dma-desc-in-sram = <1>;
+		lantiq,dma-drb = <0>;
+		lantiq,dma-byte-en = <1>;
+		lantiq,budget = <20>;
+		status = "okay";
+	};
+
+	gswip_l: gswitch@1c000000 {
+		compatible = "lantiq,grx500-gswip-mdio";
+		reg = <0x1c000000 0x4000>;
+		firmware-name = "lantiq/phy11g_ip_BE.bin";
+		resets = <&rcu0 29>, <&rcu0 28>, <&rcu0 26>, <&rcu0 25>, <&rcu0 31>;
+		reset-names = "phy0", "phy1", "phy2", "phy3", "phy4";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		ethernet-phy@2 { reg = <2>; };
+		ethernet-phy@3 { reg = <3>; };
+		ethernet-phy@4 { reg = <4>; };
+		ethernet-phy@5 { reg = <5>; };
+	};
+
+	gswip_r: gswitch@1a000000 {
+		compatible = "lantiq,grx500-gswip-mdio";
+		reg = <0x1a000000 0x4000>;
+		lantiq,wait-for-gphy;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		ethernet-phy@1 { reg = <1>; };
+	};
+
+	datapath@1e700000 {
+		compatible = "lantiq,grx500-datapath";
+		reg = <0x1e700000 0x1000>,
+		      <0x1e710000 0x10000>,
+		      <0x1e720000 0x4000>,
+		      <0x1e730000 0x14000>,
+		      <0x1e750000 0x400>,
+		      <0x1e750800 0x400>,
+		      <0x1e760000 0x10000>,
+		      <0x1e780000 0x20000>,
+		      <0x1e7c0000 0x30000>,
+		      <0x1e800000 0x100000>,
+		      <0x1e900000 0x100000>,
+		      <0x1e500000 0x100000>;
+		reg-names = "tmu", "cbm", "qidt", "sbim", "qeqcnt",
+			    "qdqcnt", "ls", "eqm", "dqm", "fsqm0",
+			    "fsqm1", "dma-desc";
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 174 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 178 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 179 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 180 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 181 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "eqm", "dqm-cpu0", "dqm-cpu1",
+				  "dqm-cpu2", "dqm-cpu3";
+		lantiq,gswip-left = <&gswip_l>;
+		lantiq,gswip-right = <&gswip_r>;
+		memory-region = <&cbm_standard_pool>, <&cbm_jumbo_pool>;
+		memory-region-names = "standard", "jumbo";
+		lantiq,lan-eqm-routes = <5 2 14 0 2>, <5 2 30 1 2>,
+				 <6 2 15 0 2>, <6 2 31 1 2>;
+		lantiq,gswr-eqm-route = <7 1 0 0 2>;
+		lantiq,lan-dqm-routes = <6 16 2 1 2>, <7 17 2 2 2>,
+				 <8 18 2 3 2>, <9 19 2 4 2>,
+				 <10 20 2 5 2>, <11 21 2 6 2>,
+				 <12 22 2 9 2>, <13 23 2 10 2>,
+				 <14 24 2 11 2>, <15 25 2 12 2>,
+				 <16 26 2 13 2>, <17 27 2 14 2>;
+		lantiq,wan-dqm-route = <19 28 1 15 2>;
+		lantiq,cpu-dqm-port = <2 35>;
 	};
 };
 

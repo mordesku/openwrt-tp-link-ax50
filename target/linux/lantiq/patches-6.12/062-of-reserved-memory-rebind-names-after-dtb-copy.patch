@@ -1,0 +1,28 @@
+Subject: [PATCH] of: reserved_mem: refresh dynamic region names after FDT copy
+
+Dynamic regions are recorded before MIPS copies its appended DTB out of
+init memory. Their names still point into the old blob when the reserved
+memory table is used by modules after free_initmem(). Static regions are
+already recorded from the copied blob in fdt_scan_reserved_mem_reg_nodes().
+
+Refresh existing dynamic-region names from the current blob before scanning
+the static regions. Node offsets remain valid across the byte-for-byte copy.
+Keep the original allocation geometry and reservation lifetime unchanged.
+
+--- a/drivers/of/of_reserved_mem.c
++++ b/drivers/of/of_reserved_mem.c
+@@ -191,6 +191,14 @@ void __init fdt_scan_reserved_mem_reg_nodes(void)
+ 	if (!fdt)
+ 		return;
+ 
++	/* The FDT may have been copied since dynamic regions were saved.
++	 * Do not retain names in the original, potentially init-only blob.
++	 */
++	for (int i = 0; i < reserved_mem_count; i++) {
++		struct reserved_mem *rmem = &reserved_mem[i];
++
++		rmem->name = fdt_get_name(fdt, rmem->fdt_node, NULL);
++	}
+ 	node = fdt_path_offset(fdt, "/reserved-memory");
+ 	if (node < 0) {
+ 		pr_info("Reserved memory: No reserved-memory node in the DT\n");

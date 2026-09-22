@@ -9,6 +9,7 @@
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/export.h>
+#include <linux/grx500-memory.h>
 #include <linux/irqchip.h>
 #include <linux/of.h>
 #include <linux/smp.h>
@@ -21,6 +22,7 @@
 #include <asm/mips-gic.h>
 #include <asm/traps.h>
 #include <asm/mipsregs.h>
+#include <asm/sections.h>
 
 #include <lantiq_soc.h>
 
@@ -30,6 +32,14 @@
 #define SOC_GRX350	"GRX350"
 
 #define COMP_GRX500	"lantiq,grx500"
+
+/* Keep DMA overlap checks exact after the datapath becomes a module. */
+void grx500_kernel_phys_range(phys_addr_t *start, phys_addr_t *end)
+{
+	*start = __pa_symbol(_text);
+	*end = __pa_symbol(_end);
+}
+EXPORT_SYMBOL_GPL(grx500_kernel_phys_range);
 
 /* Vendor mailbox ABI, checked against the waiting statuses in 165119.log. */
 bool grx500_vmb_ready(unsigned int cpu);
