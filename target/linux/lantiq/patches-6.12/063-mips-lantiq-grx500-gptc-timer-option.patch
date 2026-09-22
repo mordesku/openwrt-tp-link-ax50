@@ -1,0 +1,18 @@
+--- a/arch/mips/lantiq/Kconfig
++++ b/arch/mips/lantiq/Kconfig
+@@ -45,6 +45,15 @@
+ 
+ endchoice
+ 
++config GRX500_GPTC_TIMER
++	bool "GRX500 vendor-layout GPTC system timers"
++	depends on SOC_GRX500 && SMP
++	default n
++	help
++	  Use the AX50 vendor GPTC channel allocation for a shared clocksource
++	  and four CPU clockevents. The board must provide the corresponding
++	  lantiq,grx500-system-timer DT node. R4K remains the early boot timer.
++
+ choice
+ 	prompt "Devicetree selection"
+ 	default DT_NONE

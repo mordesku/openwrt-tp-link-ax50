@@ -42,17 +42,12 @@
 +		    EBU_ADDSEL1);
  
  	ltq_ebu_w32(BUSCON1_SETUP | BUSCON1_BCGEN_RES | BUSCON1_WAITWRC2
-@@ -228,4 +236,13 @@ static int xway_nand_probe(struct pla
- 	if (err)
- 		return err;
- 
-+	/* The AX50 RAM bring-up exposes NAND only for inspection. This must
-+	 * remain before mtd_device_register(), including any partitions.
-+	 * Do not enable writes until ECC and recovery are independently proven.
-+	 */
-+	if (of_machine_is_compatible("tplink,archer-ax50-v1")) {
-+		mtd->flags &= ~MTD_WRITEABLE;
-+		dev_info(&pdev->dev, "GRX500 NAND registered read-only for bring-up\n");
-+	}
+@@ -226,6 +234,9 @@ static int xway_nand_probe(struct pla
+ 	 */
+ 	data->chip.ecc.engine_type = NAND_ECC_ENGINE_TYPE_SOFT;
+
++	if (grx500)
++		data->chip.options |= NAND_NO_SUBPAGE_WRITE;
 +
- 	err = mtd_device_register(mtd, NULL, 0);
+ 	/* Scan to find existence of the device */
+ 	err = nand_scan(&data->chip, 1);

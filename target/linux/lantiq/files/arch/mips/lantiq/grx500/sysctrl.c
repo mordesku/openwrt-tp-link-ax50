@@ -14,14 +14,26 @@
 #include <linux/of_platform.h>
 #include <linux/of_address.h>
 
+#include <linux/slab.h>
+
 #include <lantiq_soc.h>
 
-#include "clk.h"
+#include "../clk.h"
 #include "../prom.h"
 
 #ifndef CLOCK_800M
 #define CLOCK_800M	800000000
 #endif
+
+#ifndef CLOCK_8M_192K
+#define CLOCK_8M_192K	8192000
+#endif
+
+struct grx500_cgu_clk {
+	struct clk clk;
+	atomic_t refcount;
+	bool always_on;
+};
 
 
 /* First register set */
@@ -113,15 +125,16 @@ static u32 cgu_clk_cr_b[] = {
 /* enable a clock gate */
 static int cgu_enable(struct clk *clk)
 {
+	struct grx500_cgu_clk *cclk = container_of(clk, struct grx500_cgu_clk, clk);
 	int retry = 1000000;
 
-	if (!clk->always_on) {
+	if (!cclk->always_on) {
 		pr_debug("%s module %d position 0x%08x always on\n",
 			__func__, clk->module, clk->bits);
 		return 0;
 	}
 
-	if (atomic_read(&clk->refcount) == 0) {
+	if (atomic_read(&cclk->refcount) == 0) {
 		ltq_cgu_w32(clk->bits, CGU_CR_EN_XRX(clk->module));
 		do {} while (--retry
 			&& (!(ltq_cgu_r32(CGU_SR_XRX(clk->module))
@@ -135,26 +148,27 @@ static int cgu_enable(struct clk *clk)
 		pr_debug("%s module %d position 0x%08x already enabled\n",
 			__func__, clk->module, clk->bits);
 	}
-	atomic_inc(&clk->refcount);
+	atomic_inc(&cclk->refcount);
 	return 0;
 }
 
 /* disable a clock gate */
 static void cgu_disable(struct clk *clk)
 {
+	struct grx500_cgu_clk *cclk = container_of(clk, struct grx500_cgu_clk, clk);
 	int retry = 1000000;
 
-	if (!clk->always_on) {
+	if (!cclk->always_on) {
 		pr_debug("%s module %d position 0x%08x always on\n",
 			__func__, clk->module, clk->bits);
 		return;
 	}
 
 	/* Consider disabling the module when powering on the system */
-	if (atomic_read(&clk->refcount) > 0)
-		atomic_dec(&clk->refcount);
+	if (atomic_read(&cclk->refcount) > 0)
+		atomic_dec(&cclk->refcount);
 
-	if (atomic_read(&clk->refcount) == 0) {
+	if (atomic_read(&cclk->refcount) == 0) {
 		ltq_cgu_w32(clk->bits, CGU_CR_DIS_XRX(clk->module));
 		do {} while (--retry
 			&& (ltq_cgu_r32(CGU_SR_XRX(clk->module)) & clk->bits));
@@ -173,18 +187,21 @@ static void cgu_disable(struct clk *clk)
 static void clkdev_add_pmu(const char *dev, const char *con,
 		bool used, unsigned int module, unsigned int bits)
 {
-	struct clk *clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
-	if (clk == NULL)
+	struct grx500_cgu_clk *cclk = kzalloc(sizeof(*cclk), GFP_KERNEL);
+	struct clk *clk;
+
+	if (cclk == NULL)
 		return;
+	clk = &cclk->clk;
 	clk->cl.dev_id = dev;
 	clk->cl.con_id = con;
 	clk->cl.clk = clk;
-	clk->always_on = used;
+	cclk->always_on = used;
 	clk->enable = cgu_enable;
 	clk->disable = cgu_disable;
 	clk->module = module;
 	clk->bits = bits;
-	atomic_set(&clk->refcount, 0);
+	atomic_set(&cclk->refcount, 0);
 	/* Disable it during the initialitin. Module should enable when used */
 	cgu_disable(clk);
 	clkdev_add(&clk->cl);
@@ -222,7 +239,6 @@ static void clkdev_add_clkout0(int used)
 	clk->rate = CLOCK_8M_192K;
 	clk->enable = clkout0_enable;
 	clk->disable = clkout0_disable;
-	clk->always_on = used;
 	clk->module = 0;
 	clkout0_disable(clk);
 	clkdev_add(&clk->cl);

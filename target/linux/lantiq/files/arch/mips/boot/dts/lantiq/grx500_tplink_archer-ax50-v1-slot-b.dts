@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#include "grx500_tplink_archer-ax50-v1.dts"
+
+/ {
+	chosen {
+		/* The vendor rootfsname argument is not understood by Linux 6.12.
+		 * Slot B uses UBI device 0, volume 3 (rootfsB), as recorded in the
+		 * hardware inventory. Use FROM_DTB: stock U-Boot supplies
+		 * mem=256M@512M, which overrides our tested 224 MiB RAM map.
+		 * Merely adding mem=224M would not fix this: MIPS adds multiple
+		 * mem= ranges rather than letting the last one replace the first.
+		 */
+		/* Native kernel diagnostics retain registers if PID 1 faults. */
+		bootargs = "console=ttyLTQ0,115200 cca=5 ubi.mtd=system_sw ubi.block=0,rootfsB root=/dev/ubiblock0_3 rootfstype=squashfs ro init=/etc/preinit active_bank=B maxcpus=4 print-fatal-signals=1 panic=1";
+	};
+};

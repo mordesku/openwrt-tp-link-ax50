@@ -4,6 +4,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
 #include <linux/grx500-gswip.h>
+#include <linux/grx500-memory.h>
 #include <linux/if_vlan.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -20,7 +21,6 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/sysfs.h>
-#include <asm/sections.h>
 #include <lantiq_dmax.h>
 
 /* Offsets are from the vendor CBM/TMU generated register headers. */
@@ -284,10 +284,12 @@ struct grx500_port_config {
 };
 
 static const struct grx500_port_config grx500_ports[] = {
-	{ "lan1", 5, 0, 5, 5, 5 }, { "lan2", 4, 0, 4, 4, 4 },
-	{ "lan3", 3, 0, 3, 3, 3 }, { "lan4", 2, 0, 2, 2, 2 },
 	/* GSWIP-R wire ingress supplies PMAC SPPID 15 (0xF) via DMA1TX15. */
-	{ "wan", 15, 1, 1, 1, 15 },
+	{ "eth0", 15, 1, 1, 1, 15 },
+	{ "eth1", 5, 0, 5, 5, 5 },
+	{ "eth2", 4, 0, 4, 4, 4 },
+	{ "eth3", 3, 0, 3, 3, 3 },
+	{ "eth4", 2, 0, 2, 2, 2 },
 };
 
 struct grx500_port {
@@ -301,7 +303,7 @@ struct grx500_port {
 
 struct grx500_datapath {
 	struct device *dev;
-	struct net_device *ndev; /* Stable NAPI anchor: lan1, even when down. */
+	struct net_device *ndev; /* Stable NAPI anchor: eth0, even when down. */
 	struct grx500_port *ports[GRX500_PORTS];
 	struct napi_struct napi;
 	u32 rx_bad_descriptor;
@@ -1882,9 +1884,10 @@ static int grx500_read_lan_routes(struct platform_device *pdev,
 static int grx500_find_pools(struct platform_device *pdev,
 			     struct grx500_datapath *dp)
 {
-	phys_addr_t kernel_start = __pa_symbol(_text);
-	phys_addr_t kernel_end = __pa_symbol(_end);
+	phys_addr_t kernel_start, kernel_end;
 	int i;
+
+	grx500_kernel_phys_range(&kernel_start, &kernel_end);
 
 	for (i = 0; i < GRX500_POOL_COUNT; i++) {
 		struct device_node *node;
@@ -1896,11 +1899,19 @@ static int grx500_find_pools(struct platform_device *pdev,
 			return dev_err_probe(&pdev->dev, -EINVAL,
 					     "CBM buffer pool is missing\n");
 		rmem = of_reserved_mem_lookup(node);
+		if (!rmem) {
+			dev_err(&pdev->dev, "CBM pool%d reserved-memory lookup failed for %pOF\n",
+				i, node);
+			of_node_put(node);
+			return -EINVAL;
+		}
 		of_node_put(node);
-		if (!rmem || rmem->size != grx500_pool_size[i] ||
+		if (rmem->size != grx500_pool_size[i] ||
 		    !IS_ALIGNED(rmem->base, grx500_pool_alignment[i]))
 			return dev_err_probe(&pdev->dev, -EINVAL,
-					     "CBM buffer pool geometry differs from vendor config\n");
+					     "CBM pool%d base=%pa size=%pa expected-size=%pa alignment=%pa\n",
+					     i, &rmem->base, &rmem->size,
+					     &grx500_pool_size[i], &grx500_pool_alignment[i]);
 		last = rmem->base + rmem->size - 1;
 		/* AX50 DDR begins at 0x20000000. The CBM base registers and
 		 * packet descriptors are 32-bit, so reject any out-of-range pool.

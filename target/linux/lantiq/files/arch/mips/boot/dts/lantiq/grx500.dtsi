@@ -6,6 +6,25 @@
 	#size-cells = <1>;
 	compatible = "lantiq,grx500", "lantiq,xrx500";
 
+	/* AX50 vendor 3.10 allocation. Disabled until explicitly selected by
+	 * the experiment: GPTC0/3A source; events GPTC1/1A, GPTC0/1A,
+	 * GPTC1/2A, GPTC1/3A for CPU0..3. Vendor IRQs 168/126/170/172
+	 * subtract MIPS_GIC_IRQ_BASE=8 to obtain shared GIC inputs.
+	 */
+	gptc_system: timer@16b00000 {
+		compatible = "lantiq,grx500-system-timer";
+		reg = <0x16b00000 0x100>, <0x16300000 0x100>;
+		reg-names = "gptc0", "gptc1";
+		clock-frequency = <200000000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 160 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SHARED 118 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 162 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SHARED 164 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "cpu0", "cpu1", "cpu2", "cpu3";
+		status = "disabled";
+	};
+
 	aliases {
 		serial0 = &asc0;
 		serial1 = &asc1;
