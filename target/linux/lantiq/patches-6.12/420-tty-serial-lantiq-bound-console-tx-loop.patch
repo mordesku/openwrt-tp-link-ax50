@@ -1,0 +1,46 @@
+From: OpenWrt <contact@openwrt.org>
+Date: Thu, 24 Sep 2026 20:45:00 +0200
+Subject: [PATCH] tty: serial: lantiq: bound console putchar loop with timeout
+
+lqasc_console_putchar() is called under spin_lock_irqsave(&ltq_port->lock)
+with interrupts disabled on the current CPU core. If the ASC TX FIFO fills
+up, the clock stalls, or flow control stops transmission, the unbounded
+while (!lqasc_tx_ready(port)) loop hangs the core forever. Any subsequent
+printk from another core deadlocks on ltq_port->lock, freezing the whole SoC.
+
+Add a 10ms bounded timeout so a blocked transmitter drops characters
+instead of causing a hard kernel lockup.
+
+---
+ drivers/tty/serial/lantiq.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+--- a/drivers/tty/serial/lantiq.c
++++ b/drivers/tty/serial/lantiq.c
+@@ -13,6 +13,7 @@
+ #include <linux/console.h>
+ #include <linux/device.h>
+ #include <linux/init.h>
++#include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/ioport.h>
+ #include <linux/lantiq.h>
+@@ -611,11 +612,16 @@
+ static void
+ lqasc_console_putchar(struct uart_port *port, unsigned char ch)
+ {
++	int timeout = 10000; /* 10ms max wait */
++
+ 	if (!port->membase)
+ 		return;
+ 
+-	while (!lqasc_tx_ready(port))
+-		;
++	while (!lqasc_tx_ready(port)) {
++		if (--timeout <= 0)
++			return;
++		udelay(1);
++	}
+ 
+ 	writeb(ch, port->membase + LTQ_ASC_TBUF);
+ }
