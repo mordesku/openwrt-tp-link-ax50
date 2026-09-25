@@ -328,9 +328,9 @@ void __init ltq_soc_init(void)
 		CGU_GPTC1);
 	clkdev_add_pmu("16400000.gptu", NULL, CGU_ON, CGU_REG_MODULE_0,
 		CGU_GPTC2);
-	clkdev_add_pmu("16600000.serial", NULL, 0, CGU_REG_MODULE_0,
+	clkdev_add_pmu("16600000.serial", NULL, CGU_ON, CGU_REG_MODULE_0,
 		CGU_ASC0);
-	clkdev_add_pmu("16700000.serial", NULL, 0, CGU_REG_MODULE_0,
+	clkdev_add_pmu("16700000.serial", NULL, CGU_ON, CGU_REG_MODULE_0,
 		CGU_ASC0);
 	clkdev_add_pmu("1e100000.eip97", NULL, CGU_ON, CGU_REG_MODULE_0,
 		CGU_EIP97);

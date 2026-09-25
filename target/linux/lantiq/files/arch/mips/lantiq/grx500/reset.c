@@ -13,6 +13,7 @@
 #include <linux/pm.h>
 #include <linux/export.h>
 #include <linux/delay.h>
+#include <linux/errno.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/reset-controller.h>
@@ -105,9 +106,17 @@ EXPORT_SYMBOL_GPL(ltq_reset_once);
 /* reset a io domain by hardware control instead of software control */
 void ltq_hw_reset(unsigned int module)
 {
+	int timeout = 100000; /* 100ms max wait */
+
 	ltq_rcu_w32(module, RCU_RST_REQ);
-	while (!(ltq_rcu_r32(RCU_RST_STAT) & module))
-		;
+	while (!(ltq_rcu_r32(RCU_RST_STAT) & module)) {
+		if (--timeout <= 0) {
+			pr_err_ratelimited("ltq_hw_reset: timeout waiting for module 0x%08x (RCU_RST_STAT=0x%08x)\n",
+					   module, ltq_rcu_r32(RCU_RST_STAT));
+			break;
+		}
+		udelay(1);
+	}
 }
 EXPORT_SYMBOL_GPL(ltq_hw_reset);
 
@@ -202,10 +211,17 @@ static int ltq_reset_device(struct reset_controller_dev *rcdev,
 {
 	int regidx = id >> 5;
 	int regbit = id & 0x1F;
-	
+	int timeout = 100000; /* 100ms max wait */
+
 	ltq_rcu_w32(BIT(regbit), RCU_REQ_REG(regidx));
-	while (!(ltq_rcu_r32(RCU_STAT_REG(regidx)) & (BIT(regbit))))
-		;
+	while (!(ltq_rcu_r32(RCU_STAT_REG(regidx)) & (BIT(regbit)))) {
+		if (--timeout <= 0) {
+			pr_err_ratelimited("ltq_reset_device: timeout waiting for reset id %lu (reg %d bit %d RCU_STAT=0x%08x)\n",
+					   id, regidx, regbit, ltq_rcu_r32(RCU_STAT_REG(regidx)));
+			return -ETIMEDOUT;
+		}
+		udelay(1);
+	}
 	return 0;
 }
 
