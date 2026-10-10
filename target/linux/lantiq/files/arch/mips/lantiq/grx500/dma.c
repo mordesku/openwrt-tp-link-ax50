@@ -8,6 +8,9 @@
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 #include <linux/init.h>
+#ifdef AX50_UART_MARKERS
+#include <linux/ax50_uart_marker.h>
+#endif
 #include <linux/platform_device.h>
 #include <linux/io.h>
 #include <linux/string.h>
@@ -2662,9 +2665,16 @@ static void dma_irq_handler(struct irq_desc *desc)
 	unsigned long irncr;
 	unsigned long irncr1;
 	struct dma_ctrl *pctrl = irq_desc_get_handler_data(desc);
+#ifdef AX50_UART_MARKERS
+	u32 ax50_marker_sequence;
+#endif
 
 	if (unlikely(!pctrl))
 		return;
+#ifdef AX50_UART_MARKERS
+	/* The chained parent bypasses generic IRQ action markers. */
+	ax50_marker_sequence = ax50_uart_marker_begin('D', pctrl->chained_irq);
+#endif
 	chained_irq_enter(irq_desc_get_chip(desc), desc);
 
 	irncr = ltq_dma_r32(pctrl, DMA_IRNCR);
@@ -2681,6 +2691,9 @@ static void dma_irq_handler(struct irq_desc *desc)
 			generic_handle_irq(pctrl->irq_base + 32 + offset);
 	}
 	chained_irq_exit(irq_desc_get_chip(desc), desc);
+#ifdef AX50_UART_MARKERS
+	ax50_uart_marker_end('D', ax50_marker_sequence, pctrl->chained_irq);
+#endif
 }
 
 
