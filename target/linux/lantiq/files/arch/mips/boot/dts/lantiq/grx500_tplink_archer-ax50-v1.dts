@@ -87,21 +87,25 @@
 	};
 
 	keys {
-		compatible = "gpio-keys";
-		status = "disabled";
+		compatible = "gpio-keys-polled";
+		poll-interval = <100>;
 
-		key-reset {
+		button-reset {
 			label = "reset";
 			linux,code = <KEY_RESTART>;
-			gpios = <&gpio0 19 GPIO_ACTIVE_LOW>;
-			debounce-interval = <60>;
+			gpios = <&gpio0 22 GPIO_ACTIVE_LOW>;
 		};
 
-		key-wps {
+		button-wps {
 			label = "wps";
 			linux,code = <KEY_WPS_BUTTON>;
-			gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
-			debounce-interval = <60>;
+			gpios = <&gpio0 8 GPIO_ACTIVE_LOW>;
+		};
+
+		button-wifi {
+			label = "rfkill";
+			linux,code = <KEY_RFKILL>;
+			gpios = <&gpio1 4 GPIO_ACTIVE_LOW>;
 		};
 	};
 
