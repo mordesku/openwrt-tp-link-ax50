@@ -101,6 +101,12 @@
 			linux,code = <KEY_WPS_BUTTON>;
 			gpios = <&gpio0 8 GPIO_ACTIVE_LOW>;
 		};
+
+		button-lights {
+			label = "lights_toggle";
+			linux,code = <KEY_LIGHTS_TOGGLE>;
+			gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
+		};
 	};
 
 	/* Vendor boot log: CS1, parallel 8-bit NAND at 0x17c00000.
