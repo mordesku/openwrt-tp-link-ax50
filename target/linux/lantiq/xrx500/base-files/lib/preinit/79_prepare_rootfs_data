@@ -1,0 +1,25 @@
+# Ensure rootfs_data UBI volume exists and is formatted before 80_mount_root
+ensure_rootfs_data() {
+	if [ -e /dev/ubi0 ] && ! ubinfo /dev/ubi0 -N rootfs_data >/dev/null 2>&1; then
+		local avail_lebs
+		avail_lebs=$(ubinfo /dev/ubi0 2>/dev/null | awk '/Amount of available logical eraseblocks:/ {print $6}')
+		if [ -n "$avail_lebs" ] && [ "$avail_lebs" -ge 40 ]; then
+			echo "preinit: creating rootfs_data UBI volume (20 MiB)..."
+			ubimkvol /dev/ubi0 -N rootfs_data -s 20MiB >/dev/null 2>&1 || true
+
+			local vol_id
+			vol_id=$(ubinfo /dev/ubi0 -N rootfs_data 2>/dev/null | awk '/Volume ID:/ {print $3}')
+			if [ -n "$vol_id" ]; then
+				local dev_node="/dev/ubi0_${vol_id}"
+				[ -e "$dev_node" ] || mknod "$dev_node" c 251 $((vol_id + 1))
+
+				# Initialize UBIFS filesystem structure so mount_root sees valid UBIFS
+				ubiupdatevol -t "$dev_node" 2>/dev/null || true
+				mkdir -p /tmp/init_ubifs
+				mount -t ubifs "$dev_node" /tmp/init_ubifs 2>/dev/null && umount /tmp/init_ubifs || true
+			fi
+		fi
+	fi
+}
+
+boot_hook_add preinit_main ensure_rootfs_data
