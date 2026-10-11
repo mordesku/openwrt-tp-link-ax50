@@ -1,0 +1,18 @@
+#!/bin/sh
+[ "$INTERFACE" = "wan" ] || exit 0
+
+case "$ACTION" in
+ifup)
+	echo 0 > /sys/class/leds/amber:wan/brightness
+	echo netdev > /sys/class/leds/blue:wan/trigger
+	echo eth0 > /sys/class/leds/blue:wan/device_name
+	echo 1 > /sys/class/leds/blue:wan/link
+	echo 1 > /sys/class/leds/blue:wan/rx
+	echo 1 > /sys/class/leds/blue:wan/tx
+	;;
+ifdown)
+	echo none > /sys/class/leds/blue:wan/trigger
+	echo 0 > /sys/class/leds/blue:wan/brightness
+	echo 1 > /sys/class/leds/amber:wan/brightness
+	;;
+esac

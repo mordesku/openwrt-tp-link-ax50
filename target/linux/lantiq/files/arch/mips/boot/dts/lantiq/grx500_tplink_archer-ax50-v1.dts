@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /dts-v1/;
 
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+
 #include "grx500.dtsi"
 
 / {
@@ -13,6 +17,10 @@
 		dma2 = &dma1rx;
 		dma3 = &dma2tx;
 		dma4 = &dma2rx;
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-running = &led_power;
+		led-upgrade = &led_power;
 	};
 
 	chosen {
@@ -22,6 +30,79 @@
 	memory@20000000 {
 		device_type = "memory";
 		reg = <0x20000000 0x0e000000>; /* Vendor DDR base; retain conservative 224 MiB test size. */
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_power: led-power {
+			label = "green:power";
+			function = LED_FUNCTION_POWER;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio0 21 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+
+		led_wlan2g: led-wlan2g {
+			label = "green:wlan2g";
+			function = LED_FUNCTION_WLAN;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio0 1 GPIO_ACTIVE_HIGH>;
+		};
+
+		led_wlan5g: led-wlan5g {
+			label = "green:wlan5g";
+			function = LED_FUNCTION_WLAN_5GHZ;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+		};
+
+		led_wan_amber: led-wan-amber {
+			label = "amber:wan";
+			function = LED_FUNCTION_WAN;
+			color = <LED_COLOR_ID_AMBER>;
+			gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
+		};
+
+		led_wan_blue: led-wan-blue {
+			label = "blue:wan";
+			function = LED_FUNCTION_WAN;
+			color = <LED_COLOR_ID_BLUE>;
+			gpios = <&gpio0 7 GPIO_ACTIVE_HIGH>;
+		};
+
+		led_lan: led-lan {
+			label = "green:lan";
+			function = LED_FUNCTION_LAN;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio0 9 GPIO_ACTIVE_HIGH>;
+		};
+
+		led_usb: led-usb {
+			label = "green:usb";
+			function = LED_FUNCTION_USB;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+		};
+	};
+
+	keys {
+		compatible = "gpio-keys";
+		status = "disabled";
+
+		key-reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&gpio0 19 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
+
+		key-wps {
+			label = "wps";
+			linux,code = <KEY_WPS_BUTTON>;
+			gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
 	};
 
 	/* Vendor boot log: CS1, parallel 8-bit NAND at 0x17c00000.

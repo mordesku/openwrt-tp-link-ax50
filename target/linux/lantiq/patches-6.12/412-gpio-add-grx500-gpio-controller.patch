@@ -1,0 +1,27 @@
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -460,6 +460,14 @@ config GPIO_MM_LANTIQ
+ 	  (EBU) found on Lantiq SoCs. The GPIOs are output only as they are
+ 	  created by attaching a 16-bit latch to the bus.
+ 
++config GPIO_XRX500
++	bool "Lantiq GRX500 / XRX500 GPIO support"
++	depends on LANTIQ && (SOC_GRX500 || SOC_XWAY)
++	select GPIOLIB_IRQCHIP
++	help
++	  This enables support for the GPIO controller found on the Lantiq
++	  GRX500 / XRX500 SoCs.
++
+ config GPIO_MPC5200
+ 	def_bool y
+ 	depends on PPC_MPC52xx
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -112,6 +112,7 @@ obj-$(CONFIG_GPIO_MLXBF)		+= gpio-mlxbf.
+ obj-$(CONFIG_GPIO_MLXBF2)		+= gpio-mlxbf2.o
+ obj-$(CONFIG_GPIO_MLXBF3)		+= gpio-mlxbf3.o
+ obj-$(CONFIG_GPIO_MM_LANTIQ)		+= gpio-mm-lantiq.o
++obj-$(CONFIG_GPIO_XRX500)		+= gpio-xrx500.o
+ obj-$(CONFIG_GPIO_MOCKUP)		+= gpio-mockup.o
+ obj-$(CONFIG_GPIO_MOXTET)		+= gpio-moxtet.o
+ obj-$(CONFIG_GPIO_MPC5200)		+= gpio-mpc5200.o
