@@ -93,7 +93,7 @@
 		button-reset {
 			label = "reset";
 			linux,code = <KEY_RESTART>;
-			gpios = <&gpio0 22 GPIO_ACTIVE_LOW>;
+			gpios = <&gpio0 19 GPIO_ACTIVE_LOW>;
 		};
 
 		button-wps {
