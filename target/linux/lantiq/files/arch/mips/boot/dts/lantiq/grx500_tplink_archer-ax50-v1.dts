@@ -101,12 +101,6 @@
 			linux,code = <KEY_WPS_BUTTON>;
 			gpios = <&gpio0 8 GPIO_ACTIVE_LOW>;
 		};
-
-		button-wifi {
-			label = "rfkill";
-			linux,code = <KEY_RFKILL>;
-			gpios = <&gpio1 4 GPIO_ACTIVE_LOW>;
-		};
 	};
 
 	/* Vendor boot log: CS1, parallel 8-bit NAND at 0x17c00000.
