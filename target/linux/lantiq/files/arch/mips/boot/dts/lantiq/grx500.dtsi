@@ -31,6 +31,8 @@
 		pcie0   = &pcie0;
 		pcie1   = &pcie1;
 		pcie2   = &pcie2;
+		gpio0   = &gpio0;
+		gpio1   = &gpio1;
 	};
 
 	cpus {
@@ -215,6 +217,30 @@
 				     <GIC_SHARED 78 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SHARED 79 IRQ_TYPE_LEVEL_HIGH>;
 			status = "disabled";
+		};
+
+		gpio0: gpio@c00000 {
+			compatible = "lantiq,gpio-xrx500", "lantiq,grx500-gpio";
+			reg = <0xc00000 0x80>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&gic>;
+			interrupts = <GIC_SHARED 172 IRQ_TYPE_LEVEL_HIGH>;
+			lantiq,bank = <0>;
+		};
+
+		gpio1: gpio@c00100 {
+			compatible = "lantiq,gpio-xrx500", "lantiq,grx500-gpio";
+			reg = <0xc00100 0x80>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&gic>;
+			interrupts = <GIC_SHARED 173 IRQ_TYPE_LEVEL_HIGH>;
+			lantiq,bank = <1>;
 		};
 	};
 
