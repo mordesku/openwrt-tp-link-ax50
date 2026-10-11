@@ -226,7 +226,16 @@ static int __init grx500_gptc_init(void)
 	}
 
 	__raw_writel(GPTC_STOP, gptc_base[0] + GPTC_RUN(GPTC_SOURCE));
-	__raw_writel(GPTC_UP | GPTC_32BIT, gptc_base[0] + GPTC_CON(GPTC_SOURCE));
+	/* Vendor csrc-gptc.c modifies CON with |= and keeps the bits the
+	 * bootloader/firmware may have set (SYNC=BIT8, CLK_INT/CLK_EXT=BIT9/10,
+	 * EDGE=BIT6/7). Overwriting CON reconfigured the shared timer input
+	 * behind the firmware's back; on hardware that produced backwards
+	 * jumps of the source counter (observed -0.25 s and -10.69 s) and
+	 * clocksource instability. Preserve the unknown bits like the vendor.
+	 */
+	value = __raw_readl(gptc_base[0] + GPTC_CON(GPTC_SOURCE));
+	value |= GPTC_UP | GPTC_32BIT;
+	__raw_writel(value, gptc_base[0] + GPTC_CON(GPTC_SOURCE));
 	__raw_writel(0, gptc_base[0] + GPTC_RLD(GPTC_SOURCE));
 	__raw_writel(GPTC_START | GPTC_RELOAD,
 		     gptc_base[0] + GPTC_RUN(GPTC_SOURCE));
@@ -238,7 +247,6 @@ static int __init grx500_gptc_init(void)
 	ret = clocksource_register_hz(&gptc_clocksource, gptc_rate);
 	if (ret)
 		panic("GRX500 GPTC: clocksource registration failed: %d", ret);
-	sched_clock_register(gptc_read_sched_clock, 32, gptc_rate);
 
 	for (i = 0; i < GPTC_CPUS; i++) {
 		struct grx500_gptc_event *ev = &gptc_events[i];

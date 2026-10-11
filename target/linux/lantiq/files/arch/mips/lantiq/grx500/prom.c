@@ -41,50 +41,14 @@ void grx500_kernel_phys_range(phys_addr_t *start, phys_addr_t *end)
 }
 EXPORT_SYMBOL_GPL(grx500_kernel_phys_range);
 
-/* Vendor mailbox ABI, checked against the waiting statuses in 165119.log. */
+/* Vendor mailbox ABI, checked against the waiting statuses in 165119.log.
+ * The cps-vmb core1 handoff patches (057/058) declare these extern.
+ */
 bool grx500_vmb_ready(unsigned int cpu);
 int grx500_vmb_launch(unsigned int cpu, unsigned long pc,
 		      unsigned long sp, unsigned long gp);
 
-static u32 grx500_ibl_early_hash;
-
-/* Sample the first SPL page only. A changed hash is not by itself proof
- * of code corruption: exact firmware code/data boundaries are unverified.
- */
-static void grx500_log_ibl(const char *phase, bool early)
-{
-	u32 hash = 2166136261U;
-	unsigned int word;
-
-	for (word = 0; word < 1024; word++) {
-		hash ^= __raw_readl((void __iomem *)(0xa0001000UL + word * 4));
-		hash *= 16777619U;
-	}
-	if (early)
-		grx500_ibl_early_hash = hash;
-	pr_info("GRX500 IBL %s: sample=a0001000 bytes=4096 hash=%08x early_hash=%08x\n",
-		phase, hash, grx500_ibl_early_hash);
-}
-
-static void grx500_log_start_ipi(const char *phase, unsigned int intr)
-{
-	/* CM2's 32-bit register layout, verified in vendor asm/gic.h.
-	 * Early SoC detection precedes initialization of mips_gic_base.
-	 */
-	void __iomem *base = mips_gic_base ? mips_gic_base :
-		(void __iomem *)0xb2320000UL;
-	unsigned int offset = (intr / 32) * 4, shift = intr % 32;
-
-	pr_info("GRX500 IPI%u %s: enabled=%u pending=%u edge=%u polarity=%u pin=%08x vp=%08x\n",
-		intr, phase, (__raw_readl(base + 0x400 + offset) >> shift) & 1,
-		(__raw_readl(base + 0x480 + offset) >> shift) & 1,
-		(__raw_readl(base + 0x180 + offset) >> shift) & 1,
-		(__raw_readl(base + 0x100 + offset) >> shift) & 1,
-		__raw_readl(base + 0x500 + intr * 4),
-		__raw_readl(base + 0x2000 + intr * 32));
-}
-
-bool grx500_vmb_ready(unsigned int cpu)
+/* Vendor mailbox ABI. */ bool grx500_vmb_ready(unsigned int cpu)
 {
 	return cpu < 4 && __raw_readl((void __iomem *)(0xa0000000UL + cpu * 176)) == 8;
 }
@@ -101,8 +65,6 @@ int grx500_vmb_launch(unsigned int cpu, unsigned long pc,
 	 */
 	if ((cpu != 2 && cpu != 3) || !mips_gic_base || !grx500_vmb_ready(cpu))
 		return -ENODEV;
-	grx500_log_ibl("launch", false);
-	grx500_log_start_ipi("before-enable", intr);
 	/* Never deliver this firmware command to the boot CPU or another VP. */
 	if (read_gic_map_vp(intr) != BIT(cpu)) {
 		pr_err("GRX500 IPI%u: refusing launch; firmware route is not exclusively VP%u\n",
@@ -119,17 +81,13 @@ int grx500_vmb_launch(unsigned int cpu, unsigned long pc,
 	wmb();
 	__raw_writel(1, command); /* VMB_CPU_START */
 	wmb();
-	pr_info("GRX500 VMB launch: CPU%u pc=%08x sp=%08lx gp=%08lx IPI=%u; no CPC reset\n",
-		cpu, __raw_readl(command + 4), sp, gp, intr);
 	/* Vendor initialise_vmb_IRQhdlr explicitly enables outgoing channels.
 	 * Publish the complete mailbox before unmasking an existing pending IRQ.
 	 */
 	write_gic_smask(intr);
 	wmb();
-	grx500_log_start_ipi("after-enable", intr);
 	write_gic_wedge(GIC_WEDGE_RW | intr);
 	wmb();
-	grx500_log_start_ipi("after-trigger", intr);
 	return 0;
 }
 
@@ -156,42 +114,11 @@ static const char * const grx500_cm_causes[32] = {
 	"0x1c", "0x1d", "0x1e", "0x1f"
 };
 
-/* Hypothesis: all online VPEs must inherit the same vendor EVA map. */
 /* Vendor ltq_vmb.h: FW reply (8 bytes), command (168 bytes), four slots.
  * Read uncached native-endian words; this is shared RAM, not LE MMIO.
  * Hypothesis: IBL_IN_WAIT (8) survives Linux startup when its page and
  * firmware IPI configuration are preserved. Never write mailbox commands.
  */
-static void grx500_log_vmb(const char *phase)
-{
-	unsigned int cpu;
-
-	for (cpu = 0; cpu < 4; cpu++) {
-		void __iomem *slot = (void __iomem *)(0xa0000000UL + cpu * 176);
-
-		pr_info("GRX500 VMB %s: CPU%u slot=%px status=%08x priv=%08x command=%08x pc=%08x\n",
-			phase, cpu, slot, __raw_readl(slot), __raw_readl(slot + 4),
-			__raw_readl(slot + 8), __raw_readl(slot + 12));
-	}
-}
-
-static void grx500_log_cpu_eva(void *unused)
-{
-	pr_info("GRX500 EVA CPU%u: Config0=%08x Config5=%08x SegCtl0=%08x SegCtl1=%08x SegCtl2=%08x\n",
-		smp_processor_id(), read_c0_config(), read_c0_config5(),
-		read_c0_segctl0(), read_c0_segctl1(), read_c0_segctl2());
-}
-
-static int __init grx500_check_online_eva(void)
-{
-	on_each_cpu(grx500_log_cpu_eva, NULL, 1);
-	grx500_log_vmb("late");
-	grx500_log_ibl("late", false);
-	grx500_log_start_ipi("late", 21);
-	grx500_log_start_ipi("late", 85);
-	return 0;
-}
-late_initcall(grx500_check_online_eva);
 
 static int grx500_be_handler(struct pt_regs *regs, int is_fixup)
 {
@@ -229,10 +156,6 @@ void __init ltq_soc_detect(struct ltq_soc_info *i)
 	u32 chipid_raw = ltq_r32(LTQ_MPS_CHIPID);
 
 	mips_set_be_handler(grx500_be_handler);
-	grx500_log_ibl("early", true);
-	grx500_log_start_ipi("early", 21);
-	grx500_log_start_ipi("early", 85);
-	grx500_log_vmb("early");
 
 	/* Verify the assembly EVA setup before any TLB-backed allocations. */
 	pr_info("GRX500 EVA: Config0=%08x Config5=%08x\n",
