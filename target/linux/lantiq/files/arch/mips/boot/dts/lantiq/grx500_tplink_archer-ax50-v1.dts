@@ -336,18 +336,32 @@
 	};
 };
 
+&gptc_system {
+	status = "okay";
+};
+
 &asc0 {
 	status = "okay";
 };
 
 &pcie0 {
+	reset-gpio = <&gpio1 11 GPIO_ACTIVE_LOW>;
+	lantiq,rst-high-active = <0>;
+	lantiq,rst-interval = <200>;
+	lantiq,inbound-swap = <1>;
+	lantiq,outbound-swap = <0>;
 	status = "okay";
 };
 
 &pcie1 {
+	reset-gpio = <&gpio1 29 GPIO_ACTIVE_LOW>;
+	lantiq,rst-high-active = <0>;
+	lantiq,rst-interval = <200>;
+	lantiq,inbound-swap = <1>;
+	lantiq,outbound-swap = <0>;
 	status = "okay";
 };
 
 &pcie2 {
-	status = "okay";
+	status = "disabled";
 };

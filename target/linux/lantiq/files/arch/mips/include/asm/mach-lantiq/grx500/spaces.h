@@ -14,6 +14,10 @@
 #define PAGE_OFFSET _AC(0x60000000, UL)
 #define PHYS_OFFSET _AC(0x20000000, UL)
 #define HIGHMEM_START _AC(0xffff0000, UL)
+/* Keep fixmap and vmalloc inside mapped kseg2 (0xc0000000..0xdfffffff);
+ * 0xe0000000..0xffffffff is unmapped Seg0 (PA 0xa0000000..0xbfffffff TOP IO).
+ */
+#define FIXADDR_TOP ((unsigned long)(long)(int)0xdffe0000)
 #endif
 
 #include <asm/mach-generic/spaces.h>
