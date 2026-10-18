@@ -585,16 +585,17 @@ static ssize_t phy_status_show(struct device *dev,
 		id2 = mdiobus_read(bus, phy, MII_PHYSID2);
 		/* BMSR link is latched low; the second read reports current link. */
 		bmsr = mdiobus_read(bus, phy, MII_BMSR);
-		if (id1 < 0 || id2 < 0 || bmsr < 0)
-			return id1 < 0 ? id1 : (id2 < 0 ? id2 : bmsr);
-		bmsr = mdiobus_read(bus, phy, MII_BMSR);
-		if (bmsr < 0)
-			return bmsr;
+		if (bmsr >= 0)
+			bmsr = mdiobus_read(bus, phy, MII_BMSR);
+
 		len += sysfs_emit_at(buf, len,
 				     "phy=%d id=%04x:%04x bmsr=%04x link=%s\n",
-				     phy, id1, id2, bmsr,
-				     (id1 == 0xffff && id2 == 0xffff) ? "absent" :
-				     (bmsr & BMSR_LSTATUS) ? "up" : "down");
+				     phy,
+				     id1 >= 0 ? (u16)id1 : 0xffff,
+				     id2 >= 0 ? (u16)id2 : 0xffff,
+				     bmsr >= 0 ? (u16)bmsr : 0,
+				     (id1 < 0 || id2 < 0 || (id1 == 0xffff && id2 == 0xffff)) ? "absent" :
+				     ((bmsr >= 0) && (bmsr & BMSR_LSTATUS)) ? "up" : "down");
 	}
 	return len;
 }

@@ -1,0 +1,11 @@
+--- a/arch/mips/mm/dma-noncoherent.c
++++ b/arch/mips/mm/dma-noncoherent.c
+@@ -51,7 +51,7 @@ void arch_dma_prep_coherent(struct page
+ 
+ void *arch_dma_set_uncached(void *addr, size_t size)
+ {
+-	return (void *)(__pa(addr) + UNCAC_BASE);
++	return (void *)(__pa(addr) - PHYS_OFFSET + UNCAC_BASE);
+ }
+ 
+ static inline void dma_sync_virt_for_device(void *addr, size_t size,

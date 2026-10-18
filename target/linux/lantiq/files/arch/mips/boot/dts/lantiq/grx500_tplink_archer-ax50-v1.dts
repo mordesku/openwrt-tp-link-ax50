@@ -365,3 +365,8 @@
 &pcie2 {
 	status = "disabled";
 };
+
+&usb1 {
+	vbus-gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};
