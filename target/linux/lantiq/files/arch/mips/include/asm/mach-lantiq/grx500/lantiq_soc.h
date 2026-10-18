@@ -64,6 +64,7 @@ void ltq_rcu_w32_mask(uint32_t clr, uint32_t set, uint32_t reg_off);
 void ltq_endian_set(int bitn);
 void ltq_endian_clr(int bitn);
 void ltq_pcie_clk_out(int bitn);
+u32 ltq_rcu_r32_reg(u32 reg_off);
 
 void ltq_usb_phy_reset(unsigned int bit);
 void ltq_usb0_port_endian_set(unsigned int clr, unsigned int set);

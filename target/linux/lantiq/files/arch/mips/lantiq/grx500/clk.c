@@ -1052,19 +1052,22 @@ EXPORT_SYMBOL(clk_set_rate);
 
 int clk_enable(struct clk *clk)
 {
-	if (unlikely(!clk_good(clk)))
-		return -1;
+	if (!clk)
+		return 0;
+
+	if (IS_ERR(clk))
+		return -EINVAL;
 
 	if (clk->enable)
 		return clk->enable(clk);
 
-	return -1;
+	return 0;
 }
 EXPORT_SYMBOL(clk_enable);
 
 void clk_disable(struct clk *clk)
 {
-	if (unlikely(!clk_good(clk)))
+	if (!clk || IS_ERR(clk))
 		return;
 
 	if (clk->disable)
@@ -1074,19 +1077,22 @@ EXPORT_SYMBOL(clk_disable);
 
 int clk_activate(struct clk *clk)
 {
-	if (unlikely(!clk_good(clk)))
-		return -1;
+	if (!clk)
+		return 0;
+
+	if (IS_ERR(clk))
+		return -EINVAL;
 
 	if (clk->activate)
 		return clk->activate(clk);
 
-	return -1;
+	return 0;
 }
 EXPORT_SYMBOL(clk_activate);
 
 void clk_deactivate(struct clk *clk)
 {
-	if (unlikely(!clk_good(clk)))
+	if (!clk || IS_ERR(clk))
 		return;
 
 	if (clk->deactivate)

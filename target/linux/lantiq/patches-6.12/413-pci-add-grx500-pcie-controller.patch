@@ -1,0 +1,25 @@
+--- a/arch/mips/lantiq/Kconfig
++++ b/arch/mips/lantiq/Kconfig
+@@ -85,3 +85,12 @@ config PCIE_LANTIQ_MSI
+ 	default y
+ 
+ endif
++
++config PCIE_GRX500
++	bool "GRX500 PCIE Root Complex support"
++	depends on SOC_GRX500 && PCI
++	default y
++	select PCIEPORTBUS
++	help
++	  This enables support for the PCIe Root Complex controllers on Lantiq /
++	  Intel GRX500 SoCs.
+--- a/arch/mips/pci/Makefile
++++ b/arch/mips/pci/Makefile
+@@ -43,6 +43,7 @@ obj-$(CONFIG_SOC_MT7620)	+= pci-mt7620.o
+ obj-$(CONFIG_SOC_RT3883)	+= pci-rt3883.o
+ obj-$(CONFIG_PCIE_LANTIQ)	+= ifxmips_pcie.o fixup-lantiq-pcie.o
+ obj-$(CONFIG_PCIE_LANTIQ_MSI)	+= pcie-lantiq-msi.o
++obj-$(CONFIG_PCIE_GRX500)	+= pcie-xrx500.o
+ obj-$(CONFIG_SOC_TX4927)	+= pci-tx4927.o
+ obj-$(CONFIG_SOC_TX4938)	+= pci-tx4938.o
+ obj-$(CONFIG_TOSHIBA_RBTX4927)	+= fixup-rbtx4927.o
