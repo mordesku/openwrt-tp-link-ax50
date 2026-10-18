@@ -42,9 +42,20 @@
 #define GPIO_DIRSET		0x00000048
 #define GPIO_DIRCLR		0x0000004C
 
+/* GRX500 PADMUXC Register Offsets (0x16c80000 / 0x16c80100) */
+#define PADC_MUX(pin)		((pin) * 0x4)
+#define PADC_PUEN		0x00000080
+#define PADC_PDEN		0x00000084
+#define PADC_SRC		0x00000088
+#define PADC_DCC0		0x0000008C
+#define PADC_DCC1		0x00000090
+#define PADC_OD			0x00000094
+#define PADC_MUX_GPIO		0x00000000
+
 struct xrx500_gpio_port {
 	struct gpio_chip gc;
 	void __iomem *port;
+	void __iomem *pad;
 	raw_spinlock_t lock;
 	unsigned int bank;
 	char name[16];
@@ -64,10 +75,52 @@ static inline void port_w32_mask(struct xrx500_gpio_port *p, u32 clear, u32 set,
 	raw_spin_unlock_irqrestore(&p->lock, flags);
 }
 
+static void xrx500_pad_mux_gpio(struct xrx500_gpio_port *p, unsigned int offset, bool is_output)
+{
+	unsigned long flags;
+	u32 old_mux, old_od, new_od;
+
+	if (!p->pad)
+		return;
+
+	raw_spin_lock_irqsave(&p->lock, flags);
+	old_mux = ltq_r32(p->pad + PADC_MUX(offset));
+	old_od = ltq_r32(p->pad + PADC_OD);
+
+	/* Switch physical pad multiplexer to function 0 (XRX500_MUX_GPIO) */
+	ltq_w32(PADC_MUX_GPIO, p->pad + PADC_MUX(offset));
+
+	if (is_output) {
+		/* Clear Open-Drain bit so output drives normal push-pull levels */
+		new_od = old_od & ~(1U << offset);
+		ltq_w32(new_od, p->pad + PADC_OD);
+	} else {
+		new_od = old_od;
+	}
+	wmb();
+	raw_spin_unlock_irqrestore(&p->lock, flags);
+
+	if (old_mux != PADC_MUX_GPIO || old_od != new_od) {
+		dev_info(p->gc.parent,
+			 "gpio%u (bank %u pin %u): pad mux %u->0, OD 0x%08x->0x%08x\n",
+			 p->gc.base + offset, p->bank, offset,
+			 old_mux, old_od, new_od);
+	}
+}
+
+static int xrx500_gpio_request(struct gpio_chip *gc, unsigned int offset)
+{
+	struct xrx500_gpio_port *p = gpiochip_get_data(gc);
+
+	xrx500_pad_mux_gpio(p, offset, false);
+	return 0;
+}
+
 static int xrx500_gpio_direction_input(struct gpio_chip *gc, unsigned int offset)
 {
 	struct xrx500_gpio_port *p = gpiochip_get_data(gc);
 
+	xrx500_pad_mux_gpio(p, offset, false);
 	ltq_w32(1U << offset, p->port + GPIO_DIRCLR);
 	wmb();
 	return 0;
@@ -82,6 +135,7 @@ static int xrx500_gpio_direction_output(struct gpio_chip *gc, unsigned int offse
 	else
 		ltq_w32(1U << offset, p->port + GPIO_OUTCLR);
 
+	xrx500_pad_mux_gpio(p, offset, true);
 	ltq_w32(1U << offset, p->port + GPIO_DIRSET);
 	wmb();
 	return 0;
@@ -234,11 +288,18 @@ static int xrx500_gpio_probe(struct platform_device *pdev)
 	if (IS_ERR(p->port))
 		return PTR_ERR(p->port);
 
+	if (platform_get_resource(pdev, IORESOURCE_MEM, 1)) {
+		p->pad = devm_platform_ioremap_resource(pdev, 1);
+		if (IS_ERR(p->pad))
+			return PTR_ERR(p->pad);
+	}
+
 	of_property_read_u32(np, "lantiq,bank", &bank);
 	p->bank = bank;
 	snprintf(p->name, sizeof(p->name), "gpio%u", bank);
 
 	p->gc.label = p->name;
+	p->gc.request = xrx500_gpio_request;
 	p->gc.direction_input = xrx500_gpio_direction_input;
 	p->gc.direction_output = xrx500_gpio_direction_output;
 	p->gc.get = xrx500_gpio_get;
@@ -256,6 +317,14 @@ static int xrx500_gpio_probe(struct platform_device *pdev)
 	 */
 	ltq_w32(0xffffffff, p->port + GPIO_IRNENCLR);
 	ltq_w32(0xffffffff, p->port + GPIO_IRNCR);
+	if (bank == 1) {
+		void __iomem *ifmux = (void __iomem *)0xb6080120;
+		u32 old_ifmux = ltq_r32(ifmux);
+
+		ltq_w32_mask(BIT(18), 0, ifmux);
+		dev_info(dev, "disabled BBSPI at top-mux (0x16080120: 0x%08x->0x%08x)\n",
+			 old_ifmux, ltq_r32(ifmux));
+	}
 	wmb();
 
 	irq = platform_get_irq_optional(pdev, 0);
@@ -301,7 +370,11 @@ static struct platform_driver xrx500_gpio_driver = {
 	},
 };
 
-module_platform_driver(xrx500_gpio_driver);
+static int __init xrx500_gpio_init(void)
+{
+	return platform_driver_register(&xrx500_gpio_driver);
+}
+postcore_initcall(xrx500_gpio_init);
 
 MODULE_DESCRIPTION("Lantiq GRX500 / XRX500 GPIO Controller Driver");
 MODULE_AUTHOR("Thomas Langer, John Crispin, Kavitha Subramanian");

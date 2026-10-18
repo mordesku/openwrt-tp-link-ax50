@@ -148,9 +148,19 @@ void ltq_endian_set(int bitn)
 }
 EXPORT_SYMBOL_GPL(ltq_endian_set);
 
+u32 ltq_rcu_r32_reg(u32 reg_off)
+{
+	return ltq_rcu_r32(reg_off);
+}
+EXPORT_SYMBOL_GPL(ltq_rcu_r32_reg);
+
 void ltq_pcie_clk_out(int bitn)
 {
+	u32 before = ltq_rcu_r32(RCU_IFMUX_CFG);
+
 	ltq_rcu_w32_mask(BIT(bitn), 0, RCU_IFMUX_CFG);
+	pr_info("ltq_pcie_clk_out: bit %d, RCU_IFMUX_CFG before=0x%08x after=0x%08x\n",
+		bitn, before, ltq_rcu_r32(RCU_IFMUX_CFG));
 }
 EXPORT_SYMBOL_GPL(ltq_pcie_clk_out);
 
