@@ -90,6 +90,15 @@ static int wave600_pci_probe(struct pci_dev *pdev, const struct pci_device_id *i
 	}
 
 	dev_info(&pdev->dev, "WAV654 ARC firmware booted successfully (Milestone 2 PASS)\n");
+
+	/* Initialize Mailbox Circular IPC Engine (Milestone 3) */
+	ret = wave600_ipc_init(wdev);
+	if (ret) {
+		dev_err(&pdev->dev, "mailbox IPC initialization failed: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(&pdev->dev, "WAV654 Mailbox IPC initialized successfully (Milestone 3 PASS)\n");
 	return 0;
 }
 
@@ -99,6 +108,7 @@ static void wave600_pci_remove(struct pci_dev *pdev)
 
 	if (wdev) {
 		dev_info(&pdev->dev, "removing WAV654 driver\n");
+		wave600_ipc_cleanup(wdev);
 		wave600_hw_reset(wdev);
 	}
 }

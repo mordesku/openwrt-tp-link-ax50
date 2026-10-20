@@ -137,25 +137,24 @@ static void wave600_fw_init_chi(struct wave600_dev *wdev)
 
 static int wave600_fw_wait_chi_magic(struct wave600_dev *wdev)
 {
-	void __iomem *shram = wdev->bar0 + WAVE600_SHARED_RAM_BASE;
-	void __iomem *magic_addr = shram + offsetof(struct wave600_chi_area, basic.magic);
-	void __iomem *dbg_addr = shram + offsetof(struct wave600_chi_area, debug_ext);
+	u32 magic_reg = WAVE600_SHARED_RAM_BASE + offsetof(struct wave600_chi_area, basic.magic);
+	u32 dbg_reg = WAVE600_SHARED_RAM_BASE + offsetof(struct wave600_chi_area, debug_ext);
 	u32 val = 0;
 	int timeout = 500; /* 500 * 10 ms = 5000 ms */
 
 	dev_info(wdev->dev, "waiting for ARC firmware boot handshake (CHI Magic 0xBEADFEED)...\n");
 
 	while (timeout--) {
-		val = readl(magic_addr);
-		if (val == WAVE600_CHI_MAGIC || val == swab32(WAVE600_CHI_MAGIC))
+		val = wave600_read32(wdev, magic_reg);
+		if (val == WAVE600_CHI_MAGIC)
 			break;
 		msleep(10);
 	}
 
-	if (val != WAVE600_CHI_MAGIC && val != swab32(WAVE600_CHI_MAGIC)) {
-		u32 core0 = readl(dbg_addr + offsetof(struct wave600_chi_debug_ext, core0_info));
-		u32 core1 = readl(dbg_addr + offsetof(struct wave600_chi_debug_ext, core1_info));
-		u32 core2 = readl(dbg_addr + offsetof(struct wave600_chi_debug_ext, core2_info));
+	if (val != WAVE600_CHI_MAGIC) {
+		u32 core0 = wave600_read32(wdev, dbg_reg + offsetof(struct wave600_chi_debug_ext, core0_info));
+		u32 core1 = wave600_read32(wdev, dbg_reg + offsetof(struct wave600_chi_debug_ext, core1_info));
+		u32 core2 = wave600_read32(wdev, dbg_reg + offsetof(struct wave600_chi_debug_ext, core2_info));
 
 		dev_err(wdev->dev, "timeout waiting for ARC firmware boot (read: 0x%08x, expected 0x%08x)\n",
 			val, WAVE600_CHI_MAGIC);

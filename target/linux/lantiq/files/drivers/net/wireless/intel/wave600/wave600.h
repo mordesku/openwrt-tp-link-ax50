@@ -10,6 +10,7 @@
 #include <linux/pci.h>
 #include <linux/io.h>
 #include <linux/types.h>
+#include "wave600_ipc.h"
 
 #define DRV_NAME "wave600_wifi"
 
@@ -22,6 +23,8 @@ struct wave600_dev {
 	u32 chip_id;
 	u32 chip_rev;
 	u8 radio_idx;
+
+	struct wave600_ipc ipc;
 };
 
 /*

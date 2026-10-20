@@ -22,28 +22,28 @@
 #define WAVE600_PCI_CFG_DUAL_PCI            1
 
 struct wave600_chi_area_desc {
-	__le32 ind_start_offset;
-	__le32 ind_num_elements;
-	__le32 req_start_offset;
-	__le32 req_num_elements;
+	u32 ind_start_offset;
+	u32 ind_num_elements;
+	u32 req_start_offset;
+	u32 req_num_elements;
 } __packed;
 
 struct wave600_chi_ring {
-	__le32 in_counter_addr;
-	__le32 in_status_addr;
-	__le32 out_counter_addr;
-	__le32 out_status_addr;
-	__le32 in_counter_addr_be;
-	__le32 out_freed_counter_addr_be;
+	u32 in_counter_addr;
+	u32 in_status_addr;
+	u32 out_counter_addr;
+	u32 out_status_addr;
+	u32 in_counter_addr_be;
+	u32 out_freed_counter_addr_be;
 } __packed;
 
 struct wave600_chi_rd_pool {
-	__le32 pool_base_addr;
-	__le32 rd_size;
-	__le32 payload_offset;
-	__le32 bd_index_offset;
-	__le32 num_rds;
-	__le32 num_mgt_rds;
+	u32 pool_base_addr;
+	u32 rd_size;
+	u32 payload_offset;
+	u32 bd_index_offset;
+	u32 num_rds;
+	u32 num_mgt_rds;
 } __packed;
 
 struct wave600_chi_basic {
@@ -57,47 +57,47 @@ struct wave600_chi_basic {
 	struct wave600_chi_ring mang_tx_ring;
 	struct wave600_chi_ring mang_rx_ring;
 	struct wave600_chi_rd_pool rd_pool;
-	__le32 magic; /* Written by ARC firmware when ready (0xBEADFEED) */
+	u32 magic; /* Written by ARC firmware when ready (0xBEADFEED) */
 } __packed;
 
 struct wave600_chi_ext_header {
-	__le32 magic;
-	__le32 id;
-	__le32 size;
+	u32 magic;
+	u32 id;
+	u32 size;
 } __packed;
 
 struct wave600_chi_calibr_ext {
 	struct wave600_chi_ext_header header;
-	__le32 desc_location;
-	__le32 buf_requested_size;
-	__le32 psd_progmodel_addr;
+	u32 desc_location;
+	u32 buf_requested_size;
+	u32 psd_progmodel_addr;
 } __packed;
 
 struct wave600_chi_mips_control_ext {
 	struct wave600_chi_ext_header header;
-	__le32 desc_location;
+	u32 desc_location;
 } __packed;
 
 struct wave600_chi_logger_ext {
 	struct wave600_chi_ext_header header;
-	__le32 buf_desc_location;
-	__le32 num_buf_descs;
+	u32 buf_desc_location;
+	u32 num_buf_descs;
 } __packed;
 
 struct wave600_chi_fw_caps_stas_ext {
 	struct wave600_chi_ext_header header;
-	__le32 num_stations;
+	u32 num_stations;
 } __packed;
 
 struct wave600_chi_fw_caps_vaps_ext {
 	struct wave600_chi_ext_header header;
-	__le32 num_vaps;
+	u32 num_vaps;
 } __packed;
 
 struct wave600_chi_logger_buf_info {
-	__le32 size;
-	__le32 num_buffers;
-	__le32 buf_pool_addr;
+	u32 size;
+	u32 num_buffers;
+	u32 buf_pool_addr;
 } __packed;
 
 struct wave600_chi_logger_buf_info_ext {
@@ -108,34 +108,34 @@ struct wave600_chi_logger_buf_info_ext {
 
 struct wave600_chi_stats_mgr_ext {
 	struct wave600_chi_ext_header header;
-	__le32 stats_data_size;
-	__le32 stats_table_size;
-	__le32 type_table_list[16];
+	u32 stats_data_size;
+	u32 stats_table_size;
+	u32 type_table_list[16];
 } __packed;
 
 struct wave600_chi_frag_ring_ext {
 	struct wave600_chi_ext_header header;
-	__le32 frag_ring_addr;
-	__le32 frag_ring_num_entries;
+	u32 frag_ring_addr;
+	u32 frag_ring_num_entries;
 } __packed;
 
 struct wave600_chi_logger_rd_ext {
 	struct wave600_chi_ext_header header;
-	__le16 first_rd_index;
-	__le16 num_rds;
+	u16 first_rd_index;
+	u16 num_rds;
 } __packed;
 
 struct wave600_chi_debug_ext {
 	struct wave600_chi_ext_header header;
-	__le32 core0_info;
-	__le32 core1_info;
-	__le32 core2_info;
+	u32 core0_info;
+	u32 core1_info;
+	u32 core2_info;
 } __packed;
 
 struct wave600_chi_card_cfg_data {
-	__le32 band_cfg;       /* 0x1 - dual band */
-	__le32 pcie_cfg;       /* 0x0 - single PCIe */
-	__le32 platform_type;  /* 0x0 - real ASIC */
+	u32 band_cfg;       /* 0x1 - dual band */
+	u32 pcie_cfg;       /* 0x0 - single PCIe */
+	u32 platform_type;  /* 0x0 - real ASIC */
 } __packed;
 
 struct wave600_chi_card_cfg_ext {
