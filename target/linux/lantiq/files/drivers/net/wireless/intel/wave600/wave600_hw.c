@@ -60,6 +60,12 @@ void wave600_hw_reset(struct wave600_dev *wdev)
 	mmiowb();
 	msleep(10);
 
+	/* Mask host interrupts and disable legacy INTx during hardware reset */
+	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
+	wave600_write32(wdev, WAVE600_SOC_PCIE_LEGACY_INT_ENA, 0);
+	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0xffffff);
+	mmiowb();
+
 	/* 2. Disable MAC PAC RX during reset */
 	val = wave600_read32(wdev, WAVE600_PAC_RX_CONTROL);
 	val &= ~WAVE600_PAC_RX_CTRL_ENABLED;

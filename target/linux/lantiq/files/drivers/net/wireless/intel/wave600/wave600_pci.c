@@ -33,6 +33,15 @@ static int wave600_pci_probe(struct pci_dev *pdev, const struct pci_device_id *i
 
 	pci_set_master(pdev);
 
+	/* Ensure legacy INTx interrupt generation is enabled in PCI config space */
+	pci_intx(pdev, 1);
+	{
+		u16 pci_cmd;
+		pci_read_config_word(pdev, PCI_COMMAND, &pci_cmd);
+		dev_info(&pdev->dev, "PCI COMMAND: 0x%04x (INTx %s)\n",
+			 pci_cmd, (pci_cmd & PCI_COMMAND_INTX_DISABLE) ? "DISABLED" : "ENABLED");
+	}
+
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 	if (ret) {
 		dev_err(&pdev->dev, "failed to set 32-bit DMA mask: %d\n", ret);

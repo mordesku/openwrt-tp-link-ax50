@@ -96,10 +96,10 @@
 			interrupt-names = "msi0", "msi1", "msi2", "msi3", "msi4", "msi5", "msi6", "msi7", "ir";
 			#interrupt-cells = <1>;
 			interrupt-map-mask = <0 0 0 0x7>;
-			interrupt-map = <0 0 0 1 &gic GIC_SHARED 144 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 2 &gic GIC_SHARED 145 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 3 &gic GIC_SHARED 146 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 4 &gic GIC_SHARED 147 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-map = <0 0 0 1 &gic GIC_SHARED 144 IRQ_TYPE_LEVEL_LOW>,
+					<0 0 0 2 &gic GIC_SHARED 145 IRQ_TYPE_LEVEL_LOW>,
+					<0 0 0 3 &gic GIC_SHARED 146 IRQ_TYPE_LEVEL_LOW>,
+					<0 0 0 4 &gic GIC_SHARED 147 IRQ_TYPE_LEVEL_LOW>;
 			ranges = <0x02000000 0 0xa0000000 0xa0000000 0 0x03000000
 				  0x01000000 0 0xa3800000 0xa3800000 0 0x00100000>;
 			resets = <&rcu0 12>;
@@ -129,10 +129,10 @@
 			interrupt-names = "msi0", "msi1", "msi2", "msi3", "msi4", "msi5", "msi6", "msi7", "ir";
 			#interrupt-cells = <1>;
 			interrupt-map-mask = <0 0 0 0x7>;
-			interrupt-map = <0 0 0 1 &gic GIC_SHARED 17 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 2 &gic GIC_SHARED 18 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 3 &gic GIC_SHARED 19 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 4 &gic GIC_SHARED 20 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-map = <0 0 0 1 &gic GIC_SHARED 17 IRQ_TYPE_LEVEL_LOW>,
+					<0 0 0 2 &gic GIC_SHARED 18 IRQ_TYPE_LEVEL_LOW>,
+					<0 0 0 3 &gic GIC_SHARED 19 IRQ_TYPE_LEVEL_LOW>,
+					<0 0 0 4 &gic GIC_SHARED 20 IRQ_TYPE_LEVEL_LOW>;
 			ranges = <0x02000000 0 0x9c000000 0x9c000000 0 0x03000000
 				  0x01000000 0 0x9f800000 0x9f800000 0 0x00100000>;
 			resets = <&rcu0 13>;
@@ -162,10 +162,10 @@
 			interrupt-names = "msi0", "msi1", "msi2", "msi3", "msi4", "msi5", "msi6", "msi7", "ir";
 			#interrupt-cells = <1>;
 			interrupt-map-mask = <0 0 0 0x7>;
-			interrupt-map = <0 0 0 1 &gic 163>,
-					<0 0 0 2 &gic 164>,
-					<0 0 0 3 &gic 165>,
-					<0 0 0 4 &gic 166>;
+			interrupt-map = <0 0 0 1 &gic GIC_SHARED 163 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 2 &gic GIC_SHARED 164 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 3 &gic GIC_SHARED 165 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 4 &gic GIC_SHARED 166 IRQ_TYPE_LEVEL_HIGH>;
 			ranges = <0x02000000 0 0xa4000000 0xa4000000 0 0x03000000
 				  0x01000000 0 0xa7800000 0xa7800000 0 0x00100000>;
 			resets = <&rcu0 10>;
