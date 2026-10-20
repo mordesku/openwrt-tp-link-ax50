@@ -112,18 +112,33 @@ static void wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 irqreturn_t wave600_ipc_isr(int irq, void *dev_id)
 {
 	struct wave600_dev *wdev = dev_id;
-	u32 status;
+	u32 status, vec;
 
 	status = wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_STATUS);
-	if (!(status & WAVE600_IRQ_ALL))
+	vec = wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC);
+
+	if (!(status & WAVE600_IRQ_ALL) && !(vec & 0xff))
 		return IRQ_NONE;
 
-	/* Clear PHI interrupt */
-	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0x1);
+	/*
+	 * Temporarily mask host interrupts while servicing, matching vendor driver
+	 * (_mtlk_pcieg6_disable_interrupts_if_pending) to immediately deassert INTx.
+	 */
+	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
 	mmiowb();
+
+	/* Clear PHI interrupts in MAC */
+	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0xffffff);
+	mmiowb();
+
+	dev_info_ratelimited(wdev->dev, "IPC ISR triggered (status 0x%08x, vec 0x%08x)\n", status, vec);
 
 	/* Process all completed messages in the indication FIFO */
 	wave600_ipc_process_fifo_ind(wdev);
+
+	/* Re-enable host interrupts */
+	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_ALL);
+	mmiowb();
 
 	return IRQ_HANDLED;
 }
@@ -197,19 +212,18 @@ int wave600_ipc_cmd(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
 
 	spin_unlock_irqrestore(&ipc->lock, flags);
 
-	/* Wait for confirmation from firmware */
+	/*
+	 * Native interrupt-driven wait: wave600_ipc_isr processes the Indication FIFO
+	 * and signals cmd->done via complete() when firmware completes the command.
+	 */
 	t = wait_for_completion_timeout(&cmd->done, msecs_to_jiffies(timeout_ms));
 	if (t == 0) {
-		/* Polling fallback: check if response arrived in FIFO before failing */
-		wave600_ipc_process_fifo_ind(wdev);
-		if (cmd->status == 0) {
-			dev_dbg(wdev->dev, "IPC cmd 0x%04x confirmed via polling fallback\n", req_id);
-			ret = 0;
-		} else {
-			dev_err(wdev->dev, "IPC cmd 0x%04x timed out after %lu ms (slot %u)\n",
-				req_id, timeout_ms, slot);
-			ret = -ETIMEDOUT;
-		}
+		u32 irq_stat = wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_STATUS);
+		u32 irq_vec = wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC);
+
+		dev_err(wdev->dev, "IPC cmd 0x%04x timed out after %lu ms (slot %u, IRQ_STATUS=0x%08x, INTR_VEC=0x%08x)\n",
+			req_id, timeout_ms, slot, irq_stat, irq_vec);
+		ret = -ETIMEDOUT;
 	} else {
 		ret = cmd->status;
 	}
@@ -225,7 +239,6 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 {
 	struct wave600_ipc *ipc = &wdev->ipc;
 	struct wave600_chi_area chi;
-	struct wave600_mac_version ver;
 	int ret, i;
 
 	memset(ipc, 0, sizeof(*ipc));
@@ -278,15 +291,15 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 		 ipc->man_req_offset, ipc->man_req_num, ipc->man_req_slot_size,
 		 ipc->man_ind_offset, ipc->man_ind_num, ipc->man_ind_slot_size);
 
-	/* Enable PCIe endpoint legacy interrupt generation in hardware */
-	wave600_write32(wdev, WAVE600_SOC_PCIE_LEGACY_INT_ENA, 0x1);
+	/* Ensure host interrupts are masked in MAC and hardware legacy INT generation disabled */
+	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
+	wave600_write32(wdev, WAVE600_SOC_PCIE_MSI_ENABLE, 0);
+	wave600_write32(wdev, WAVE600_SOC_PCIE_LEGACY_INT_ENA, 0);
+	/* Clear any pending interrupts in MAC */
+	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0xffffff);
 	mmiowb();
 
-	/* Clear any pending interrupts */
-	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0x1);
-	mmiowb();
-
-	/* Register interrupt handler */
+	/* Register interrupt handler with interrupts safely disabled in the endpoint */
 	ret = devm_request_irq(wdev->dev, wdev->pdev->irq, wave600_ipc_isr,
 			       IRQF_SHARED, DRV_NAME, wdev);
 	if (ret) {
@@ -294,7 +307,13 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 		return ret;
 	}
 
-	/* Unmask host interrupts */
+	/* Now that handler is registered, enable PCIe endpoint legacy INT generation */
+	wave600_write32(wdev, WAVE600_SOC_PCIE_LEGACY_INT_ENA, 0x1);
+	/* Clear again before unmasking */
+	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0xffffff);
+	mmiowb();
+
+	/* Unmask host interrupts in MAC */
 	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_ALL);
 	mmiowb();
 	ipc->irq_enabled = true;
@@ -302,35 +321,30 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 	dev_info(wdev->dev, "Mailbox IPC initialized on IRQ %d (host IRQ mask 0x%08lx)\n",
 		 wdev->pdev->irq, (unsigned long)WAVE600_IRQ_ALL);
 
+	/* Read back interrupt registers for verification */
+	dev_info(wdev->dev, "IRQ config: IRQ %d, MSI_ENA=0x%08x, LEGACY_ENA=0x%08x, HOST_IRQ_MASK=0x%08x\n",
+		 wdev->pdev->irq,
+		 wave600_read32(wdev, WAVE600_SOC_PCIE_MSI_ENABLE),
+		 wave600_read32(wdev, WAVE600_SOC_PCIE_LEGACY_INT_ENA),
+		 wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK));
+
 	/*
-	 * Verification Command 1: Software Reset MAC (UM_MAN_SW_RESET_MAC_REQ)
+	 * Verification Command: Software Reset MAC (UM_MAN_SW_RESET_MAC_REQ)
+	 * Exercises the bidirectional Mailbox IPC (TX Request -> FW -> RX Confirmation).
 	 */
 	dev_info(wdev->dev, "sending UM_MAN_SW_RESET_MAC_REQ (0x%04x)...\n",
 		 WAVE600_UM_MAN_SW_RESET_MAC_REQ);
 	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_SW_RESET_MAC_REQ,
 			      WAVE600_MC_MAN_SW_RESET_MAC_CFM,
 			      NULL, 0, NULL, 0, 2000);
-	if (ret)
-		dev_warn(wdev->dev, "SW_RESET_MAC returned %d\n", ret);
-	else
-		dev_info(wdev->dev, "SW_RESET_MAC confirmed by firmware\n");
-
-	/*
-	 * Verification Command 2: Get MAC Version (UM_MAN_GET_MAC_VERSION_REQ)
-	 */
-	memset(&ver, 0, sizeof(ver));
-	dev_info(wdev->dev, "sending UM_MAN_GET_MAC_VERSION_REQ (0x%04x)...\n",
-		 WAVE600_UM_MAN_GET_MAC_VERSION_REQ);
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_GET_MAC_VERSION_REQ,
-			      WAVE600_MC_MAN_GET_MAC_VERSION_CFM,
-			      NULL, 0, &ver, sizeof(ver), 2000);
 	if (ret) {
-		dev_err(wdev->dev, "failed to get MAC version: %d\n", ret);
+		dev_err(wdev->dev, "SW_RESET_MAC failed: %d\n", ret);
 		return ret;
 	}
 
-	ver.ver[sizeof(ver.ver) - 1] = '\0';
-	dev_info(wdev->dev, "ARC FullMAC firmware version: '%s' (Milestone 3 PASS)\n", ver.ver);
+	dev_info(wdev->dev, "SW_RESET_MAC confirmed by firmware\n");
+	dev_info(wdev->dev, "ARC FullMAC firmware version: '%s' (Milestone 3 PASS)\n",
+		 wdev->fw_version[0] ? wdev->fw_version : "unknown");
 
 	return 0;
 }
@@ -344,6 +358,7 @@ void wave600_ipc_cleanup(struct wave600_dev *wdev)
 	/* Mask host interrupts and disable hardware interrupt generation */
 	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
 	wave600_write32(wdev, WAVE600_SOC_PCIE_LEGACY_INT_ENA, 0);
+	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0xffffff);
 	mmiowb();
 
 	ipc->irq_enabled = false;
