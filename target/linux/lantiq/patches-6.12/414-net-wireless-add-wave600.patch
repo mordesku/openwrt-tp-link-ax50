@@ -1,0 +1,17 @@
+--- a/drivers/net/wireless/Kconfig
++++ b/drivers/net/wireless/Kconfig
+@@ -1,4 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0-only
++source "drivers/net/wireless/intel/wave600/Kconfig"
++
+ #
+ # Wireless LAN device configuration
+ #
+--- a/drivers/net/wireless/Makefile
++++ b/drivers/net/wireless/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_WAVE600_WIFI) += intel/wave600/
+ #
+ # Makefile for the Linux Wireless network device drivers.
+ #

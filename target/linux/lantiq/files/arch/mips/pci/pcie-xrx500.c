@@ -679,7 +679,7 @@ static int grx500_pcie_read_config(struct pci_bus *bus, unsigned int devfn,
 	if (rel_bus == 0) {
 		/* Access Root Complex config space via csr_base */
 		data = ltq_r32(lpp->csr_base + (where & ~3));
-		if (where == PCI_PRIMARY_BUS) {
+		if ((where & ~3) == PCI_PRIMARY_BUS) {
 			u8 primary = (data & 0xff) + bus_offset;
 			u8 secondary = ((data >> 8) & 0xff) + bus_offset;
 			u8 subordinate = (data >> 16) & 0xff;
@@ -761,6 +761,12 @@ static int grx500_pcie_write_config(struct pci_bus *bus, unsigned int devfn,
 				subordinate -= bus_offset;
 			value = (value & 0xff000000) | primary |
 				(secondary << 8) | (subordinate << 16);
+		} else if (where == PCI_SECONDARY_BUS) {
+			u8 secondary = value & 0xff;
+
+			if (secondary >= bus_offset && secondary != 0xff)
+				secondary -= bus_offset;
+			value = secondary;
 		} else if (where == PCI_SUBORDINATE_BUS) {
 			u8 subordinate = value & 0xff;
 
