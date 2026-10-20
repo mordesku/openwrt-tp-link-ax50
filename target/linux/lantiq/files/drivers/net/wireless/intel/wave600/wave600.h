@@ -23,9 +23,18 @@ struct wave600_dev {
 	u32 chip_id;
 	u32 chip_rev;
 	u8 radio_idx;
+	char fw_version[128];
 
 	struct wave600_ipc ipc;
+
+	/* Calibration cache DMA memory */
+	void *cal_buf;
+	dma_addr_t cal_dma_addr;
+	size_t cal_buf_size;
 };
+
+int wave600_cal_init(struct wave600_dev *wdev);
+void wave600_cal_cleanup(struct wave600_dev *wdev);
 
 /*
  * Register MMIO accessors - use raw accessors to match vendor driver

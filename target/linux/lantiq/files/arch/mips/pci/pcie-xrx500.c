@@ -962,6 +962,7 @@ static int grx500_pcie_probe(struct platform_device *pdev)
 	lpp->pcic.pci_ops = &grx500_pcie_ops;
 	lpp->pcic.io_resource = &lpp->io;
 	lpp->pcic.mem_resource = &lpp->mem;
+	lpp->pcic.of_node = np;
 
 	pci_load_of_ranges(&lpp->pcic, np);
 
@@ -971,6 +972,12 @@ static int grx500_pcie_probe(struct platform_device *pdev)
 		pcie_ep_rst_deassert(lpp);
 		return ret;
 	}
+
+	/* Unmask INTx legacy interrupts (INTA..INTD: bits 13..16) in Root Complex app registers */
+	ltq_w32(0xF << 13, lpp->app_base + PCIE_IRNCR);
+	ltq_w32(0xF << 13, lpp->app_base + PCIE_IRNEN);
+	dev_info(dev, "port %d: unmasked INTx in PCIE_IRNEN (0x%08x)\n",
+		 lpp->id, ltq_r32(lpp->app_base + PCIE_IRNEN));
 
 	register_pci_controller(&lpp->pcic);
 

@@ -108,6 +108,15 @@ static int wave600_pci_probe(struct pci_dev *pdev, const struct pci_device_id *i
 	}
 
 	dev_info(&pdev->dev, "WAV654 Mailbox IPC initialized successfully (Milestone 3 PASS)\n");
+
+	/* Initialize Calibration, ProgModel & RF Transceiver (Milestone 4) */
+	ret = wave600_cal_init(wdev);
+	if (ret) {
+		dev_err(&pdev->dev, "calibration initialization failed: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(&pdev->dev, "WAV654 RF Calibration completed successfully (Milestone 4 PASS)\n");
 	return 0;
 }
 
@@ -117,6 +126,7 @@ static void wave600_pci_remove(struct pci_dev *pdev)
 
 	if (wdev) {
 		dev_info(&pdev->dev, "removing WAV654 driver\n");
+		wave600_cal_cleanup(wdev);
 		wave600_ipc_cleanup(wdev);
 		wave600_hw_reset(wdev);
 	}
