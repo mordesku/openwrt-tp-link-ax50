@@ -64,6 +64,26 @@ static int wave600_fw_load_file(struct wave600_dev *wdev, const char *name,
 	dev_info(wdev->dev, "staging '%s' (%zu bytes) to IRAM 0x%08x\n",
 		 name, fw->size, dst_offset);
 
+	/* Extract firmware version from Upper MAC binary (matching vendor get_firmware_version) */
+	if (strcmp(name, WAVE600_FW_UPPER_MAC) == 0 && fw->data && fw->size > 64) {
+		const char *sig = "version number: ";
+		const char *p = strnstr((const char *)fw->data, sig, fw->size);
+		if (p) {
+			const char *start = p + strlen(sig);
+			const char *end = strnstr(start, "@@@", fw->size - (start - (const char *)fw->data));
+			size_t len = end ? (size_t)(end - start) : sizeof(wdev->fw_version) - 1;
+			if (len >= sizeof(wdev->fw_version))
+				len = sizeof(wdev->fw_version) - 1;
+			memcpy(wdev->fw_version, start, len);
+			wdev->fw_version[len] = '\0';
+			while (len > 0 && (wdev->fw_version[len - 1] == ' ' || wdev->fw_version[len - 1] == '\t')) {
+				wdev->fw_version[len - 1] = '\0';
+				len--;
+			}
+			dev_info(wdev->dev, "ARC Upper CPU firmware version: '%s'\n", wdev->fw_version);
+		}
+	}
+
 	ret = wave600_fw_copy_chunk(wdev, dst_offset, fw->data, fw->size, max_size);
 	release_firmware(fw);
 	return ret;

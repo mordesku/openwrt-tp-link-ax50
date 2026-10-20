@@ -117,27 +117,38 @@ irqreturn_t wave600_ipc_isr(int irq, void *dev_id)
 	status = wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_STATUS);
 	vec = wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC);
 
-	if (!(status & WAVE600_IRQ_ALL) && !(vec & 0xff))
-		return IRQ_NONE;
+	/*
+	 * When HOST_IRQ_MASK is enabled, WAV654 hardware generates a single initial dummy
+	 * pulse (documented by vendor: "side effect: one dummy interrupt").
+	 * If no interrupt flag is active in status, clear the latch via PHI_IRQ_CLEAR (0x1)
+	 * and return IRQ_HANDLED to consume the dummy pulse cleanly.
+	 * CRITICAL: NEVER write to HOST_IRQ_MASK and NEVER return IRQ_NONE here,
+	 * as that causes an immediate recursive loop and triggers Linux "nobody cared".
+	 */
+	if (!(status & WAVE600_IRQ_ALL) && !(vec & 0xff)) {
+		wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0x1);
+		mmiowb();
+		return IRQ_HANDLED;
+	}
 
 	/*
-	 * Temporarily mask host interrupts while servicing, matching vendor driver
-	 * (_mtlk_pcieg6_disable_interrupts_if_pending) to immediately deassert INTx.
+	 * Real interrupt: temporarily mask host interrupts while servicing
+	 * to deassert PCIe level line (matches vendor _mtlk_pcieg6_disable_interrupts_if_pending).
 	 */
 	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
 	mmiowb();
 
-	/* Clear PHI interrupts in MAC */
-	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0xffffff);
+	/* Clear RAB interrupt condition in MAC */
+	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0x1);
 	mmiowb();
 
-	dev_info_ratelimited(wdev->dev, "IPC ISR triggered (status 0x%08x, vec 0x%08x)\n", status, vec);
+	dev_dbg(wdev->dev, "IPC ISR triggered (status 0x%08x, vec 0x%08x)\n", status, vec);
 
 	/* Process all completed messages in the indication FIFO */
 	wave600_ipc_process_fifo_ind(wdev);
 
-	/* Re-enable host interrupts */
-	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_ALL);
+	/* Re-enable host interrupts (IPC / Control only) */
+	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_IPC);
 	mmiowb();
 
 	return IRQ_HANDLED;
@@ -295,8 +306,8 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
 	wave600_write32(wdev, WAVE600_SOC_PCIE_MSI_ENABLE, 0);
 	wave600_write32(wdev, WAVE600_SOC_PCIE_LEGACY_INT_ENA, 0);
-	/* Clear any pending interrupts in MAC */
-	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0xffffff);
+	/* Clear any pending interrupts in MAC (0x1 = MTLK_GEN6_CLEAR_RAB_INTERRUPT) */
+	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0x1);
 	mmiowb();
 
 	/* Register interrupt handler with interrupts safely disabled in the endpoint */
@@ -310,16 +321,17 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 	/* Now that handler is registered, enable PCIe endpoint legacy INT generation */
 	wave600_write32(wdev, WAVE600_SOC_PCIE_LEGACY_INT_ENA, 0x1);
 	/* Clear again before unmasking */
-	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0xffffff);
+	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0x1);
 	mmiowb();
 
-	/* Unmask host interrupts in MAC */
-	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_ALL);
+	/* Unmask host interrupts in MAC (IPC / Control only) */
+	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_IPC);
 	mmiowb();
+	(void)wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK);
 	ipc->irq_enabled = true;
 
 	dev_info(wdev->dev, "Mailbox IPC initialized on IRQ %d (host IRQ mask 0x%08lx)\n",
-		 wdev->pdev->irq, (unsigned long)WAVE600_IRQ_ALL);
+		 wdev->pdev->irq, (unsigned long)WAVE600_IRQ_IPC);
 
 	/* Read back interrupt registers for verification */
 	dev_info(wdev->dev, "IRQ config: IRQ %d, MSI_ENA=0x%08x, LEGACY_ENA=0x%08x, HOST_IRQ_MASK=0x%08x\n",

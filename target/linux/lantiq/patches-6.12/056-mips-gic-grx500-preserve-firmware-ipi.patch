@@ -1,7 +1,31 @@
 --- a/drivers/irqchip/irq-mips-gic.c
 +++ b/drivers/irqchip/irq-mips-gic.c
-@@ -817,6 +817,13 @@
+@@ -187,8 +187,24 @@
+ static void gic_unmask_irq(struct irq_data *d)
+ {
+ 	unsigned int intr = GIC_HWIRQ_TO_SHARED(d->hwirq);
+ 	unsigned int cpu;
  
++#if defined(CONFIG_SOC_GRX500)
++	/*
++	 * GRX500 PCIe Root Complex INTx latch WAR:
++	 * The PCIe Root Complex latches INTx in PCIE_IRNCR (0x00F8) and holds
++	 * the GIC level line asserted until software clears the latch bit.
++	 * If not cleared before unmasking, GIC immediately re-triggers.
++	 * Bits 13..16 correspond to INTA..INTD (Write-1-to-Clear).
++	 */
++	if (intr >= 144 && intr <= 147)
++		__raw_writel(BIT(13 + (intr - 144)), (void __iomem *)(0xb8800000 + 0xF8));
++	else if (intr >= 17 && intr <= 20)
++		__raw_writel(BIT(13 + (intr - 17)), (void __iomem *)(0xb8300000 + 0xF8));
++	else if (intr >= 163 && intr <= 166)
++		__raw_writel(BIT(13 + (intr - 163)), (void __iomem *)(0xb8d00000 + 0xF8));
++#endif
++
+ 	write_gic_smask(intr);
+ 
+ 	gic_clear_pcpu_masks(intr);
+@@ -818,5 +834,12 @@
  	/* Setup defaults */
  	for (i = 0; i < gic_shared_intrs; i++) {
 +		/* GRX500 vendor irq-gic.c leaves these IBL/VMB channels intact.

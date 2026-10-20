@@ -43,16 +43,33 @@ struct wave600_dev;
 #define WAVE600_UM_MAN_SW_RESET_MAC_REQ      WAVE600_UMI_MSG_MAN_REQ(0x0C) /* 0x040C */
 #define WAVE600_MC_MAN_SW_RESET_MAC_CFM      WAVE600_UMI_MSG_MAN_CFM(0x0C) /* 0x140C */
 
-/* Host IRQ bitmasks (matching vendor mtlk_ccr_defs.h) */
+#define WAVE600_UM_DOWNLOAD_PROG_MODEL_REQ           WAVE600_UMI_MSG_MAN_REQ(0x02) /* 0x0402 */
+#define WAVE600_MC_DOWNLOAD_PROG_MODEL_CFM           WAVE600_UMI_MSG_MAN_CFM(0x02) /* 0x1402 */
+
+#define WAVE600_UM_MAN_HDK_CONFIG_REQ                WAVE600_UMI_MSG_MAN_REQ(0x50) /* 0x0450 */
+#define WAVE600_MC_MAN_HDK_CONFIG_CFM                WAVE600_UMI_MSG_MAN_CFM(0x50) /* 0x1450 */
+
+#define WAVE600_UM_MAN_CALIBRATE_REQ                 WAVE600_UMI_MSG_MAN_REQ(0x53) /* 0x0453 */
+#define WAVE600_MC_MAN_CALIBRATE_CFM                 WAVE600_UMI_MSG_MAN_CFM(0x53) /* 0x1453 */
+
+#define WAVE600_UM_MAN_DOWNLOAD_PROG_MODEL_ANT_TX_REQ WAVE600_UMI_MSG_MAN_REQ(0x80) /* 0x0480 */
+#define WAVE600_MC_MAN_DOWNLOAD_PROG_MODEL_ANT_TX_CFM WAVE600_UMI_MSG_MAN_CFM(0x80) /* 0x1480 */
+
+#define WAVE600_UM_MAN_DOWNLOAD_PROG_MODEL_ANT_RX_REQ WAVE600_UMI_MSG_MAN_REQ(0x81) /* 0x0481 */
+#define WAVE600_MC_MAN_DOWNLOAD_PROG_MODEL_ANT_RX_CFM WAVE600_UMI_MSG_MAN_CFM(0x81) /* 0x1481 */
+
+/* Host IRQ bitmasks (matching vendor MacGeneralRegs.h and mtlk_ccr_defs.h) */
 #define WAVE600_IRQ_TXOUT     BIT(0)
 #define WAVE600_IRQ_RX        BIT(1)
 #define WAVE600_IRQ_BSS_CFM   BIT(2)
 #define WAVE600_IRQ_BSS_IND   BIT(3)
-#define WAVE600_IRQ_CONTROL   BIT(5)
-#define WAVE600_IRQ_MAILBOX   BIT(6)
+#define WAVE600_IRQ_MAILBOX   BIT(4) /* macHostMailboxCountNotEmptyIrq */
+#define WAVE600_IRQ_CONTROL   BIT(5) /* rabPhiInterrupt */
+#define WAVE600_IRQ_DMA_ERR   BIT(6)
 
-#define WAVE600_IRQ_ALL       (WAVE600_IRQ_CONTROL | WAVE600_IRQ_TXOUT | \
-                               WAVE600_IRQ_RX | WAVE600_IRQ_BSS_IND | WAVE600_IRQ_BSS_CFM)
+#define WAVE600_IRQ_IPC       WAVE600_IRQ_CONTROL /* Active interrupt source for Mailbox IPC */
+#define WAVE600_IRQ_ALL       (WAVE600_IRQ_CONTROL | WAVE600_IRQ_BSS_IND | WAVE600_IRQ_BSS_CFM | \
+			       WAVE600_IRQ_RX | WAVE600_IRQ_TXOUT) /* 0x2F matching vendor MTLK_IRQ_ALL */
 
 /*
  * HIM 32-bit descriptor encoding in sFifoQ
@@ -95,6 +112,39 @@ struct wave600_mac_version {
 	u8 length;
 	u8 reserved[3];
 	char ver[36];
+} __packed;
+
+/*
+ * HDK Configuration structure (UM_MAN_HDK_CONFIG_REQ)
+ */
+struct wave600_umi_hdk_config {
+	u32 cal_buffer_base_addr;
+	u8 get_set_operation;
+	u8 set_channel_mode;
+	u8 reserved[2];
+	u8 num_tx_ants;
+	u8 num_rx_ants;
+	u16 eeprom_version;
+	u8 num_points_5ghz;
+	u8 num_points_2ghz;
+	u8 band;
+	u8 reserved2;
+	u32 offline_cal_mask;
+	u32 online_cal_mask;
+} __packed;
+
+#define WAVE600_MAX_CALIB_CHANS 32
+
+/*
+ * Calibration parameters structure (UM_MAN_CALIBRATE_REQ)
+ */
+struct wave600_umi_calibrate_params {
+	u32 stored_calib_data;
+	u32 status;
+	u8 chan_nums[WAVE600_MAX_CALIB_CHANS];
+	u8 num_chans;
+	u8 chan_width;
+	u8 reserved[2];
 } __packed;
 
 /*
