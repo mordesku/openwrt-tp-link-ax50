@@ -54,3 +54,19 @@ define KernelPackage/grx500-switch/description
 endef
 
 $(eval $(call KernelPackage,grx500-switch))
+
+define KernelPackage/wave600-wifi
+  SUBMENU:=$(WIRELESS_MENU)
+  TITLE:=Intel/MaxLinear Wave600 (WAV654) Wi-Fi 6 driver
+  DEPENDS:=@TARGET_lantiq_xrx500
+  KCONFIG:=CONFIG_WAVE600_WIFI
+  FILES:=$(LINUX_DIR)/drivers/net/wireless/intel/wave600/wave600_wifi.ko
+  AUTOLOAD:=$(call AutoLoad,60,wave600_wifi)
+endef
+
+define KernelPackage/wave600-wifi/description
+  Clean modern driver for Intel/MaxLinear WAV654 802.11ax PCIe radios
+endef
+
+$(eval $(call KernelPackage,wave600-wifi))
+
