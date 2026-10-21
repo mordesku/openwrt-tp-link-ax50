@@ -14,7 +14,12 @@
 #include "wave600_chi.h"
 #include "wave600_ipc.h"
 
-static void wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
+/*
+ * Consume completed messages from the Indication FIFO.
+ * Runs in tasklet context only (ind_idx is owned by the tasklet).
+ * Returns the number of messages consumed (0 if the FIFO was empty).
+ */
+static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 {
 	struct wave600_ipc *ipc = &wdev->ipc;
 	int processed = 0;
@@ -33,7 +38,7 @@ static void wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 		wave600_write32(wdev, ipc->ind_offset + (ipc->ind_idx * sizeof(u32)), 0);
 		mmiowb();
 
-		/* Clear interrupt unconditionally as vendor does */
+		/* Clear interrupt unconditionally as vendor does (gen6) */
 		wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0x1);
 		mmiowb();
 
@@ -68,6 +73,7 @@ static void wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 					memcpy_fromio(cmd->resp_buf, slot_addr + sizeof(hdr), copy_len);
 				}
 
+				ipc->cfm_count++;
 				cmd->status = 0;
 				complete(&cmd->done);
 			} else {
@@ -78,19 +84,29 @@ static void wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 			 * Asynchronous Indication from firmware:
 			 * 'idx' corresponds to an indication slot in sMAN.ind.
 			 */
+			u32 bounce_len = min(ipc->man_ind_slot_size,
+					     (u32)WAVE600_IPC_MAX_IND_BOUNCE);
 			void __iomem *ind_slot = wdev->bar0 + ipc->man_ind_offset +
 						 (idx * ipc->man_ind_slot_size);
-			struct wave600_umi_msg_hdr ind_hdr;
+			u8 bounce[WAVE600_IPC_MAX_IND_BOUNCE];
+			struct wave600_umi_msg_hdr *ind_hdr = (struct wave600_umi_msg_hdr *)bounce;
 			u32 resp_descr;
 
-			memcpy_fromio(&ind_hdr, ind_slot, sizeof(ind_hdr));
+			/* Copy the full IOM out of the slot (vendor _mtlk_mmb_handle_cm_ind) */
+			memcpy_fromio(bounce, ind_slot, bounce_len);
 			dev_info_ratelimited(wdev->dev, "asynchronous indication 0x%04x on radio %u vap %u (slot %u)\n",
-					     ind_hdr.msg_id, radio, vap, idx);
+					    ind_hdr->msg_id, radio, vap, idx);
 
 			/*
-			 * Recycle indication slot back to firmware (vendor _mtlk_mmb_resp_cm_ind):
-			 * Write descriptor into Request FIFO so firmware can reuse this slot.
+			 * Release the slot back to firmware (vendor _mtlk_mmb_resp_cm_ind):
+			 * the IOM contents are written back before the release descriptor
+			 * is posted, then the ARRAY_MAN_IND descriptor goes through the
+			 * Request FIFO so firmware can reuse this slot.
 			 */
+			memcpy_toio(ind_slot, bounce, bounce_len);
+			mmiowb();
+
+			ipc->ind_count++;
 			resp_descr = wave600_msg_to_descr(WAVE600_MSG_TYPE_MAN_IND, idx, radio, vap);
 			spin_lock(&ipc->lock);
 			wave600_write32(wdev, ipc->req_offset + (ipc->req_idx * sizeof(u32)), resp_descr);
@@ -107,49 +123,149 @@ static void wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 			dev_dbg(wdev->dev, "unhandled descriptor type %u, index %u\n", type, idx);
 		}
 	}
+
+	return processed;
+}
+
+/*
+ * Deferred interrupt processing (vendor mtlk_hw_mmb_deferred_handler +
+ * IRQ_ENABLE_OR_RESCHEDULE). HOST_IRQ_MASK stays 0 while the tasklet runs;
+ * it is re-enabled only after the work completes.
+ */
+static void wave600_ipc_tasklet_fn(struct tasklet_struct *t)
+{
+	struct wave600_ipc *ipc = from_tasklet(ipc, t, tasklet);
+	struct wave600_dev *wdev = ipc->wdev;
+	int processed;
+
+	processed = wave600_ipc_process_fifo_ind(wdev);
+
+	if (processed > 0) {
+		ipc->empty_runs = 0;
+	} else if (++ipc->empty_runs >= WAVE600_IPC_STORM_LIMIT && !ipc->storm_latched) {
+		/*
+		 * Storm guard (inverse of vendor MTCFG_LEGACY_INT_RECOVERY_MON):
+		 * firmware keeps re-asserting the RAB PHI while the Indication
+		 * FIFO is empty. Leave HOST_IRQ_MASK at 0 so the PCIe level line
+		 * stays deasserted and the system survives; log one snapshot.
+		 */
+		ipc->storm_latched = true;
+		dev_err(wdev->dev,
+			"IRQ storm guard: %u empty service runs, HOST_IRQ_MASK left at 0 (STATUS=0x%08x, PHI_IRQ=0x%08x, INTR_VEC=0x%08x, isr=%u spurious=%u cfm=%u ind=%u)\n",
+			ipc->empty_runs,
+			wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_STATUS),
+			wave600_read32(wdev, WAVE600_MAC_GEN_PHI_IRQ),
+			wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC),
+			ipc->isr_total, ipc->isr_spurious,
+			ipc->cfm_count, ipc->ind_count);
+		return;
+	}
+
+	/* Cleanup path: do not re-arm interrupts once the driver is going away */
+	if (!ipc->irq_enabled)
+		return;
+
+	/* Re-enable host interrupts (vendor single-IRQ legacy mask MTLK_IRQ_ALL) */
+	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_ALL);
+	mmiowb();
 }
 
 irqreturn_t wave600_ipc_isr(int irq, void *dev_id)
 {
 	struct wave600_dev *wdev = dev_id;
-	u32 status, vec;
+	struct wave600_ipc *ipc = &wdev->ipc;
+	u32 status;
+
+	/*
+	 * Vendor-grade level-INTx servicing
+	 * (hw_mmb.c mtlk_hw_mmb_interrupt_handler_legacy +
+	 *  mtlk_ccr_pcieg6.c _mtlk_pcieg6_{disable,clear}_interrupts_if_pending):
+	 *
+	 * 1. HOST_IRQ_MASK = 0 immediately deasserts the PCIe level line.
+	 *    Read back to make sure the write reached the endpoint.
+	 * 2. HOST_IRQ_STATUS is a live condition register (RO); read it
+	 *    only after masking.
+	 * 3. Clear the RAB PHI latch with 0x1 only if the CONTROL bit is set.
+	 * 4. Empty status => not ours / spurious: re-enable and return
+	 *    IRQ_NONE so the kernel spurious-IRQ watchdog can catch a
+	 *    permanently asserted line instead of looping forever.
+	 * 5. Otherwise stash the status, schedule the tasklet and keep the
+	 *    mask at 0 until processing completes (vendor isr_action_normal).
+	 */
+	/*
+	 * Vendor pcie_intx_war() (GIC driver, patch 3046): clear the GRX500
+	 * Root Complex INTx latch (PCIE_IRNCR, write-1-to-clear, INTA = bit 13)
+	 * at irq unmask and at the end of every dispatch. The RC asserts the
+	 * GIC line HIGH on Assert_INTA and only the IRNCR write releases it.
+	 */
+	if (ipc->rc_app)
+		__raw_writel(WAVE600_RC_INTA, ipc->rc_app + WAVE600_RC_APP_IRNCR);
+
+	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
+	(void)wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK);
 
 	status = wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_STATUS);
-	vec = wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC);
 
-	/*
-	 * When HOST_IRQ_MASK is enabled, WAV654 hardware generates a single initial dummy
-	 * pulse (documented by vendor: "side effect: one dummy interrupt").
-	 * If no interrupt flag is active in status, clear the latch via PHI_IRQ_CLEAR (0x1)
-	 * and return IRQ_HANDLED to consume the dummy pulse cleanly.
-	 * CRITICAL: NEVER write to HOST_IRQ_MASK and NEVER return IRQ_NONE here,
-	 * as that causes an immediate recursive loop and triggers Linux "nobody cared".
-	 */
-	if (!(status & WAVE600_IRQ_ALL) && !(vec & 0xff)) {
+	if (status & WAVE600_IRQ_CONTROL) {
 		wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0x1);
 		mmiowb();
-		return IRQ_HANDLED;
 	}
 
-	/*
-	 * Real interrupt: temporarily mask host interrupts while servicing
-	 * to deassert PCIe level line (matches vendor _mtlk_pcieg6_disable_interrupts_if_pending).
-	 */
-	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
-	mmiowb();
+	if (!ipc->irq_enabled) {
+		/* Racing driver cleanup: leave interrupts masked */
+		return IRQ_NONE;
+	}
 
-	/* Clear RAB interrupt condition in MAC */
-	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0x1);
-	mmiowb();
+	ipc->isr_total++;
 
-	dev_dbg(wdev->dev, "IPC ISR triggered (status 0x%08x, vec 0x%08x)\n", status, vec);
+	if (!(status & WAVE600_IRQ_ALL)) {
+		u32 irnen = 0, irncr = 0, irnicr = 0;
 
-	/* Process all completed messages in the indication FIFO */
-	wave600_ipc_process_fifo_ind(wdev);
+		ipc->isr_spurious++;
 
-	/* Re-enable host interrupts (IPC / Control only) */
-	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_IPC);
-	mmiowb();
+		if (ipc->rc_app) {
+			/*
+			 * RC-side diagnostics: read the GRX500 Root Complex
+			 * interrupt node state for this root port.
+			 */
+			irnicr = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNICR);
+			irncr = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNCR);
+			irnen = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNEN);
+		}
+
+		/*
+		 * Diagnostic: an assert source invisible in HOST_IRQ_STATUS
+		 * (and ungated by HOST_IRQ_MASK) keeps the INTx level line
+		 * asserted. Read the raw 8-source PCIe interrupt vector
+		 * (SocRegsRegs.h REG_SOC_REGS_PCIE_INTR_VEC):
+		 *   bit 0/1: Host I/F data Tx/Rx out
+		 *   bit 2/3: MGMT Tx/Rx out
+		 *   bit 4:   FW-Driver mailbox
+		 *   bit 5:   RAB PHI interrupt
+		 *   bit 6:   WLAN IP's XBAR error
+		 *   bit 7:   WDT interrupt (invisible in HOST_IRQ_STATUS,
+		 *            which covers only bits 0..6)
+		 * Plus the AMBA order manager WDT level status (0x6C).
+		 * Print the first occurrence and every 10000th to identify
+		 * the storm source without flooding the console.
+		 */
+		if (ipc->isr_spurious == 1 || (ipc->isr_spurious % 10000) == 0) {
+			u32 vec = wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC);
+			u32 wdt = wave600_read32(wdev, WAVE600_SOC_PCIE_AMBA_ORDR_WDT);
+
+			dev_err(wdev->dev,
+				"unhandled INTx #%u: HOST_IRQ_STATUS=0x%08x, PCIE_INTR_VEC=0x%08x, AMBA_ORDR_WDT_INT=0x%08x, RC%u: IRNEN=0x%08x IRNCR=0x%08x IRNICR=0x%08x\n",
+				ipc->isr_spurious, status, vec, wdt,
+				ipc->rc_port, irnen, irncr, irnicr);
+		}
+
+		wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_ALL);
+		mmiowb();
+		return IRQ_NONE;
+	}
+
+	/* Defer all Indication FIFO processing to the tasklet */
+	tasklet_schedule(&ipc->tasklet);
 
 	return IRQ_HANDLED;
 }
@@ -231,9 +347,18 @@ int wave600_ipc_cmd(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
 	if (t == 0) {
 		u32 irq_stat = wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_STATUS);
 		u32 irq_vec = wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC);
+		u32 wdt_stat = wave600_read32(wdev, WAVE600_SOC_PCIE_AMBA_ORDR_WDT);
+		u32 irnen = 0, irncr = 0, irnicr = 0;
 
-		dev_err(wdev->dev, "IPC cmd 0x%04x timed out after %lu ms (slot %u, IRQ_STATUS=0x%08x, INTR_VEC=0x%08x)\n",
-			req_id, timeout_ms, slot, irq_stat, irq_vec);
+		if (ipc->rc_app) {
+			irnen = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNEN);
+			irncr = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNCR);
+			irnicr = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNICR);
+		}
+
+		dev_err(wdev->dev, "IPC cmd 0x%04x timed out after %lu ms (slot %u, IRQ_STATUS=0x%08x, INTR_VEC=0x%08x, AMBA_ORDR_WDT_INT=0x%08x, RC%u: IRNEN=0x%08x IRNCR=0x%08x IRNICR=0x%08x)\n",
+			req_id, timeout_ms, slot, irq_stat, irq_vec, wdt_stat,
+			ipc->rc_port, irnen, irncr, irnicr);
 		ret = -ETIMEDOUT;
 	} else {
 		ret = cmd->status;
@@ -258,6 +383,9 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 
 	for (i = 0; i < WAVE600_IPC_MAX_MAN_REQS; i++)
 		init_completion(&ipc->cmds[i].done);
+
+	/* Deferred interrupt processing (vendor tasklet-based deferred handler) */
+	tasklet_setup(&ipc->tasklet, wave600_ipc_tasklet_fn);
 
 	/* Read Shared RAM CHI area updated by ARC firmware */
 	memcpy_fromio(&chi, wdev->bar0 + WAVE600_SHARED_RAM_BASE, sizeof(chi));
@@ -302,6 +430,47 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 		 ipc->man_req_offset, ipc->man_req_num, ipc->man_req_slot_size,
 		 ipc->man_ind_offset, ipc->man_ind_num, ipc->man_ind_slot_size);
 
+	/*
+	 * INTx storm diagnostics: map the GRX500 Root Complex app register
+	 * block of the root port serving this endpoint (bus 1 -> RC port 0,
+	 * bus 3 -> RC port 1, per grx500.dtsi ssx@18000000 "app" regions) and
+	 * dump the RC interrupt node state BEFORE any endpoint interrupt
+	 * register is touched. If the INTA latch (PCIE_IRNCR) or live node
+	 * status (PCIE_IRNICR) is already set here, the line was asserted
+	 * before this driver enabled anything in the endpoint.
+	 */
+	{
+		phys_addr_t app_base = 0;
+
+		switch (wdev->pdev->bus->number) {
+		case 1:
+			ipc->rc_port = 0;
+			app_base = WAVE600_RC_APP_PORT0_BASE;
+			break;
+		case 3:
+			ipc->rc_port = 1;
+			app_base = WAVE600_RC_APP_PORT1_BASE;
+			break;
+		default:
+			dev_info(wdev->dev, "PCI bus %u: RC app mapping skipped\n",
+				 wdev->pdev->bus->number);
+			break;
+		}
+		if (app_base) {
+			ipc->rc_app = ioremap(app_base, 0x1000);
+			if (ipc->rc_app) {
+				dev_info(wdev->dev, "RC port %u app regs at %pa: IRNEN=0x%08x, IRNCR=0x%08x, IRNICR=0x%08x\n",
+					 ipc->rc_port, &app_base,
+					 __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNEN),
+					 __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNCR),
+					 __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNICR));
+			} else {
+				dev_warn(wdev->dev, "failed to map RC port %u app regs\n",
+					 ipc->rc_port);
+			}
+		}
+	}
+
 	/* Ensure host interrupts are masked in MAC and hardware legacy INT generation disabled */
 	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
 	wave600_write32(wdev, WAVE600_SOC_PCIE_MSI_ENABLE, 0);
@@ -318,27 +487,92 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 		return ret;
 	}
 
+	/*
+	 * Vendor gic_unmask_irq() runs pcie_intx_war() when the irq is
+	 * unmasked: clear any stale RC INTx latch from before request_irq.
+	 */
+	if (ipc->rc_app)
+		__raw_writel(WAVE600_RC_INTA, ipc->rc_app + WAVE600_RC_APP_IRNCR);
+
+	/*
+	 * INTx chain diagnostics + vendor-substantiated fixups.
+	 *
+	 * The endpoint-side interrupt sources and masks match the vendor
+	 * legacy mode exactly, so the missing link is somewhere in the
+	 * endpoint Assert_INTa -> RC latch -> GIC level chain. Capture:
+	 *  - the trigger type the kernel actually derived from DT,
+	 *  - the endpoint's interrupt pin/line and MSI capability state,
+	 *  - the root port's PCI_COMMAND INTx state.
+	 */
+	{
+		struct pci_dev *root = wdev->pdev->bus->self;
+		u16 msi_ctl = 0, root_cmd = 0;
+		int msi_pos = pci_find_capability(wdev->pdev, PCI_CAP_ID_MSI);
+		u8 pin = 0, line = 0;
+
+		pci_read_config_byte(wdev->pdev, PCI_INTERRUPT_PIN, &pin);
+		pci_read_config_byte(wdev->pdev, PCI_INTERRUPT_LINE, &line);
+		if (msi_pos > 0)
+			pci_read_config_word(wdev->pdev, msi_pos + 2, &msi_ctl);
+
+		dev_info(wdev->dev, "PCI cfg: IRQ %d trigger=0x%x, INT_PIN=%u INT_LINE=%u, MSI cap@0x%02x MsgCtl=0x%04x\n",
+			 wdev->pdev->irq, irq_get_trigger_type(wdev->pdev->irq),
+			 pin, line, msi_pos, msi_ctl);
+
+		/*
+		 * Vendor _mtlk_pcieg6_set_msi_intr_mode() legacy path clears the
+		 * MSI Enable bit in the endpoint's MSI capability: a function
+		 * with MSI enabled never sends Assert_INTx messages.
+		 */
+		if (msi_pos > 0 && (msi_ctl & PCI_MSI_FLAGS_ENABLE)) {
+			pci_write_config_word(wdev->pdev, msi_pos + 2,
+					      msi_ctl & ~PCI_MSI_FLAGS_ENABLE);
+			pci_read_config_word(wdev->pdev, msi_pos + 2, &msi_ctl);
+			dev_info(wdev->dev, "cleared endpoint MSI enable (MsgCtl now 0x%04x)\n",
+				 msi_ctl);
+		}
+
+		if (root) {
+			pci_read_config_word(root, PCI_COMMAND, &root_cmd);
+			dev_info(wdev->dev, "root port %04x:%02x:%02x.%u PCI_COMMAND=0x%04x (INTx %s)\n",
+				 root->vendor, root->bus->number,
+				 PCI_SLOT(root->devfn), PCI_FUNC(root->devfn),
+				 root_cmd,
+				 (root_cmd & PCI_COMMAND_INTX_DISABLE) ? "DISABLED" : "ENABLED");
+
+			/* Root port must forward decoded INTx to the host line */
+			if (root_cmd & PCI_COMMAND_INTX_DISABLE) {
+				pci_intx(root, 1);
+				pci_read_config_word(root, PCI_COMMAND, &root_cmd);
+				dev_info(wdev->dev, "re-enabled root port INTx (PCI_COMMAND now 0x%04x)\n",
+					 root_cmd);
+			}
+		}
+	}
+
 	/* Now that handler is registered, enable PCIe endpoint legacy INT generation */
 	wave600_write32(wdev, WAVE600_SOC_PCIE_LEGACY_INT_ENA, 0x1);
 	/* Clear again before unmasking */
 	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0x1);
 	mmiowb();
 
-	/* Unmask host interrupts in MAC (IPC / Control only) */
-	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_IPC);
+	/* Unmask host interrupts in MAC (vendor single-IRQ legacy mask MTLK_IRQ_ALL) */
+	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_ALL);
 	mmiowb();
 	(void)wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK);
 	ipc->irq_enabled = true;
 
-	dev_info(wdev->dev, "Mailbox IPC initialized on IRQ %d (host IRQ mask 0x%08lx)\n",
-		 wdev->pdev->irq, (unsigned long)WAVE600_IRQ_IPC);
+	dev_info(wdev->dev, "Mailbox IPC initialized on IRQ %d (host IRQ mask 0x%08x)\n",
+		 wdev->pdev->irq, (u32)WAVE600_IRQ_ALL);
 
 	/* Read back interrupt registers for verification */
-	dev_info(wdev->dev, "IRQ config: IRQ %d, MSI_ENA=0x%08x, LEGACY_ENA=0x%08x, HOST_IRQ_MASK=0x%08x\n",
+	dev_info(wdev->dev, "IRQ config: IRQ %d, MSI_ENA=0x%08x, LEGACY_ENA=0x%08x, HOST_IRQ_MASK=0x%08x, INTR_VEC=0x%08x, AMBA_ORDR_WDT_INT=0x%08x\n",
 		 wdev->pdev->irq,
 		 wave600_read32(wdev, WAVE600_SOC_PCIE_MSI_ENABLE),
 		 wave600_read32(wdev, WAVE600_SOC_PCIE_LEGACY_INT_ENA),
-		 wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK));
+		 wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK),
+		 wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC),
+		 wave600_read32(wdev, WAVE600_SOC_PCIE_AMBA_ORDR_WDT));
 
 	/*
 	 * Verification Command: Software Reset MAC (UM_MAN_SW_RESET_MAC_REQ)
@@ -367,13 +601,22 @@ void wave600_ipc_cleanup(struct wave600_dev *wdev)
 	unsigned long flags;
 	int i;
 
+	/* Stop accepting new interrupts before killing the tasklet */
+	ipc->irq_enabled = false;
+
 	/* Mask host interrupts and disable hardware interrupt generation */
 	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
 	wave600_write32(wdev, WAVE600_SOC_PCIE_LEGACY_INT_ENA, 0);
 	wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0xffffff);
 	mmiowb();
 
-	ipc->irq_enabled = false;
+	/* Drain any scheduled tasklet (it will not re-arm interrupts) */
+	tasklet_kill(&ipc->tasklet);
+
+	if (ipc->rc_app) {
+		iounmap(ipc->rc_app);
+		ipc->rc_app = NULL;
+	}
 
 	spin_lock_irqsave(&ipc->lock, flags);
 	for (i = 0; i < WAVE600_IPC_MAX_MAN_REQS; i++) {
