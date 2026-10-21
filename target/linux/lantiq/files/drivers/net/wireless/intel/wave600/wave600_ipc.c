@@ -193,14 +193,11 @@ irqreturn_t wave600_ipc_isr(int irq, void *dev_id)
 	 *    mask at 0 until processing completes (vendor isr_action_normal).
 	 */
 	/*
-	 * Vendor pcie_intx_war() (GIC driver, patch 3046): clear the GRX500
-	 * Root Complex INTx latch (PCIE_IRNCR, write-1-to-clear, INTA = bit 13)
-	 * at irq unmask and at the end of every dispatch. The RC asserts the
-	 * GIC line HIGH on Assert_INTA and only the IRNCR write releases it.
+	 * Note: the GRX500 RC INTx latch (PCIE_IRNCR) is serviced by the
+	 * pcie-xrx500 INTx irqchip (child EOI = vendor pcie_intx_war), so
+	 * this driver consumes interrupts purely through the standard
+	 * interrupt-map path and owns no Root Complex registers.
 	 */
-	if (ipc->rc_app)
-		__raw_writel(WAVE600_RC_INTA, ipc->rc_app + WAVE600_RC_APP_IRNCR);
-
 	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
 	(void)wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK);
 
@@ -219,19 +216,7 @@ irqreturn_t wave600_ipc_isr(int irq, void *dev_id)
 	ipc->isr_total++;
 
 	if (!(status & WAVE600_IRQ_ALL)) {
-		u32 irnen = 0, irncr = 0, irnicr = 0;
-
 		ipc->isr_spurious++;
-
-		if (ipc->rc_app) {
-			/*
-			 * RC-side diagnostics: read the GRX500 Root Complex
-			 * interrupt node state for this root port.
-			 */
-			irnicr = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNICR);
-			irncr = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNCR);
-			irnen = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNEN);
-		}
 
 		/*
 		 * Diagnostic: an assert source invisible in HOST_IRQ_STATUS
@@ -254,9 +239,8 @@ irqreturn_t wave600_ipc_isr(int irq, void *dev_id)
 			u32 wdt = wave600_read32(wdev, WAVE600_SOC_PCIE_AMBA_ORDR_WDT);
 
 			dev_err(wdev->dev,
-				"unhandled INTx #%u: HOST_IRQ_STATUS=0x%08x, PCIE_INTR_VEC=0x%08x, AMBA_ORDR_WDT_INT=0x%08x, RC%u: IRNEN=0x%08x IRNCR=0x%08x IRNICR=0x%08x\n",
-				ipc->isr_spurious, status, vec, wdt,
-				ipc->rc_port, irnen, irncr, irnicr);
+				"unhandled INTx #%u: HOST_IRQ_STATUS=0x%08x, PCIE_INTR_VEC=0x%08x, AMBA_ORDR_WDT_INT=0x%08x\n",
+				ipc->isr_spurious, status, vec, wdt);
 		}
 
 		wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_ALL);
@@ -348,17 +332,9 @@ int wave600_ipc_cmd(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
 		u32 irq_stat = wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_STATUS);
 		u32 irq_vec = wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC);
 		u32 wdt_stat = wave600_read32(wdev, WAVE600_SOC_PCIE_AMBA_ORDR_WDT);
-		u32 irnen = 0, irncr = 0, irnicr = 0;
 
-		if (ipc->rc_app) {
-			irnen = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNEN);
-			irncr = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNCR);
-			irnicr = __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNICR);
-		}
-
-		dev_err(wdev->dev, "IPC cmd 0x%04x timed out after %lu ms (slot %u, IRQ_STATUS=0x%08x, INTR_VEC=0x%08x, AMBA_ORDR_WDT_INT=0x%08x, RC%u: IRNEN=0x%08x IRNCR=0x%08x IRNICR=0x%08x)\n",
-			req_id, timeout_ms, slot, irq_stat, irq_vec, wdt_stat,
-			ipc->rc_port, irnen, irncr, irnicr);
+		dev_err(wdev->dev, "IPC cmd 0x%04x timed out after %lu ms (slot %u, IRQ_STATUS=0x%08x, INTR_VEC=0x%08x, AMBA_ORDR_WDT_INT=0x%08x)\n",
+			req_id, timeout_ms, slot, irq_stat, irq_vec, wdt_stat);
 		ret = -ETIMEDOUT;
 	} else {
 		ret = cmd->status;
@@ -430,47 +406,6 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 		 ipc->man_req_offset, ipc->man_req_num, ipc->man_req_slot_size,
 		 ipc->man_ind_offset, ipc->man_ind_num, ipc->man_ind_slot_size);
 
-	/*
-	 * INTx storm diagnostics: map the GRX500 Root Complex app register
-	 * block of the root port serving this endpoint (bus 1 -> RC port 0,
-	 * bus 3 -> RC port 1, per grx500.dtsi ssx@18000000 "app" regions) and
-	 * dump the RC interrupt node state BEFORE any endpoint interrupt
-	 * register is touched. If the INTA latch (PCIE_IRNCR) or live node
-	 * status (PCIE_IRNICR) is already set here, the line was asserted
-	 * before this driver enabled anything in the endpoint.
-	 */
-	{
-		phys_addr_t app_base = 0;
-
-		switch (wdev->pdev->bus->number) {
-		case 1:
-			ipc->rc_port = 0;
-			app_base = WAVE600_RC_APP_PORT0_BASE;
-			break;
-		case 3:
-			ipc->rc_port = 1;
-			app_base = WAVE600_RC_APP_PORT1_BASE;
-			break;
-		default:
-			dev_info(wdev->dev, "PCI bus %u: RC app mapping skipped\n",
-				 wdev->pdev->bus->number);
-			break;
-		}
-		if (app_base) {
-			ipc->rc_app = ioremap(app_base, 0x1000);
-			if (ipc->rc_app) {
-				dev_info(wdev->dev, "RC port %u app regs at %pa: IRNEN=0x%08x, IRNCR=0x%08x, IRNICR=0x%08x\n",
-					 ipc->rc_port, &app_base,
-					 __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNEN),
-					 __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNCR),
-					 __raw_readl(ipc->rc_app + WAVE600_RC_APP_IRNICR));
-			} else {
-				dev_warn(wdev->dev, "failed to map RC port %u app regs\n",
-					 ipc->rc_port);
-			}
-		}
-	}
-
 	/* Ensure host interrupts are masked in MAC and hardware legacy INT generation disabled */
 	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
 	wave600_write32(wdev, WAVE600_SOC_PCIE_MSI_ENABLE, 0);
@@ -488,21 +423,12 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 	}
 
 	/*
-	 * Vendor gic_unmask_irq() runs pcie_intx_war() when the irq is
-	 * unmasked: clear any stale RC INTx latch from before request_irq.
-	 */
-	if (ipc->rc_app)
-		__raw_writel(WAVE600_RC_INTA, ipc->rc_app + WAVE600_RC_APP_IRNCR);
-
-	/*
 	 * INTx chain diagnostics + vendor-substantiated fixups.
 	 *
-	 * The endpoint-side interrupt sources and masks match the vendor
-	 * legacy mode exactly, so the missing link is somewhere in the
-	 * endpoint Assert_INTa -> RC latch -> GIC level chain. Capture:
-	 *  - the trigger type the kernel actually derived from DT,
-	 *  - the endpoint's interrupt pin/line and MSI capability state,
-	 *  - the root port's PCI_COMMAND INTx state.
+	 * The GRX500 RC INTx latch (PCIE_IRNCR) is serviced by the
+	 * pcie-xrx500 INTx irqchip, so no Root Complex handling is needed
+	 * here. Capture the endpoint's interrupt pin/line and MSI capability
+	 * state plus the root port's PCI_COMMAND INTx state.
 	 */
 	{
 		struct pci_dev *root = wdev->pdev->bus->self;
@@ -515,9 +441,8 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 		if (msi_pos > 0)
 			pci_read_config_word(wdev->pdev, msi_pos + 2, &msi_ctl);
 
-		dev_info(wdev->dev, "PCI cfg: IRQ %d trigger=0x%x, INT_PIN=%u INT_LINE=%u, MSI cap@0x%02x MsgCtl=0x%04x\n",
-			 wdev->pdev->irq, irq_get_trigger_type(wdev->pdev->irq),
-			 pin, line, msi_pos, msi_ctl);
+		dev_info(wdev->dev, "PCI cfg: IRQ %d, INT_PIN=%u INT_LINE=%u, MSI cap@0x%02x MsgCtl=0x%04x\n",
+			 wdev->pdev->irq, pin, line, msi_pos, msi_ctl);
 
 		/*
 		 * Vendor _mtlk_pcieg6_set_msi_intr_mode() legacy path clears the
@@ -612,11 +537,6 @@ void wave600_ipc_cleanup(struct wave600_dev *wdev)
 
 	/* Drain any scheduled tasklet (it will not re-arm interrupts) */
 	tasklet_kill(&ipc->tasklet);
-
-	if (ipc->rc_app) {
-		iounmap(ipc->rc_app);
-		ipc->rc_app = NULL;
-	}
 
 	spin_lock_irqsave(&ipc->lock, flags);
 	for (i = 0; i < WAVE600_IPC_MAX_MAN_REQS; i++) {

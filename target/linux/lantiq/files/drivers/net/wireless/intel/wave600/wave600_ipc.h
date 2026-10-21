@@ -203,13 +203,6 @@ struct wave600_ipc {
 	/* Deferred interrupt processing (vendor mtlk_hw_mmb_deferred_handler) */
 	struct tasklet_struct tasklet;
 
-	/*
-	 * GRX500 Root Complex app register block of the root port serving
-	 * this endpoint (INTx storm diagnostics / RC-side latch clear).
-	 */
-	void __iomem *rc_app;
-	u32 rc_port;
-
 	/* ISR / tasklet statistics (diagnostics for IRQ storm triage) */
 	u32 isr_total;
 	u32 isr_spurious;
