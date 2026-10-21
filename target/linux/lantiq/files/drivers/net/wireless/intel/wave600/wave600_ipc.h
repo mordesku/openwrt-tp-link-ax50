@@ -67,9 +67,19 @@ struct wave600_dev;
 #define WAVE600_IRQ_CONTROL   BIT(5) /* rabPhiInterrupt */
 #define WAVE600_IRQ_DMA_ERR   BIT(6)
 
-#define WAVE600_IRQ_IPC       WAVE600_IRQ_CONTROL /* Active interrupt source for Mailbox IPC */
+/* Single-IRQ legacy mode mask, matching vendor MTLK_IRQ_ALL (hw_mmb.c ihd_1) */
 #define WAVE600_IRQ_ALL       (WAVE600_IRQ_CONTROL | WAVE600_IRQ_BSS_IND | WAVE600_IRQ_BSS_CFM | \
 			       WAVE600_IRQ_RX | WAVE600_IRQ_TXOUT) /* 0x2F matching vendor MTLK_IRQ_ALL */
+
+/*
+ * Storm guard: number of consecutive tasklet runs that consumed no message
+ * before the driver gives up and leaves HOST_IRQ_MASK = 0 (system survives,
+ * register snapshot is logged once). Inverse of vendor MTCFG_LEGACY_INT_RECOVERY_MON.
+ */
+#define WAVE600_IPC_STORM_LIMIT 1000
+
+/* Bounce buffer for the MAN_IND slot IOM write-back (vendor _mtlk_mmb_resp_cm_ind) */
+#define WAVE600_IPC_MAX_IND_BOUNCE 256
 
 /*
  * HIM 32-bit descriptor encoding in sFifoQ
@@ -189,6 +199,24 @@ struct wave600_ipc {
 
 	/* Pending commands */
 	struct wave600_ipc_cmd cmds[WAVE600_IPC_MAX_MAN_REQS];
+
+	/* Deferred interrupt processing (vendor mtlk_hw_mmb_deferred_handler) */
+	struct tasklet_struct tasklet;
+
+	/*
+	 * GRX500 Root Complex app register block of the root port serving
+	 * this endpoint (INTx storm diagnostics / RC-side latch clear).
+	 */
+	void __iomem *rc_app;
+	u32 rc_port;
+
+	/* ISR / tasklet statistics (diagnostics for IRQ storm triage) */
+	u32 isr_total;
+	u32 isr_spurious;
+	u32 cfm_count;
+	u32 ind_count;
+	u32 empty_runs;
+	bool storm_latched;
 
 	bool irq_enabled;
 };

@@ -80,7 +80,14 @@ static int wave600_pci_probe(struct pci_dev *pdev, const struct pci_device_id *i
 	 * In accordance with vendor driver CID-01, skip AUX device in non-dual-PCI mode.
 	 */
 	if (wdev->chip_id == 0xffff || wdev->chip_id == 0) {
-		dev_info(&pdev->dev, "ignoring WAV654 PCI AUX endpoint (non-dual-PCI mode)\n");
+		/*
+		 * The ignored endpoint keeps INTx generation enabled from
+		 * pci_intx(pdev, 1) above; an uninitialized WAV654 asserting
+		 * INTA# would hold its GIC level line down forever. Disable
+		 * INTx generation in PCI config space before bailing out.
+		 */
+		pci_intx(pdev, 0);
+		dev_info(&pdev->dev, "ignoring WAV654 PCI AUX endpoint (INTx generation disabled)\n");
 		return -ENODEV;
 	}
 
