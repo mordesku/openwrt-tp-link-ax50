@@ -107,19 +107,41 @@
 			 *
 			 * PCIe legacy INTx GIC inputs are ACTIVE-HIGH level
 			 * (vendor GIC driver fixed polarity table:
-			 * GIC_POL_POS | GIC_TRIG_LEVEL for "pcie legacy").
-			 * The RC asserts the GIC line HIGH on Assert_INTA and
-			 * the IRNCR latch (RC app +0xF8, W1C) must be cleared
-			 * per event (vendor pcie_intx_war).
+			 * GIC_POL_POS | GIC_TRIG_LEVEL for "pcie legacy"), the
+			 * msi inputs are positive edge. The RC asserts the
+			 * per-pin GIC line HIGH on Assert_INTx and latches it in
+			 * PCIE_IRNCR (RC app +0xF8, W1C).
+			 *
+			 * The port itself is the INTx interrupt controller: the
+			 * "inta".."intd" entries below are the per-pin GIC parent
+			 * lines; the pcie-xrx500 driver demuxes them through its
+			 * INTx irqchip, which owns the IRNEN gating and the
+			 * per-event IRNCR latch clear (vendor pcie_intx_war).
 			 */
-			interrupts = <128 129 130 131 132 133 134 135 152>;
-			interrupt-names = "msi0", "msi1", "msi2", "msi3", "msi4", "msi5", "msi6", "msi7", "ir";
+			interrupt-controller;
+			interrupts = <GIC_SHARED 128 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 129 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 130 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 131 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 132 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 133 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 134 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 135 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 152 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 136 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 137 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 138 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 139 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "msi0", "msi1", "msi2", "msi3",
+					  "msi4", "msi5", "msi6", "msi7",
+					  "ir", "inta", "intb", "intc", "intd";
 			#interrupt-cells = <1>;
 			interrupt-map-mask = <0 0 0 0x7>;
-			interrupt-map = <0 0 0 1 &gic GIC_SHARED 136 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 2 &gic GIC_SHARED 137 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 3 &gic GIC_SHARED 138 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 4 &gic GIC_SHARED 139 IRQ_TYPE_LEVEL_HIGH>;
+			/* INTx pins of downstream devices map to this controller */
+			interrupt-map = <0 0 0 1 &pcie0 0>,
+					<0 0 0 2 &pcie0 1>,
+					<0 0 0 3 &pcie0 2>,
+					<0 0 0 4 &pcie0 3>;
 			ranges = <0x02000000 0 0xa0000000 0xa0000000 0 0x03000000
 				  0x01000000 0 0xa3800000 0xa3800000 0 0x00100000>;
 			resets = <&rcu0 12>;
@@ -145,16 +167,31 @@
 			>;
 			reg-names = "csr", "cfg", "app", "phy", "msi", "pic";
 			interrupt-parent = <&gic>;
-			/* Physical GIC inputs (vendor DT cell minus 8, see pcie0 note) */
-			interrupts = <37 38 39 40 41 42 43 44 49>;
-			interrupt-names = "msi0", "msi1", "msi2", "msi3", "msi4", "msi5", "msi6", "msi7", "ir";
+			/* Physical GIC inputs (vendor DT cell minus 8, see pcie0 note);
+			 * INTx demuxed by the pcie-xrx500 INTx irqchip (see pcie0 note) */
+			interrupt-controller;
+			interrupts = <GIC_SHARED 37 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 38 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 39 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 40 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 41 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 42 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 43 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 44 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 49 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 9 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 10 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 11 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 12 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "msi0", "msi1", "msi2", "msi3",
+					  "msi4", "msi5", "msi6", "msi7",
+					  "ir", "inta", "intb", "intc", "intd";
 			#interrupt-cells = <1>;
 			interrupt-map-mask = <0 0 0 0x7>;
-			/* PCIe legacy INTx: ACTIVE-HIGH level, physical inputs (see pcie0 note) */
-			interrupt-map = <0 0 0 1 &gic GIC_SHARED 9 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 2 &gic GIC_SHARED 10 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 3 &gic GIC_SHARED 11 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 4 &gic GIC_SHARED 12 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-map = <0 0 0 1 &pcie1 0>,
+					<0 0 0 2 &pcie1 1>,
+					<0 0 0 3 &pcie1 2>,
+					<0 0 0 4 &pcie1 3>;
 			ranges = <0x02000000 0 0x9c000000 0x9c000000 0 0x03000000
 				  0x01000000 0 0x9f800000 0x9f800000 0 0x00100000>;
 			resets = <&rcu0 13>;
@@ -180,16 +217,31 @@
 			>;
 			reg-names = "csr", "cfg", "app", "phy", "msi", "pic";
 			interrupt-parent = <&gic>;
-			/* Physical GIC inputs (vendor DT cell minus 8, see pcie0 note) */
-			interrupts = <24 25 26 27 28 29 30 31 55>;
-			interrupt-names = "msi0", "msi1", "msi2", "msi3", "msi4", "msi5", "msi6", "msi7", "ir";
+			/* Physical GIC inputs (vendor DT cell minus 8, see pcie0 note);
+			 * INTx demuxed by the pcie-xrx500 INTx irqchip (see pcie0 note) */
+			interrupt-controller;
+			interrupts = <GIC_SHARED 24 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 25 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 26 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 27 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 28 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 29 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 30 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 31 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SHARED 55 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 155 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 156 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 157 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SHARED 158 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "msi0", "msi1", "msi2", "msi3",
+					  "msi4", "msi5", "msi6", "msi7",
+					  "ir", "inta", "intb", "intc", "intd";
 			#interrupt-cells = <1>;
 			interrupt-map-mask = <0 0 0 0x7>;
-			/* PCIe legacy INTx: ACTIVE-HIGH level, physical inputs (see pcie0 note) */
-			interrupt-map = <0 0 0 1 &gic GIC_SHARED 155 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 2 &gic GIC_SHARED 156 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 3 &gic GIC_SHARED 157 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 4 &gic GIC_SHARED 158 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-map = <0 0 0 1 &pcie2 0>,
+					<0 0 0 2 &pcie2 1>,
+					<0 0 0 3 &pcie2 2>,
+					<0 0 0 4 &pcie2 3>;
 			ranges = <0x02000000 0 0xa4000000 0xa4000000 0 0x03000000
 				  0x01000000 0 0xa7800000 0xa7800000 0 0x00100000>;
 			resets = <&rcu0 10>;

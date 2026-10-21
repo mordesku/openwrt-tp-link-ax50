@@ -12,6 +12,9 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/delay.h>
+#include <linux/interrupt.h>
+#include <linux/irqdomain.h>
+#include <linux/irqchip/chained_irq.h>
 #include <linux/pci.h>
 #include <linux/pci_regs.h>
 #include <linux/module.h>
@@ -47,6 +50,10 @@
 
 #define PCIE_IRNEN				0x00F4
 #define PCIE_IRNCR				0x00F8
+#define PCIE_IRNICR				0x00FC
+
+/* INTA..INTD occupy interrupt node bits 13..16 in the RC app registers */
+#define PCIE_INTX_BIT(_x)			BIT(13 + (_x))
 
 /* PHY Register Offsets (DesignWare 2.0 PDI) */
 #define PCIE_PHY_CFG0				0xC004
@@ -219,6 +226,17 @@
 
 #define PCIE_MAX_PAYLOAD_128			0
 
+struct grx500_pcie_port;
+
+/*
+ * One GIC parent line per INTx pin: the GRX500 routes each decoded
+ * INTA..INTD assert to its own physical GIC shared input.
+ */
+struct grx500_intx_parent {
+	struct grx500_pcie_port *lpp;
+	unsigned int hwirq;
+};
+
 struct grx500_pcie_port {
 	int id;
 	struct device *dev;
@@ -246,6 +264,9 @@ struct grx500_pcie_port {
 
 	bool link_up;
 	spinlock_t lock;
+
+	struct irq_domain *intx_domain;
+	struct grx500_intx_parent intx_parent[PCI_NUM_INTX];
 };
 
 static bool lcpll_ssc_initialized;
@@ -857,6 +878,120 @@ static void grx500_pcie_rc_class_early_fixup(struct pci_dev *dev)
 DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INFINEON, PCI_ANY_ID, grx500_pcie_rc_class_early_fixup);
 DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_LANTIQ, PCI_ANY_ID, grx500_pcie_rc_class_early_fixup);
 
+/*
+ * INTx interrupt demuxing for this Root Complex.
+ *
+ * Hardware semantics (from the vendor 3.10 GRX500 stack):
+ * - A downstream Assert_INTx is latched in PCIE_IRNCR (write-1-to-clear)
+ *   and raises the corresponding physical GIC shared input (active-HIGH
+ *   level per the vendor GIC polarity table).
+ * - PCIE_IRNEN gates the interrupt node bits (INTA..INTD = bits 13..16).
+ * - The latch must be cleared per event: the vendor runs pcie_intx_war()
+ *   on GIC unmask and on the finish of every dispatch. Here the clear is
+ *   the child EOI, and the stale-latch clear + IRNEN enable live in the
+ *   child unmask (the vendor ltq_pcie_bios_map_irq() pattern).
+ * - Each INTx pin has its own GIC parent line, so every parent dispatches
+ *   exactly one child of the per-port INTx domain.
+ */
+static void grx500_intx_irq_mask(struct irq_data *d)
+{
+	struct grx500_pcie_port *lpp = irq_data_get_irq_chip_data(d);
+
+	ltq_w32_mask(PCIE_INTX_BIT(d->hwirq), 0, lpp->app_base + PCIE_IRNEN);
+}
+
+static void grx500_intx_irq_unmask(struct irq_data *d)
+{
+	struct grx500_pcie_port *lpp = irq_data_get_irq_chip_data(d);
+
+	/* Clear a stale latch before (re)enabling the line (vendor map_irq) */
+	ltq_w32_mask(0, PCIE_INTX_BIT(d->hwirq), lpp->app_base + PCIE_IRNCR);
+	ltq_w32_mask(0, PCIE_INTX_BIT(d->hwirq), lpp->app_base + PCIE_IRNEN);
+}
+
+static void grx500_intx_irq_eoi(struct irq_data *d)
+{
+	struct grx500_pcie_port *lpp = irq_data_get_irq_chip_data(d);
+
+	/* Vendor pcie_intx_war() at GIC finish: release the latched line */
+	ltq_w32_mask(0, PCIE_INTX_BIT(d->hwirq), lpp->app_base + PCIE_IRNCR);
+}
+
+static struct irq_chip grx500_intx_irq_chip = {
+	.name = "GRX500-INTx",
+	.irq_mask = grx500_intx_irq_mask,
+	.irq_unmask = grx500_intx_irq_unmask,
+	.irq_eoi = grx500_intx_irq_eoi,
+};
+
+static int grx500_intx_domain_map(struct irq_domain *domain, unsigned int virq,
+				  irq_hw_number_t hwirq)
+{
+	irq_set_chip_data(virq, domain->host_data);
+	irq_set_chip_and_handler_name(virq, &grx500_intx_irq_chip,
+				      handle_fasteoi_irq, "INTx");
+	return 0;
+}
+
+static const struct irq_domain_ops grx500_intx_domain_ops = {
+	.map = grx500_intx_domain_map,
+	.xlate = irq_domain_xlate_onecell,
+};
+
+static void grx500_intx_parent_handler(struct irq_desc *desc)
+{
+	struct grx500_intx_parent *parent = irq_desc_get_handler_data(desc);
+	struct irq_chip *chip = irq_desc_get_chip(desc);
+
+	chained_irq_enter(chip, desc);
+	generic_handle_domain_irq(parent->lpp->intx_domain, parent->hwirq);
+	chained_irq_exit(chip, desc);
+}
+
+static int grx500_pcie_init_intx(struct platform_device *pdev,
+				 struct grx500_pcie_port *lpp)
+{
+	static const char * const intx_names[PCI_NUM_INTX] = {
+		"inta", "intb", "intc", "intd"
+	};
+	struct device_node *np = pdev->dev.of_node;
+	struct device *dev = &pdev->dev;
+	int i;
+
+	if (!of_property_read_bool(np, "interrupt-controller"))
+		return 0;
+
+	/* Deterministic start: gate all INTx nodes, clear stale latches */
+	ltq_w32(0, lpp->app_base + PCIE_IRNEN);
+	ltq_w32(0xF << 13, lpp->app_base + PCIE_IRNCR);
+
+	lpp->intx_domain = irq_domain_add_linear(np, PCI_NUM_INTX,
+						 &grx500_intx_domain_ops, lpp);
+	if (!lpp->intx_domain) {
+		dev_err(dev, "failed to add INTx IRQ domain\n");
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < PCI_NUM_INTX; i++) {
+		int irq = of_irq_get_byname(np, intx_names[i]);
+
+		if (irq < 0) {
+			dev_warn(dev, "INTx line %s unavailable (%d)\n",
+				 intx_names[i], irq);
+			continue;
+		}
+
+		lpp->intx_parent[i].lpp = lpp;
+		lpp->intx_parent[i].hwirq = i;
+		irq_set_chained_handler_and_data(irq, grx500_intx_parent_handler,
+						 &lpp->intx_parent[i]);
+		dev_info(dev, "INTx line %s chained on parent IRQ %d\n",
+			 intx_names[i], irq);
+	}
+
+	return 0;
+}
+
 static int grx500_pcie_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -973,11 +1108,15 @@ static int grx500_pcie_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	/* Unmask INTx legacy interrupts (INTA..INTD: bits 13..16) in Root Complex app registers */
-	ltq_w32(0xF << 13, lpp->app_base + PCIE_IRNCR);
-	ltq_w32(0xF << 13, lpp->app_base + PCIE_IRNEN);
-	dev_info(dev, "port %d: unmasked INTx in PCIE_IRNEN (0x%08x)\n",
-		 lpp->id, ltq_r32(lpp->app_base + PCIE_IRNEN));
+	/*
+	 * INTx irqchip: register the per-port INTx domain and chain the four
+	 * GIC parent lines before the PCI enumeration assigns device IRQs.
+	 */
+	ret = grx500_pcie_init_intx(pdev, lpp);
+	if (ret) {
+		dev_err(dev, "failed to init INTx irqchip: %d\n", ret);
+		return ret;
+	}
 
 	register_pci_controller(&lpp->pcic);
 
