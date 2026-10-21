@@ -92,14 +92,34 @@
 			>;
 			reg-names = "csr", "cfg", "app", "phy", "msi", "pic";
 			interrupt-parent = <&gic>;
-			interrupts = <136 137 138 139 140 141 142 143 160>;
+			/*
+			 * GIC numbering note: the vendor 3.10 DT uses cells that
+			 * are offset by +8 from the physical GIC shared input
+			 * (vendor xrx500.dtsi pcie0: msi0-7=<136..143> ir=<160>
+			 * INTA..INTD=<144..147>; vendor GIC driver operates the
+			 * physical inputs msi=128..135, ir=152, legacy=136..139
+			 * per its polarity table and pcie_intx_war()). Linux 6.12
+			 * MIPS GIC xlate uses the DT cell as the physical input
+			 * directly, so all pcie numbers below are the physical
+			 * ones (vendor cell minus 8). The rest of this dtsi
+			 * (gpio 172/173, gptc, asc) already uses physical
+			 * numbering.
+			 *
+			 * PCIe legacy INTx GIC inputs are ACTIVE-HIGH level
+			 * (vendor GIC driver fixed polarity table:
+			 * GIC_POL_POS | GIC_TRIG_LEVEL for "pcie legacy").
+			 * The RC asserts the GIC line HIGH on Assert_INTA and
+			 * the IRNCR latch (RC app +0xF8, W1C) must be cleared
+			 * per event (vendor pcie_intx_war).
+			 */
+			interrupts = <128 129 130 131 132 133 134 135 152>;
 			interrupt-names = "msi0", "msi1", "msi2", "msi3", "msi4", "msi5", "msi6", "msi7", "ir";
 			#interrupt-cells = <1>;
 			interrupt-map-mask = <0 0 0 0x7>;
-			interrupt-map = <0 0 0 1 &gic GIC_SHARED 144 IRQ_TYPE_LEVEL_LOW>,
-					<0 0 0 2 &gic GIC_SHARED 145 IRQ_TYPE_LEVEL_LOW>,
-					<0 0 0 3 &gic GIC_SHARED 146 IRQ_TYPE_LEVEL_LOW>,
-					<0 0 0 4 &gic GIC_SHARED 147 IRQ_TYPE_LEVEL_LOW>;
+			interrupt-map = <0 0 0 1 &gic GIC_SHARED 136 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 2 &gic GIC_SHARED 137 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 3 &gic GIC_SHARED 138 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 4 &gic GIC_SHARED 139 IRQ_TYPE_LEVEL_HIGH>;
 			ranges = <0x02000000 0 0xa0000000 0xa0000000 0 0x03000000
 				  0x01000000 0 0xa3800000 0xa3800000 0 0x00100000>;
 			resets = <&rcu0 12>;
@@ -125,14 +145,16 @@
 			>;
 			reg-names = "csr", "cfg", "app", "phy", "msi", "pic";
 			interrupt-parent = <&gic>;
-			interrupts = <45 46 47 48 49 50 51 52 57>;
+			/* Physical GIC inputs (vendor DT cell minus 8, see pcie0 note) */
+			interrupts = <37 38 39 40 41 42 43 44 49>;
 			interrupt-names = "msi0", "msi1", "msi2", "msi3", "msi4", "msi5", "msi6", "msi7", "ir";
 			#interrupt-cells = <1>;
 			interrupt-map-mask = <0 0 0 0x7>;
-			interrupt-map = <0 0 0 1 &gic GIC_SHARED 17 IRQ_TYPE_LEVEL_LOW>,
-					<0 0 0 2 &gic GIC_SHARED 18 IRQ_TYPE_LEVEL_LOW>,
-					<0 0 0 3 &gic GIC_SHARED 19 IRQ_TYPE_LEVEL_LOW>,
-					<0 0 0 4 &gic GIC_SHARED 20 IRQ_TYPE_LEVEL_LOW>;
+			/* PCIe legacy INTx: ACTIVE-HIGH level, physical inputs (see pcie0 note) */
+			interrupt-map = <0 0 0 1 &gic GIC_SHARED 9 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 2 &gic GIC_SHARED 10 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 3 &gic GIC_SHARED 11 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 4 &gic GIC_SHARED 12 IRQ_TYPE_LEVEL_HIGH>;
 			ranges = <0x02000000 0 0x9c000000 0x9c000000 0 0x03000000
 				  0x01000000 0 0x9f800000 0x9f800000 0 0x00100000>;
 			resets = <&rcu0 13>;
@@ -158,14 +180,16 @@
 			>;
 			reg-names = "csr", "cfg", "app", "phy", "msi", "pic";
 			interrupt-parent = <&gic>;
-			interrupts = <32 33 34 35 36 37 38 39 63>;
+			/* Physical GIC inputs (vendor DT cell minus 8, see pcie0 note) */
+			interrupts = <24 25 26 27 28 29 30 31 55>;
 			interrupt-names = "msi0", "msi1", "msi2", "msi3", "msi4", "msi5", "msi6", "msi7", "ir";
 			#interrupt-cells = <1>;
 			interrupt-map-mask = <0 0 0 0x7>;
-			interrupt-map = <0 0 0 1 &gic GIC_SHARED 163 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 2 &gic GIC_SHARED 164 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 3 &gic GIC_SHARED 165 IRQ_TYPE_LEVEL_HIGH>,
-					<0 0 0 4 &gic GIC_SHARED 166 IRQ_TYPE_LEVEL_HIGH>;
+			/* PCIe legacy INTx: ACTIVE-HIGH level, physical inputs (see pcie0 note) */
+			interrupt-map = <0 0 0 1 &gic GIC_SHARED 155 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 2 &gic GIC_SHARED 156 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 3 &gic GIC_SHARED 157 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 4 &gic GIC_SHARED 158 IRQ_TYPE_LEVEL_HIGH>;
 			ranges = <0x02000000 0 0xa4000000 0xa4000000 0 0x03000000
 				  0x01000000 0 0xa7800000 0xa7800000 0 0x00100000>;
 			resets = <&rcu0 10>;
