@@ -87,21 +87,11 @@
 #define WAVE600_SOC_PCIE_AMBA_ORDR_WDT  (WAVE600_SOC_REGS_BASE + 0x6C)
 
 /*
- * GRX500 PCIe Root Complex app registers (lantiq,pcie-xrx500).
- * Used for INTx storm diagnostics / RC-side latch handling from this driver.
- * Physical app bases come from grx500.dtsi ssx@18000000 reg "app":
- *   RC port 0 (bus 01): 0x18800000, RC port 1 (bus 03): 0x18300000.
- * Register semantics per vendor ltq_pcie (patch 3030):
- *   IRNEN  (app+0xF4): interrupt node enable, INTA..INTD = bits 13..16
- *   IRNCR  (app+0xF8): interrupt node clear, write-1-to-clear latch
- *   IRNICR (app+0xFC): interrupt node live status
+ * Note: the GRX500 Root Complex INTx registers (IRNEN/IRNCR/IRNICR at the
+ * RC app block) are owned and serviced by the pcie-xrx500 INTx irqchip;
+ * this driver consumes interrupts purely through the standard
+ * interrupt-map path.
  */
-#define WAVE600_RC_APP_PORT0_BASE     0x18800000
-#define WAVE600_RC_APP_PORT1_BASE     0x18300000
-#define WAVE600_RC_APP_IRNEN          0xF4
-#define WAVE600_RC_APP_IRNCR          0xF8
-#define WAVE600_RC_APP_IRNICR         0xFC
-#define WAVE600_RC_INTA               BIT(13)
 #define WAVE600_SOC_EFUSE_DATA          (WAVE600_SOC_REGS_BASE + 0x70)
 #define WAVE600_SOC_EFUSE_ADDRESS       (WAVE600_SOC_REGS_BASE + 0x74)
 #define WAVE600_SOC_EFUSE_CONTROL       (WAVE600_SOC_REGS_BASE + 0x78)
