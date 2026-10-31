@@ -136,14 +136,15 @@ struct wave600_umi_logger_set_severity {
 #define WAVE600_MC_MAN_MAC_EVENT_IND         WAVE600_UMI_MSG(WAVE600_MSG_IND, WAVE600_MSG_TYPE_MAN_IND, 0x38) /* 0x3338 */
 
 /*
- * UMI_MAC_EVENT_t (vendor mhi_mac_event.h:158-174): sent by firmware on
- * MC_MAN_MAC_EVENT_IND (0x3338) when a CPU exception or MTLK_ASSERT occurs.
+ * MAC_EVENT / APP_FATAL (vendor mhi_mac_event.h:163-174 and 236-256): sent
+ * by firmware on MC_MAN_MAC_EVENT_IND (0x3338) when an assert or CPU exception occurs.
  * All 32-bit fields are MAC-endian (LE) inside the UMI payload.
  */
 struct wave600_umi_mac_event {
 	__le32 event_id;
-	__le32 core_num;
 	__le32 timestamp;
+	__le32 core_num;
+	__le32 fatal_timestamp;
 	__le32 cause_or_line;
 	__le32 status_reg;
 	__le32 epc_reg;
