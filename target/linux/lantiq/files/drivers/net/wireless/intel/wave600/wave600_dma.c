@@ -283,7 +283,7 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 			goto skip;
 		}
 
-		dma_unmap_single(wdev->dev, buf->dma, total, DMA_FROM_DEVICE);
+		dma_unmap_single(wdev->dev, buf->dma, buf->size, DMA_FROM_DEVICE);
 
 		skb = buf->skb;
 		skb_put(skb, total);
@@ -588,18 +588,28 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	dma->tx_in_use++;
 	spin_unlock_irqrestore(&dma->tx_lock, flags);
 
+	u8 ep = (wdev->radio_idx ^ 1) & 1;
+	u32 info0;
+
 	memset(&hd, 0, sizeof(hd));
 	/*
 	 * Vendor _mtlk_hw_send_data + _mtlk_mmb_put_hd_to_ring (hw_mmb.c:8346-8437):
-	 *  - In DB_2x2 mode, radio_id 0 maps to ep_bit = 1 (hybrid log:
-	 *    "radio_id: 0 vap_id: 0 --> ep_bit: 1, vap_id_fw 16"),
+	 *  - In DB_2x2 mode, radio_id 0 maps to ep_bit = 1,
+	 *  - VAPID in info0 is local VAP index (0) (hw_mmb.c:8408),
 	 *  - All 5 HOST_DSC words are converted with cpu_to_le32() on write.
 	 */
-	hd.info0 = cpu_to_le32(FIELD_PREP(W600_TX_VAPID, 0) |
-			       FIELD_PREP(W600_TX_FRAMETYPE, W600_FRAME_TYPE_ETHERNET) |
-			       W600_TX_UNKNOWN_SID);	/* no station DB yet */
+	info0 = FIELD_PREP(W600_TX_VAPID, 0) |
+		FIELD_PREP(W600_TX_FRAMETYPE, W600_FRAME_TYPE_ETHERNET);
+	if (is_multicast_ether_addr(skb->data)) {
+		info0 |= W600_TX_MCF;
+	} else if (wdev->sta_connected && ether_addr_equal(skb->data, wdev->sta_mac)) {
+		info0 |= FIELD_PREP(W600_TX_STAID, wdev->sta_sid ? wdev->sta_sid : 1);
+	} else {
+		info0 |= W600_TX_UNKNOWN_SID;
+	}
+	hd.info0 = cpu_to_le32(info0);
 	hd.info1 = cpu_to_le32(FIELD_PREP(W600_TX_CLASS, skb->priority & 7) |
-			       FIELD_PREP(W600_TX_EP, (wdev->radio_idx ^ 1) & 1));
+			       FIELD_PREP(W600_TX_EP, ep));
 	hd.payload_addr = cpu_to_le32((u32)(dma_addr & ~7));
 	hd.info3 = cpu_to_le32(FIELD_PREP(W600_TX_SOP_EOP, W600_NO_FRAG) |
 			       FIELD_PREP(W600_TX_OFFSET, dma_addr & 7) |
