@@ -119,6 +119,10 @@ struct wave600_umi_logger_set_severity {
 #define WAVE600_MC_MAN_STA_ADD_CFM           WAVE600_UMI_MSG_MAN_CFM(0x3B) /* 0x143B */
 #define WAVE600_UM_MAN_STA_REMOVE_REQ        WAVE600_UMI_MSG_MAN_REQ(0x3C) /* 0x043C */
 #define WAVE600_MC_MAN_STA_REMOVE_CFM        WAVE600_UMI_MSG_MAN_CFM(0x3C) /* 0x143C */
+#define WAVE600_UM_MAN_REQUEST_SID_REQ        WAVE600_UMI_MSG_MAN_REQ(0x42) /* 0x0442 */
+#define WAVE600_MC_MAN_REQUEST_SID_CFM        WAVE600_UMI_MSG_MAN_CFM(0x42) /* 0x1442 */
+#define WAVE600_UM_MAN_REMOVE_SID_REQ         WAVE600_UMI_MSG_MAN_REQ(0x43) /* 0x0443 */
+#define WAVE600_MC_MAN_REMOVE_SID_CFM         WAVE600_UMI_MSG_MAN_CFM(0x43) /* 0x1443 */
 #define WAVE600_UM_MAN_STOP_TRAFFIC_REQ       WAVE600_UMI_MSG_MAN_REQ(0x44) /* 0x0444 */
 #define WAVE600_MC_MAN_STOP_TRAFFIC_CFM       WAVE600_UMI_MSG_MAN_CFM(0x44) /* 0x1444 */
 #define WAVE600_UM_MAN_SET_802_1X_FILTER_REQ  WAVE600_UMI_MSG_MAN_REQ(0x46) /* 0x0446 */
@@ -127,6 +131,7 @@ struct wave600_umi_logger_set_severity {
 #define WAVE600_MC_MAN_SET_BEACON_TEMPLATE_CFM  WAVE600_UMI_MSG_MAN_CFM(0x3D) /* 0x143D */
 
 /* Firmware-initiated events (UMI_MSG_MAN_IND(type, dir=IND, num)) */
+#define WAVE600_MC_MAN_CLASS3_ERROR_IND      WAVE600_UMI_MSG(WAVE600_MSG_IND, WAVE600_MSG_TYPE_MAN_IND, 0x04) /* 0x3304 */
 #define WAVE600_MC_MAN_NETWORK_EVENT_IND     WAVE600_UMI_MSG(WAVE600_MSG_IND, WAVE600_MSG_TYPE_MAN_IND, 0x26) /* 0x3326 */
 #define WAVE600_MC_MAN_MAC_EVENT_IND         WAVE600_UMI_MSG(WAVE600_MSG_IND, WAVE600_MSG_TYPE_MAN_IND, 0x38) /* 0x3338 */
 
@@ -247,6 +252,33 @@ struct wave600_umi_802_1x_filter {
 	__le16 sid;
 	u8 is_filter_open;
 	u8 reserved;
+} __packed;
+
+/* Vendor UMI_REQUEST_SID (0x0442) */
+struct wave600_umi_request_sid {
+	u8 addr[ETH_ALEN];
+	__le16 sid;
+	u8 status;
+	u8 reserved[3];
+} __packed;
+
+/* Vendor UMI_REMOVE_SID (0x0443) */
+struct wave600_umi_remove_sid {
+	__le16 sid;
+	u8 status;
+	u8 reserved;
+} __packed;
+
+/* Vendor UMI_FRAME_CLASS_ERROR (0x3304) */
+struct wave600_umi_class3_error_entry {
+	u8 vap_id;
+	u8 reserved;
+	u8 addr[ETH_ALEN];
+} __packed;
+
+struct wave600_umi_class3_error {
+	u8 num_entries;
+	struct wave600_umi_class3_error_entry entries[8];
 } __packed;
 
 /*

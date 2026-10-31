@@ -1285,8 +1285,11 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 					struct station_parameters *params)
 {
 	struct wave600_dev *wdev = *(struct wave600_dev **)wiphy_priv(wiphy);
+	struct wave600_umi_request_sid sid_req;
+	struct wave600_umi_request_sid sid_cfm;
 	struct wave600_umi_sta_add req;
 	struct wave600_umi_sta_add cfm;
+	u16 sid;
 	int ret;
 
 	if (!wdev->ap_started)
@@ -1294,28 +1297,77 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 
 	dev_info(wdev->dev, "cfg80211: add station %pM (aid %u)\n", mac, params ? params->aid : 0);
 
+	/*
+	 * Step 1: Request a Station ID (SID) from FullMAC firmware.
+	 * Vendor core_config.c:1036-1080 core_cfg_internal_request_sid sends
+	 * UM_MAN_REQUEST_SID_REQ (0x0442) so the ARC hardware receiver table
+	 * registers and binds sAddr to an allocated SID before any data frames arrive.
+	 */
+	memset(&sid_req, 0, sizeof(sid_req));
+	ether_addr_copy(sid_req.addr, mac);
+	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_REQUEST_SID_REQ,
+			      WAVE600_MC_MAN_REQUEST_SID_CFM,
+			      &sid_req, sizeof(sid_req),
+			      &sid_cfm, sizeof(sid_cfm), 2000);
+	if (ret) {
+		dev_warn(wdev->dev, "REQUEST_SID IPC failed: %d\n", ret);
+		return ret;
+	}
+	if (sid_cfm.status) {
+		dev_warn(wdev->dev, "REQUEST_SID rejected by FW: status=%u\n", sid_cfm.status);
+		return -EIO;
+	}
+
+	sid = le16_to_cpu(sid_cfm.sid);
+	dev_info(wdev->dev, "REQUEST_SID %pM confirmed: sid=%u\n", mac, sid);
+
+	/*
+	 * Step 2: Configure station capabilities via UM_MAN_STA_ADD_REQ (0x043B).
+	 */
 	memset(&req, 0, sizeof(req));
-	req.sid = cpu_to_le16(1);
+	req.sid = sid_cfm.sid;
 	req.vap_id = 0;
-	req.aid = cpu_to_le16(params ? params->aid : 1);
+	req.aid = cpu_to_le16(params && params->aid ? params->aid : (sid + 1));
 	ether_addr_copy(req.addr, mac);
 	req.rates_len = sizeof(wave600_rates_2g);
 	memcpy(req.rates, wave600_rates_2g, sizeof(wave600_rates_2g));
-	req.flags = 0x06;	/* STA_ADD_FLAGS_IS_8021X_FILTER_OPEN (0x02) | STA_ADD_FLAGS_WME (0x04) */
+
+	/* Flags: STA_ADD_FLAGS_IS_8021X_FILTER_OPEN (0x04) | STA_ADD_FLAGS_WME (0x02) */
+	req.flags = 0x06;
+
+	/* If client has HT capabilities, copy HT parameters and set STA_ADD_FLAGS_IS_HT (0x10) */
+	if (params && params->link_sta_params.ht_capa) {
+		const struct ieee80211_ht_cap *ht = params->link_sta_params.ht_capa;
+
+		req.ht_cap_info = ht->cap_info;
+		req.ampdu_param = ht->ampdu_params_info;
+		memcpy(req.rx_mcs_bitmask, ht->mcs.rx_mask, sizeof(req.rx_mcs_bitmask));
+		req.flags |= 0x10; /* STA_ADD_FLAGS_IS_HT */
+	}
 
 	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_STA_ADD_REQ,
 			      WAVE600_MC_MAN_STA_ADD_CFM,
 			      &req, sizeof(req), &cfm, sizeof(cfm), 2000);
 	if (ret) {
+		struct wave600_umi_remove_sid rem_req;
+		struct wave600_umi_remove_sid rem_cfm;
+
 		dev_warn(wdev->dev, "STA_ADD IPC failed: %d\n", ret);
+		/* Cleanup allocated SID on error */
+		memset(&rem_req, 0, sizeof(rem_req));
+		rem_req.sid = sid_cfm.sid;
+		wave600_ipc_cmd(wdev, WAVE600_UM_MAN_REMOVE_SID_REQ,
+				WAVE600_MC_MAN_REMOVE_SID_CFM,
+				&rem_req, sizeof(rem_req),
+				&rem_cfm, sizeof(rem_cfm), 2000);
 		return ret;
 	}
 
 	wdev->sta_connected = true;
-	wdev->sta_sid = le16_to_cpu(cfm.sid) ? le16_to_cpu(cfm.sid) : 1;
+	wdev->sta_sid = sid;
 	ether_addr_copy(wdev->sta_mac, mac);
-	dev_info(wdev->dev, "STA_ADD %pM confirmed: status=%u sid=%u\n",
-		 mac, cfm.status, wdev->sta_sid);
+	dev_info(wdev->dev, "STA_ADD %pM confirmed: status=%u sid=%u (flags=0x%02x)\n",
+		 mac, cfm.status, wdev->sta_sid, req.flags);
 
 	return 0;
 }
@@ -1342,6 +1394,9 @@ static int wave600_cfg80211_del_station(struct wiphy *wiphy,
 	struct wave600_umi_stop_traffic scfm;
 	struct wave600_umi_sta_remove req;
 	struct wave600_umi_sta_remove cfm;
+	struct wave600_umi_remove_sid rreq;
+	struct wave600_umi_remove_sid rcfm;
+	u16 sid;
 	int ret;
 
 	if (!wdev->ap_started || !wdev->sta_connected)
@@ -1350,12 +1405,13 @@ static int wave600_cfg80211_del_station(struct wiphy *wiphy,
 	if (params && params->mac && !ether_addr_equal(params->mac, wdev->sta_mac))
 		return 0;
 
+	sid = wdev->sta_sid;
 	dev_info(wdev->dev, "cfg80211: del station %pM (sid %u)\n",
-		 wdev->sta_mac, wdev->sta_sid ? wdev->sta_sid : 1);
+		 wdev->sta_mac, sid);
 
 	/* Stop traffic queues before removing station to prevent FW assertion 0x03c2 */
 	memset(&sreq, 0, sizeof(sreq));
-	sreq.sid = cpu_to_le16(wdev->sta_sid ? wdev->sta_sid : 1);
+	sreq.sid = cpu_to_le16(sid);
 	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_STOP_TRAFFIC_REQ,
 			      WAVE600_MC_MAN_STOP_TRAFFIC_CFM,
 			      &sreq, sizeof(sreq), &scfm, sizeof(scfm), 2000);
@@ -1363,13 +1419,21 @@ static int wave600_cfg80211_del_station(struct wiphy *wiphy,
 		dev_warn(wdev->dev, "STOP_TRAFFIC IPC failed: %d\n", ret);
 
 	memset(&req, 0, sizeof(req));
-	req.sid = cpu_to_le16(wdev->sta_sid ? wdev->sta_sid : 1);
-
+	req.sid = cpu_to_le16(sid);
 	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_STA_REMOVE_REQ,
 			      WAVE600_MC_MAN_STA_REMOVE_CFM,
 			      &req, sizeof(req), &cfm, sizeof(cfm), 2000);
 	if (ret)
 		dev_warn(wdev->dev, "STA_REMOVE IPC failed: %d\n", ret);
+
+	/* Release SID in ARC firmware hardware table (vendor core.c:14879 UM_MAN_REMOVE_SID_REQ) */
+	memset(&rreq, 0, sizeof(rreq));
+	rreq.sid = cpu_to_le16(sid);
+	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_REMOVE_SID_REQ,
+			      WAVE600_MC_MAN_REMOVE_SID_CFM,
+			      &rreq, sizeof(rreq), &rcfm, sizeof(rcfm), 2000);
+	if (ret)
+		dev_warn(wdev->dev, "REMOVE_SID IPC failed: %d\n", ret);
 
 	wdev->sta_connected = false;
 	wdev->sta_sid = 0;
