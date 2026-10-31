@@ -164,6 +164,12 @@ static const u8 wave600_rates_2g[] = {
 	0x30, 0x48, 0x60, 0x6c,		/* 24, 36, 48, 54 */
 };
 
+/* 5 GHz OFDM rates (6, 12, 24 Mbps marked as basic rates with 0x80) */
+static const u8 wave600_rates_5g[] = {
+	0x8c, 0x12, 0x98, 0x24,		/* 6 basic, 9, 12 basic, 18 */
+	0xb0, 0x48, 0x60, 0x6c,		/* 24 basic, 36, 48, 54 */
+};
+
 /* IE ids routed to the individual beacon template parts, exactly as the
  * vendor classifies them in beacon_manager.c _wave_get_beacon_data_length
  * (numeric values from driver/shared/frame.h ie_id_t). part1 = frame head. */
@@ -227,10 +233,13 @@ static const u8 wave600_rates_2g[] = {
 #define W600_MIB_SPECTRUM_MODE			0x1202
 #define W600_MIB_SPECTRUM_20M			0
 #define W600_MIB_IEEE_ADDRESS			0x0040
-#define W600_NETWORK_11BGN_MIXED		5	/* NETWORK_MODES_E */
+#define W600_NETWORK_11BGN_MIXED		5	/* NETWORK_MODES_E (2.4 GHz) */
+#define W600_NETWORK_11AN_MIXED			8	/* NETWORK_MODES_E (5 GHz) */
 #define W600_VAP_OPERATION_ADD			1
 #define W600_OPERATE_RATE_SET_11BGN		0xffffffffU
 #define W600_BSS_BASIC_RATE_SET_11BGN_DEFAULT	0x00007800U
+#define W600_OPERATE_RATE_SET_11AN		0xffff80ffU
+#define W600_BSS_BASIC_RATE_SET_11AN		0x00000015U
 
 /* TPC (mhi_mib_id.h) */
 #define W600_TPC_CAL_TYPE_LOGARITHMIC		1
@@ -241,7 +250,7 @@ static const u8 wave600_rates_2g[] = {
  * warns that zero limits crash the FW. */
 #define W600_TPC_LIMIT_MAX			0x7FFF
 
-static int wave600_send_set_chan(struct wave600_dev *wdev, u8 chan, u8 width)
+static int wave600_send_set_chan(struct wave600_dev *wdev, u8 chan, u8 width, u8 primary_idx)
 {
 	struct wave600_umi_set_chan p;
 	struct wave600_umi_set_chan cfm;
@@ -250,6 +259,7 @@ static int wave600_send_set_chan(struct wave600_dev *wdev, u8 chan, u8 width)
 	memset(&p, 0, sizeof(p));
 	p.low_chan_num = chan;
 	p.chan_width = width;	/* chanWidth_e */
+	p.primary_chan_idx = primary_idx;
 	/*
 	 * Vendor (core_config.c core_cfg_send_set_chan) always sends a
 	 * valid regulatory domain code: core_cfg_get_regd_code() with the
@@ -276,14 +286,16 @@ static int wave600_send_set_chan(struct wave600_dev *wdev, u8 chan, u8 width)
 	if (cfm.antenna_mask)
 		wdev->antenna_mask = cfm.antenna_mask;
 	else
-		wdev->antenna_mask = 0x05; /* default 2x2 antennas (ant 0 and ant 2) */
+		wdev->antenna_mask = (wdev->radio_idx == 1) ? 0x0A : 0x05;
 
 	return 0;
 }
 
-static int wave600_send_set_bss(struct wave600_dev *wdev)
+static int wave600_send_set_bss(struct wave600_dev *wdev, bool is_5g)
 {
 	struct wave600_umi_set_bss p;
+	const u8 *rates = is_5g ? wave600_rates_5g : wave600_rates_2g;
+	u8 rates_len = is_5g ? sizeof(wave600_rates_5g) : sizeof(wave600_rates_2g);
 
 	memset(&p, 0, sizeof(p));
 	/* UMI payload scalars are little-endian on the wire (vendor
@@ -294,8 +306,8 @@ static int wave600_send_set_bss(struct wave600_dev *wdev)
 	p.vap_id = W600_VAP_ID;
 	p.slot_time = 1;	/* short slot for OFDM */
 	p.use_short_preamble = 1;
-	memcpy(p.rates, wave600_rates_2g, sizeof(wave600_rates_2g));
-	p.rates_len = sizeof(wave600_rates_2g);
+	memcpy(p.rates, rates, rates_len);
+	p.rates_len = rates_len;
 	/* Single stream MCS 0-7 */
 	memset(p.tx_mcs_bitmask, 0x00, sizeof(p.tx_mcs_bitmask));
 	p.tx_mcs_bitmask[0] = 0xff;
@@ -308,17 +320,25 @@ static int wave600_send_set_bss(struct wave600_dev *wdev)
 			       &p, sizeof(p), NULL, 0, 5000);
 }
 
-static int wave600_send_add_vap(struct wave600_dev *wdev)
+/* Initial basic rates for ADD_VAP (vendor core_pdb_def.h / core.c:2329-2348:
+ * PARAM_DB_CORE_BASIC_RATES_2 and PARAM_DB_CORE_BASIC_RATES_5, no 0x80 flags) */
+static const u8 wave600_add_vap_rates_2g[] = { 2, 4, 11, 22 };
+static const u8 wave600_add_vap_rates_5g[] = { 12, 24, 48 };
+
+static int wave600_send_add_vap(struct wave600_dev *wdev, bool is_5g)
 {
 	struct wave600_umi_add_vap p;
+	const u8 *rates = is_5g ? wave600_add_vap_rates_5g : wave600_add_vap_rates_2g;
+	u8 rates_len = is_5g ? sizeof(wave600_add_vap_rates_5g) : sizeof(wave600_add_vap_rates_2g);
 
 	memset(&p, 0, sizeof(p));
 	memcpy(p.bssid, wdev->ndev->dev_addr, ETH_ALEN);
 	p.vap_id = W600_VAP_ID;
 	p.operation_mode = 0;	/* OPERATION_MODE_NORMAL */
-	memcpy(p.rates, wave600_rates_2g, sizeof(wave600_rates_2g));
-	p.rates_len = sizeof(wave600_rates_2g);
-	p.tx_mcs_bitmask[0] = 0xff;	/* MCS 0-7, single stream */
+	memcpy(p.rates, rates, rates_len);
+	p.rates_len = rates_len;
+	/* Vendor core.c:2342 explicitly memsets u8TX_MCS_Bitmask to 0 */
+	memset(p.tx_mcs_bitmask, 0, sizeof(p.tx_mcs_bitmask));
 	/* Vendor memsets the VHT/HE MCS-NSS maps to 0xff: each 2-bit subfield
 	 * then reads 3 = "n spatial streams not supported" (UMI_ADD_VAP). */
 	memset(p.vht_mcs_nss, 0xff, sizeof(p.vht_mcs_nss));
@@ -395,7 +415,7 @@ static int wave600_send_mib(struct wave600_dev *wdev, u16 object_id,
 /* Vendor mtlk_mib_set_pre_activate (mib_osdep.c): common physical
  * operational parameters for the pre-activation phase. Only the fields
  * the vendor sets are non-zero (PRE_ACTIVATE_MIB_TYPE layout). */
-static int wave600_send_mib_pre_activate(struct wave600_dev *wdev)
+static int wave600_send_mib_pre_activate(struct wave600_dev *wdev, bool is_5g)
 {
 	struct {
 		u8 reserved[3];
@@ -409,12 +429,12 @@ static int wave600_send_mib_pre_activate(struct wave600_dev *wdev)
 	} __packed v;
 
 	memset(&v, 0, sizeof(v));
-	v.network_mode = W600_NETWORK_11BGN_MIXED;
+	v.network_mode = is_5g ? W600_NETWORK_11AN_MIXED : W600_NETWORK_11BGN_MIXED;
 	v.upper_lower_channel = 0;	/* no channel bonding (20 MHz) */
 	v.spectrum_mode = W600_MIB_SPECTRUM_20M;
 	/* UMI payload scalars are little-endian (vendor HOST_TO_MAC32) */
-	v.operational_rate_set = cpu_to_le32(W600_OPERATE_RATE_SET_11BGN);
-	v.bss_basic_rate_set = cpu_to_le32(W600_BSS_BASIC_RATE_SET_11BGN_DEFAULT);
+	v.operational_rate_set = cpu_to_le32(is_5g ? W600_OPERATE_RATE_SET_11AN : W600_OPERATE_RATE_SET_11BGN);
+	v.bss_basic_rate_set = cpu_to_le32(is_5g ? W600_BSS_BASIC_RATE_SET_11AN : W600_BSS_BASIC_RATE_SET_11BGN_DEFAULT);
 
 	return wave600_send_mib(wdev, W600_MIB_PRE_ACTIVATE, &v, sizeof(v));
 }
@@ -936,29 +956,68 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 				     struct cfg80211_ap_settings *settings)
 {
 	struct wave600_dev *wdev = *(struct wave600_dev **)wiphy_priv(wiphy);
-	u8 chan, width;
+	bool is_5g;
+	u8 chan, width, low_chan, primary_idx = 0;
 	int ret;
 
-	if (settings->chandef.chan->band != NL80211_BAND_2GHZ)
+	if (settings->chandef.chan->band != NL80211_BAND_2GHZ &&
+	    settings->chandef.chan->band != NL80211_BAND_5GHZ)
 		return -EOPNOTSUPP;
 	if (settings->ssid_len == 0 || settings->ssid_len > W600_SSID_MAX_LEN)
 		return -EINVAL;
 
+	is_5g = (settings->chandef.chan->band == NL80211_BAND_5GHZ);
 	chan = settings->chandef.chan->hw_value;
+	wdev->radio_idx = is_5g ? 1 : 0;
+
 	switch (settings->chandef.width) {
 	case NL80211_CHAN_WIDTH_20:
 	case NL80211_CHAN_WIDTH_20_NOHT:
 		width = 0;	/* CW_20 */
+		low_chan = chan;
+		primary_idx = 0;
 		break;
 	case NL80211_CHAN_WIDTH_40:
 		width = 1;	/* CW_40 */
+		if (is_5g) {
+			u32 cf1 = settings->chandef.center_freq1;
+			u32 low_freq = cf1 - 10;
+			low_chan = (u8)((low_freq - 5000) / 5);
+			primary_idx = (chan >= low_chan) ? (chan - low_chan) / 4 : 0;
+		} else {
+			low_chan = (settings->chandef.center_freq1 > settings->chandef.chan->center_freq) ? chan : (chan - 4);
+			primary_idx = (chan - low_chan) / 4;
+		}
+		break;
+	case NL80211_CHAN_WIDTH_80:
+		width = 2;	/* CW_80 */
+		if (is_5g) {
+			u32 cf1 = settings->chandef.center_freq1;
+			u32 low_freq = cf1 - 30;
+			low_chan = (u8)((low_freq - 5000) / 5);
+			primary_idx = (chan >= low_chan) ? (chan - low_chan) / 4 : 0;
+		} else {
+			return -EOPNOTSUPP;
+		}
+		break;
+	case NL80211_CHAN_WIDTH_160:
+		width = 3;	/* CW_160 */
+		if (is_5g) {
+			u32 cf1 = settings->chandef.center_freq1;
+			u32 low_freq = cf1 - 70;
+			low_chan = (u8)((low_freq - 5000) / 5);
+			primary_idx = (chan >= low_chan) ? (chan - low_chan) / 4 : 0;
+		} else {
+			return -EOPNOTSUPP;
+		}
 		break;
 	default:
 		return -EOPNOTSUPP;
 	}
 
-	dev_info(wdev->dev, "start_ap: SSID '%.*s' channel %d width %d\n",
-		 (int)settings->ssid_len, settings->ssid, chan, width);
+	dev_info(wdev->dev, "start_ap: SSID '%.*s' band %s channel %d (low %u, idx %u) width %d (radio_idx %u)\n",
+		 (int)settings->ssid_len, settings->ssid,
+		 is_5g ? "5GHz" : "2.4GHz", chan, low_chan, primary_idx, width, wdev->radio_idx);
 
 	/*
 	 * Vendor AP bring-up sequence (verified against _mtlk_core_on_rcvry_configure
@@ -986,7 +1045,7 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 				  wdev->ndev->dev_addr, ETH_ALEN,
 				  "IEEE_ADDRESS after SET");
 
-	ret = wave600_send_mib_pre_activate(wdev);
+	ret = wave600_send_mib_pre_activate(wdev, is_5g);
 	if (ret) {
 		dev_err(wdev->dev, "start_ap: MIB_PRE_ACTIVATE failed: %d\n", ret);
 		return ret;
@@ -1004,7 +1063,7 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 		return ret;
 	}
 
-	ret = wave600_send_add_vap(wdev);
+	ret = wave600_send_add_vap(wdev, is_5g);
 	if (ret) {
 		dev_err(wdev->dev, "start_ap: ADD_VAP failed: %d\n", ret);
 		return ret;
@@ -1017,7 +1076,7 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 	}
 
 	wdev->ap_channel = chan;
-	ret = wave600_send_set_chan(wdev, chan, width);
+	ret = wave600_send_set_chan(wdev, low_chan, width, primary_idx);
 	if (ret) {
 		dev_err(wdev->dev, "start_ap: SET_CHAN failed: %d\n", ret);
 		return ret;
@@ -1039,7 +1098,7 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 	}
 
 	/* Vendor core_config.c:646-650 mtlk_core_set_coc_actual_power_mode -> MC_MAN_SET_ANTENNAS_REQ */
-	ret = wave600_send_set_antennas(wdev, wdev->antenna_mask ? wdev->antenna_mask : 0x05);
+	ret = wave600_send_set_antennas(wdev, wdev->antenna_mask ? wdev->antenna_mask : (is_5g ? 0x0A : 0x05));
 	if (ret) {
 		dev_err(wdev->dev, "start_ap: SET_ANTENNAS failed: %d\n", ret);
 		return ret;
@@ -1051,7 +1110,7 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 		return ret;
 	}
 
-	ret = wave600_send_set_bss(wdev);
+	ret = wave600_send_set_bss(wdev, is_5g);
 	if (ret) {
 		dev_err(wdev->dev, "start_ap: SET_BSS failed: %d\n", ret);
 		return ret;
@@ -1115,6 +1174,7 @@ static int wave600_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *ndev
 	wdev->ap_started = false;
 	wdev->sta_connected = false;
 	eth_zero_addr(wdev->sta_mac);
+	wdev->radio_idx = 0;
 	return 0;
 }
 
@@ -1131,7 +1191,8 @@ static int wave600_cfg80211_set_channel(struct wiphy *wiphy,
 {
 	struct wave600_dev *wdev = *(struct wave600_dev **)wiphy_priv(wiphy);
 
-	if (chandef->chan->band != NL80211_BAND_2GHZ)
+	if (chandef->chan->band != NL80211_BAND_2GHZ &&
+	    chandef->chan->band != NL80211_BAND_5GHZ)
 		return -EOPNOTSUPP;
 
 	wdev->ap_channel = chandef->chan->hw_value;
@@ -1141,9 +1202,13 @@ static int wave600_cfg80211_set_channel(struct wiphy *wiphy,
 	switch (chandef->width) {
 	case NL80211_CHAN_WIDTH_20:
 	case NL80211_CHAN_WIDTH_20_NOHT:
-		return wave600_send_set_chan(wdev, wdev->ap_channel, 0);
+		return wave600_send_set_chan(wdev, wdev->ap_channel, 0, 0);
 	case NL80211_CHAN_WIDTH_40:
-		return wave600_send_set_chan(wdev, wdev->ap_channel, 1);
+		return wave600_send_set_chan(wdev, wdev->ap_channel, 1, 0);
+	case NL80211_CHAN_WIDTH_80:
+		return wave600_send_set_chan(wdev, wdev->ap_channel, 2, 0);
+	case NL80211_CHAN_WIDTH_160:
+		return wave600_send_set_chan(wdev, wdev->ap_channel, 3, 0);
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -1324,13 +1389,16 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 	/*
 	 * Step 2: Configure station capabilities via UM_MAN_STA_ADD_REQ (0x043B).
 	 */
+	const u8 *rates = (wdev->radio_idx == 1) ? wave600_rates_5g : wave600_rates_2g;
+	u8 rates_len = (wdev->radio_idx == 1) ? sizeof(wave600_rates_5g) : sizeof(wave600_rates_2g);
+
 	memset(&req, 0, sizeof(req));
 	req.sid = sid_cfm.sid;
 	req.vap_id = 0;
 	req.aid = cpu_to_le16(params && params->aid ? params->aid : (sid + 1));
 	ether_addr_copy(req.addr, mac);
-	req.rates_len = sizeof(wave600_rates_2g);
-	memcpy(req.rates, wave600_rates_2g, sizeof(wave600_rates_2g));
+	req.rates_len = rates_len;
+	memcpy(req.rates, rates, rates_len);
 
 	/* Flags: STA_ADD_FLAGS_IS_8021X_FILTER_OPEN (0x04) | STA_ADD_FLAGS_WME (0x02) */
 	req.flags = 0x06;
@@ -1510,6 +1578,40 @@ static void wave600_setup_band_2g(struct ieee80211_supported_band *band)
 	band->n_channels = ARRAY_SIZE(channels_2g);
 }
 
+static void wave600_setup_band_5g(struct ieee80211_supported_band *band)
+{
+	static const struct ieee80211_channel channels_5g[] = {
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5180, .hw_value = 36, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5200, .hw_value = 40, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5220, .hw_value = 44, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5240, .hw_value = 48, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5260, .hw_value = 52, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5280, .hw_value = 56, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5300, .hw_value = 60, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5320, .hw_value = 64, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5500, .hw_value = 100, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5520, .hw_value = 104, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5540, .hw_value = 108, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5560, .hw_value = 112, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5580, .hw_value = 116, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5600, .hw_value = 120, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5620, .hw_value = 124, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5640, .hw_value = 128, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5660, .hw_value = 132, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5680, .hw_value = 136, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5700, .hw_value = 140, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5720, .hw_value = 144, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5745, .hw_value = 149, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5765, .hw_value = 153, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5785, .hw_value = 157, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5805, .hw_value = 161, .max_power = 23, .max_antenna_gain = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5825, .hw_value = 165, .max_power = 23, .max_antenna_gain = 0 },
+	};
+
+	memcpy(band->channels, channels_5g, sizeof(channels_5g));
+	band->n_channels = ARRAY_SIZE(channels_5g);
+}
+
 /* ------------------------------------------------------------------ */
 /* Handler-liveness diagnostic (one-shot, end of probe)               */
 /* ------------------------------------------------------------------ */
@@ -1598,7 +1700,7 @@ int wave600_cfg80211_init(struct wave600_dev *wdev)
 	band->bitrates = kcalloc(12, sizeof(struct ieee80211_rate), GFP_KERNEL);
 	if (!band->channels || !band->bitrates) {
 		ret = -ENOMEM;
-		goto err_band;
+		goto err_band_2g;
 	}
 	wave600_setup_band_2g(band);
 
@@ -1628,6 +1730,62 @@ int wave600_cfg80211_init(struct wave600_dev *wdev)
 	memset(&band->ht_cap.mcs, 0, sizeof(band->ht_cap.mcs));
 	band->ht_cap.mcs.rx_mask[0] = 0xff;
 
+	/* 5 GHz Band */
+	wiphy->bands[NL80211_BAND_5GHZ] =
+		kzalloc(sizeof(*wiphy->bands[NL80211_BAND_5GHZ]), GFP_KERNEL);
+	if (!wiphy->bands[NL80211_BAND_5GHZ]) {
+		ret = -ENOMEM;
+		goto err_band_2g;
+	}
+
+	band = wiphy->bands[NL80211_BAND_5GHZ];
+	band->channels = kcalloc(25, sizeof(struct ieee80211_channel), GFP_KERNEL);
+	band->bitrates = kcalloc(8, sizeof(struct ieee80211_rate), GFP_KERNEL);
+	if (!band->channels || !band->bitrates) {
+		ret = -ENOMEM;
+		goto err_band_5g;
+	}
+	wave600_setup_band_5g(band);
+
+	/* 5 GHz Bitrates (6, 9, 12, 18, 24, 36, 48, 54 Mbps in 100 kbps units) */
+	{
+		static const int rates_5g[] = { 60, 90, 120, 180, 240, 360, 480, 540 };
+		static const u32 flags_5g[] = {
+			IEEE80211_RATE_MANDATORY_A,
+			0,
+			IEEE80211_RATE_MANDATORY_A,
+			0,
+			IEEE80211_RATE_MANDATORY_A,
+			0, 0, 0
+		};
+		int i;
+
+		for (i = 0; i < 8; i++) {
+			band->bitrates[i].bitrate = rates_5g[i];
+			band->bitrates[i].flags = flags_5g[i];
+			band->bitrates[i].hw_value = i;
+		}
+		band->n_bitrates = 8;
+	}
+
+	/* HT20/40 capabilities, single stream (MCS 0-7) */
+	band->ht_cap.ht_supported = true;
+	band->ht_cap.cap = IEEE80211_HT_CAP_SGI_20 | IEEE80211_HT_CAP_SGI_40 |
+			   IEEE80211_HT_CAP_SUP_WIDTH_20_40 | BIT(8); /* RX STBC 1SS */
+	band->ht_cap.ampdu_factor = IEEE80211_HT_MAX_AMPDU_32K;
+	band->ht_cap.ampdu_density = IEEE80211_HT_MPDU_DENSITY_16;
+	memset(&band->ht_cap.mcs, 0, sizeof(band->ht_cap.mcs));
+	band->ht_cap.mcs.rx_mask[0] = 0xff;
+
+	/* VHT capabilities (80 / 160 MHz) */
+	band->vht_cap.vht_supported = true;
+	band->vht_cap.cap = IEEE80211_VHT_CAP_SHORT_GI_80 |
+			    IEEE80211_VHT_CAP_SHORT_GI_160 |
+			    IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ |
+			    IEEE80211_VHT_CAP_RXSTBC_1;
+	band->vht_cap.vht_mcs.rx_mcs_map = cpu_to_le16(0xfffa);
+	band->vht_cap.vht_mcs.tx_mcs_map = cpu_to_le16(0xfffa);
+
 	wiphy->signal_type = CFG80211_SIGNAL_TYPE_UNSPEC;
 	wiphy->max_scan_ssids = 1;
 	strscpy(wiphy->fw_version, wdev->fw_version, sizeof(wiphy->fw_version));
@@ -1636,7 +1794,7 @@ int wave600_cfg80211_init(struct wave600_dev *wdev)
 				  NET_NAME_UNKNOWN, ether_setup);
 	if (!wdev->ndev) {
 		ret = -ENOMEM;
-		goto err_band;
+		goto err_band_5g;
 	}
 	SET_NETDEV_DEV(wdev->ndev, wdev->dev);
 	wdev_net = netdev_priv(wdev->ndev);
@@ -1657,7 +1815,7 @@ int wave600_cfg80211_init(struct wave600_dev *wdev)
 
 	wdev->wiphy = wiphy;
 	wdev->wdev_net = wdev_net;
-	dev_info(wdev->dev, "cfg80211 wiphy registered, AP interface %s (mgmt_tx & sta_add enabled)\n",
+	dev_info(wdev->dev, "cfg80211 wiphy registered, AP interface %s (dual-band 2.4/5GHz ready)\n",
 		 wdev->ndev->name);
 	return 0;
 
@@ -1665,11 +1823,20 @@ err_wiphy_reg:
 	wiphy_unregister(wiphy);
 err_ndev:
 	free_netdev(wdev->ndev);
-err_band:
-	kfree(band->bitrates);
-	kfree(band->channels);
-	kfree(band);
-	wiphy->bands[NL80211_BAND_2GHZ] = NULL;
+err_band_5g:
+	if (wiphy->bands[NL80211_BAND_5GHZ]) {
+		kfree(wiphy->bands[NL80211_BAND_5GHZ]->bitrates);
+		kfree(wiphy->bands[NL80211_BAND_5GHZ]->channels);
+		kfree(wiphy->bands[NL80211_BAND_5GHZ]);
+		wiphy->bands[NL80211_BAND_5GHZ] = NULL;
+	}
+err_band_2g:
+	if (wiphy->bands[NL80211_BAND_2GHZ]) {
+		kfree(wiphy->bands[NL80211_BAND_2GHZ]->bitrates);
+		kfree(wiphy->bands[NL80211_BAND_2GHZ]->channels);
+		kfree(wiphy->bands[NL80211_BAND_2GHZ]);
+		wiphy->bands[NL80211_BAND_2GHZ] = NULL;
+	}
 err_wiphy:
 	wiphy_free(wiphy);
 	return ret;
@@ -1691,18 +1858,29 @@ void wave600_cfg80211_cleanup(struct wave600_dev *wdev)
 	if (!wdev->wiphy)
 		return;
 
-	band = wdev->wiphy->bands[NL80211_BAND_2GHZ];
 	if (wdev->ndev) {
 		unregister_netdev(wdev->ndev);
 		free_netdev(wdev->ndev);
 		wdev->ndev = NULL;
 	}
 	wiphy_unregister(wdev->wiphy);
+
+	band = wdev->wiphy->bands[NL80211_BAND_5GHZ];
 	if (band) {
 		kfree(band->bitrates);
 		kfree(band->channels);
 		kfree(band);
+		wdev->wiphy->bands[NL80211_BAND_5GHZ] = NULL;
 	}
+
+	band = wdev->wiphy->bands[NL80211_BAND_2GHZ];
+	if (band) {
+		kfree(band->bitrates);
+		kfree(band->channels);
+		kfree(band);
+		wdev->wiphy->bands[NL80211_BAND_2GHZ] = NULL;
+	}
+
 	wiphy_free(wdev->wiphy);
 	wdev->wiphy = NULL;
 }

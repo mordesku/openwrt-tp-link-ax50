@@ -385,19 +385,22 @@ int wave600_psdb_send(struct wave600_dev *wdev, u32 pm_addr)
 	size = psdb->fw->size;
 
 	/* 1. HDK antenna configuration (vendor sends it before the PSDB
-	 * data). Byte fields only, no endianness involved. */
-	memset(&ant, 0, sizeof(ant));
-	ant.ant_params[0] = psdb->ant[0];
-	ant.ant_params[1] = psdb->ant[1];
+	 * data, only once when first band goes up: __wave_radio_is_first).
+	 * Byte fields only, no endianness involved. */
+	if (wdev->radio_idx == 0) {
+		memset(&ant, 0, sizeof(ant));
+		ant.ant_params[0] = psdb->ant[0];
+		ant.ant_params[1] = psdb->ant[1];
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_HDK_ANT_CONFIG_REQ,
-			      WAVE600_MC_MAN_HDK_ANT_CONFIG_CFM,
-			      &ant, sizeof(ant), NULL, 0, 5000);
-	if (ret) {
-		dev_err(wdev->dev, "PSDB: HDK_ANT_CONFIG_REQ failed: %d\n", ret);
-		goto out;
+		ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_HDK_ANT_CONFIG_REQ,
+				      WAVE600_MC_MAN_HDK_ANT_CONFIG_CFM,
+				      &ant, sizeof(ant), NULL, 0, 5000);
+		if (ret) {
+			dev_err(wdev->dev, "PSDB: HDK_ANT_CONFIG_REQ failed: %d\n", ret);
+			goto out;
+		}
+		dev_info(wdev->dev, "PSDB: HDK antenna configuration confirmed by firmware\n");
 	}
-	dev_info(wdev->dev, "PSDB: HDK antenna configuration confirmed by firmware\n");
 
 	/* 2. Single-word platform fields (little-endian words, raw bytes) */
 	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_PLATFORM_DATA_FIELDS_REQ,
@@ -405,11 +408,12 @@ int wave600_psdb_send(struct wave600_dev *wdev, u32 pm_addr)
 			      psdb->fields_msg, psdb->fields_msg_len,
 			      NULL, 0, 5000);
 	if (ret) {
-		dev_err(wdev->dev, "PSDB: PLATFORM_DATA_FIELDS_REQ failed: %d\n", ret);
+		dev_err(wdev->dev, "PSDB: radio %u PLATFORM_DATA_FIELDS_REQ failed: %d\n",
+			wdev->radio_idx, ret);
 		goto out;
 	}
-	dev_info(wdev->dev, "PSDB: platform fields (%u words) confirmed by firmware\n",
-		 (unsigned)(psdb->fields_msg_len / 4));
+	dev_info(wdev->dev, "PSDB: radio %u platform fields (%u words) confirmed by firmware\n",
+		 wdev->radio_idx, (unsigned)(psdb->fields_msg_len / 4));
 
 	/* 3. Data tables: stage the table body [nrows][ncols][data] through
 	 * the SHRAM ProgModel area byte-exact, then hand over the table ID. */
@@ -444,17 +448,17 @@ int wave600_psdb_send(struct wave600_dev *wdev, u32 pm_addr)
 				      WAVE600_MC_MAN_PLATFORM_TABLE_CFM,
 				      tid, sizeof(tid), NULL, 0, 5000);
 		if (ret) {
-			dev_err(wdev->dev, "PSDB: PLATFORM_TABLE_REQ 0x%06x failed: %d\n",
-				psdb->tabs[k].id, ret);
+			dev_err(wdev->dev, "PSDB: radio %u PLATFORM_TABLE_REQ 0x%06x failed: %d\n",
+				wdev->radio_idx, psdb->tabs[k].id, ret);
 			goto out;
 		}
 
-		dev_info(wdev->dev, "PSDB: table 0x%06x (%u x %u, %u bytes) confirmed by firmware\n",
-			 psdb->tabs[k].id, t_nrows, t_ncols, t_bytes);
+		dev_info(wdev->dev, "PSDB: radio %u table 0x%06x (%u x %u, %u bytes) confirmed by firmware\n",
+			 wdev->radio_idx, psdb->tabs[k].id, t_nrows, t_ncols, t_bytes);
 	}
 
-	dev_info(wdev->dev, "PSDB platform data loaded to firmware (%u tables)\n",
-		 psdb->ntab);
+	dev_info(wdev->dev, "PSDB: radio %u platform data loaded to firmware (%u tables)\n",
+		 wdev->radio_idx, psdb->ntab);
 	ret = 0;
 
 out:
@@ -463,7 +467,6 @@ out:
 	 * table is re-read by the TX power configuration on every channel
 	 * set (vendor keeps its parsed PSDB structures for the same reason).
 	 */
-	psdb->parsed = false;
 	return ret;
 }
 

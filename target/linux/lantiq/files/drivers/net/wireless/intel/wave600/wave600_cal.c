@@ -465,10 +465,12 @@ static int wave600_cal_dummy_vap_add(struct wave600_dev *wdev)
 	memset(&req, 0, sizeof(req));
 	if (wdev->ndev)
 		memcpy(req.bssid, wdev->ndev->dev_addr, sizeof(req.bssid));
+	req.bssid[5] += wdev->radio_idx; /* unique for every radio (vendor wave_radio.c:4807) */
 	req.vap_id = 0;
 	req.operation_mode = 0;
 
-	dev_info(wdev->dev, "adding dummy calibration VAP 0 (bssid %pM)...\n", req.bssid);
+	dev_info(wdev->dev, "adding dummy calibration VAP 0 (bssid %pM) on radio %u...\n",
+		 req.bssid, wdev->radio_idx);
 	return wave600_ipc_cmd(wdev, WAVE600_UM_MAN_ADD_VAP_REQ,
 			       WAVE600_MC_MAN_ADD_VAP_CFM,
 			       &req, sizeof(req), NULL, 0, 5000);
@@ -481,7 +483,7 @@ static int wave600_cal_dummy_vap_del(struct wave600_dev *wdev)
 	memset(&req, 0, sizeof(req));
 	req.vap_id = 0;
 
-	dev_info(wdev->dev, "removing dummy calibration VAP 0...\n");
+	dev_info(wdev->dev, "removing dummy calibration VAP 0 on radio %u...\n", wdev->radio_idx);
 	return wave600_ipc_cmd(wdev, WAVE600_UM_MAN_REMOVE_VAP_REQ,
 			       WAVE600_MC_MAN_REMOVE_VAP_CFM,
 			       &req, sizeof(req), NULL, 0, 5000);
@@ -563,14 +565,14 @@ int wave600_cal_init(struct wave600_dev *wdev)
 			return ret;
 	}
 
-	/* 2. Upload EEPROM AFE + RSSI calibration data for 2.4 GHz (cal->rssi[0]) */
+	/* 2. Pre-calibration for Radio 0 (2.4 GHz): EEPROM + HDK (vendor wave_radio.c:5150) */
+	wdev->radio_idx = 0;
 	ret = wave600_cal_send_eeprom_data(wdev, 0);
 	if (ret) {
 		dev_err(wdev->dev, "EEPROM calibration data upload failed: %d\n", ret);
 		return ret;
 	}
 
-	/* 3. Configure Hardware / HDK (UM_MAN_HDK_CONFIG_REQ) */
 	memset(&hdk, 0, sizeof(hdk));
 	/* UMI payload scalars are little-endian (vendor HOST_TO_MAC16/32) */
 	hdk.cal_buffer_base_addr = cpu_to_le32((u32)wdev->cal_dma_addr);
@@ -596,30 +598,98 @@ int wave600_cal_init(struct wave600_dev *wdev)
 	hdk.offline_cal_mask = 0xffffffff;
 	hdk.online_cal_mask = 0xffffffff;
 
-	dev_info(wdev->dev, "configuring HDK (band 1 [2.4 GHz], %ux%u, cal_dma=%pad)...\n",
+	dev_info(wdev->dev, "configuring HDK for Radio 0 (band 1 [2.4 GHz], %ux%u, cal_dma=%pad)...\n",
 		 num_ants, num_ants, &wdev->cal_dma_addr);
 	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_HDK_CONFIG_REQ,
 			      WAVE600_MC_MAN_HDK_CONFIG_CFM,
 			      &hdk, sizeof(hdk), NULL, 0, 5000);
 	if (ret) {
-		dev_err(wdev->dev, "HDK_CONFIG_REQ failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio 0 HDK_CONFIG_REQ failed: %d\n", ret);
 		return ret;
 	}
-	dev_info(wdev->dev, "HDK configured successfully by firmware\n");
+	dev_info(wdev->dev, "Radio 0 HDK configured successfully by firmware\n");
 
-	/* 4. Platform Specific Data (HDK_ANT_CONFIG + PLATFORM_DATA_FIELDS + TABLES) */
+	/* 3. Pre-calibration for Radio 1 (5 GHz): ProgModel + EEPROM + HDK (vendor wave_radio.c:5150) */
+	wdev->radio_idx = 1;
 	if (pm_addr) {
+		dev_info(wdev->dev, "Radio 1: requesting ProgModel download permission (0x%04x)...\n",
+			 WAVE600_UM_MAN_DOWNLOAD_PROG_MODEL_PERMISSION_REQ);
+		ret = wave600_ipc_cmd(wdev,
+				      WAVE600_UM_MAN_DOWNLOAD_PROG_MODEL_PERMISSION_REQ,
+				      WAVE600_MC_MAN_DOWNLOAD_PROG_MODEL_PERMISSION_CFM,
+				      NULL, 0, NULL, 0, 5000);
+		if (ret) {
+			dev_warn(wdev->dev, "Radio 1 DOWNLOAD_PROG_MODEL_PERMISSION_REQ failed: %d\n", ret);
+		} else {
+			ret = wave600_progmodel_download(wdev, "ProgModel_gen6_Common.bin", pm_addr,
+							 WAVE600_UM_DOWNLOAD_PROG_MODEL_REQ,
+							 WAVE600_MC_DOWNLOAD_PROG_MODEL_CFM);
+			if (ret)
+				dev_warn(wdev->dev, "Radio 1 ProgModel Common failed: %d\n", ret);
+
+			ret = wave600_progmodel_download(wdev, "ProgModel_gen6_Ant_Tx.bin", pm_addr,
+							 WAVE600_UM_MAN_DOWNLOAD_PROG_MODEL_ANT_TX_REQ,
+							 WAVE600_MC_MAN_DOWNLOAD_PROG_MODEL_ANT_TX_CFM);
+			if (ret)
+				dev_warn(wdev->dev, "Radio 1 ProgModel Ant_Tx failed: %d\n", ret);
+
+			ret = wave600_progmodel_download(wdev, "ProgModel_gen6_Ant_Rx.bin", pm_addr,
+							 WAVE600_UM_MAN_DOWNLOAD_PROG_MODEL_ANT_RX_REQ,
+							 WAVE600_MC_MAN_DOWNLOAD_PROG_MODEL_ANT_RX_CFM);
+			if (ret)
+				dev_warn(wdev->dev, "Radio 1 ProgModel Ant_Rx failed: %d\n", ret);
+		}
+	}
+
+	ret = wave600_cal_send_eeprom_data(wdev, 1);
+	if (ret)
+		dev_warn(wdev->dev, "Radio 1 EEPROM calibration data upload failed: %d\n", ret);
+
+	memset(&hdk, 0, sizeof(hdk));
+	hdk.cal_buffer_base_addr = cpu_to_le32((u32)wdev->cal_dma_addr);
+	num_ants = hweight8(wdev->psdb.ant[1].tx_ant_mask);
+	if (!num_ants)
+		num_ants = 2;
+	hdk.num_tx_ants = num_ants;
+	hdk.num_rx_ants = num_ants;
+	hdk.eeprom_version = cpu_to_le16(wdev->cal.eeprom_version);
+	hdk.band = 0; /* MTLK_HW_BAND_5_2_GHZ = 0 */
+	hdk.offline_cal_mask = 0xffffffff;
+	hdk.online_cal_mask = 0xffffffff;
+
+	dev_info(wdev->dev, "configuring HDK for Radio 1 (band 0 [5 GHz], %ux%u)...\n",
+		 num_ants, num_ants);
+	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_HDK_CONFIG_REQ,
+			      WAVE600_MC_MAN_HDK_CONFIG_CFM,
+			      &hdk, sizeof(hdk), NULL, 0, 5000);
+	if (ret)
+		dev_warn(wdev->dev, "Radio 1 HDK_CONFIG_REQ failed: %d\n", ret);
+	else
+		dev_info(wdev->dev, "Radio 1 HDK configured successfully by firmware\n");
+
+	/* 4. Platform Specific Data (vendor mtlk_psdb_load_to_hw for each radio) */
+	if (pm_addr) {
+		wdev->radio_idx = 0;
 		ret = wave600_psdb_send(wdev, pm_addr);
 		if (ret) {
-			dev_err(wdev->dev, "PSDB send failed: %d\n", ret);
+			dev_err(wdev->dev, "Radio 0 PSDB send failed: %d\n", ret);
+			return ret;
+		}
+
+		/* Radio 1 (5 GHz) must also receive PSDB fields and tables */
+		wdev->radio_idx = 1;
+		ret = wave600_psdb_send(wdev, pm_addr);
+		if (ret) {
+			dev_err(wdev->dev, "Radio 1 PSDB send failed: %d\n", ret);
 			return ret;
 		}
 	}
 
-	/* 5. Execute Channel Calibration wrapped in dummy VAP 0 add/del */
+	/* 5. Execute Channel Calibration for Radio 0 (2.4 GHz) */
+	wdev->radio_idx = 0;
 	ret = wave600_cal_dummy_vap_add(wdev);
 	if (ret) {
-		dev_err(wdev->dev, "dummy calibration ADD_VAP failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio 0 dummy calibration ADD_VAP failed: %d\n", ret);
 		return ret;
 	}
 
@@ -630,24 +700,102 @@ int wave600_cal_init(struct wave600_dev *wdev)
 	cal.num_chans = 3;
 	cal.chan_width = 0; /* 20 MHz */
 
-	dev_info(wdev->dev, "initiating RF calibration for channels 1, 6, 11 (20 MHz)...\n");
+	dev_info(wdev->dev, "initiating Radio 0 RF calibration for channels 1, 6, 11 (20 MHz)...\n");
 	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_CALIBRATE_REQ,
 			      WAVE600_MC_MAN_CALIBRATE_CFM,
 			      &cal, sizeof(cal), &cal, sizeof(cal), 30000);
 	if (ret) {
-		dev_err(wdev->dev, "CALIBRATE_REQ failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio 0 CALIBRATE_REQ failed: %d\n", ret);
 		wave600_cal_dummy_vap_del(wdev);
 		return ret;
 	}
 
-	dev_info(wdev->dev, "WAV654 Radio RF calibration verified (status: 0x%08x) (Milestone 4 PASS)\n",
+	dev_info(wdev->dev, "Radio 0 RF calibration verified (status: 0x%08x)\n",
 		 le32_to_cpu(cal.status));
 
 	ret = wave600_cal_dummy_vap_del(wdev);
 	if (ret) {
-		dev_err(wdev->dev, "dummy calibration REMOVE_VAP failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio 0 dummy calibration REMOVE_VAP failed: %d\n", ret);
 		return ret;
 	}
+
+	/* 6. Execute Channel Calibration for Radio 1 (5 GHz) */
+	wdev->radio_idx = 1;
+	ret = wave600_cal_dummy_vap_add(wdev);
+	if (ret) {
+		dev_warn(wdev->dev, "Radio 1 dummy calibration ADD_VAP failed: %d\n", ret);
+	} else {
+		static const u8 ch_20[] = {
+			36, 40, 44, 48, 52, 56, 60, 64,
+			100, 104, 108, 112, 116, 120, 124, 128,
+			132, 136, 140, 144, 149, 153, 157, 161, 165
+		};
+		static const u8 ch_40[] = { 36, 44, 52, 60, 100, 108, 116, 124, 132, 140, 149, 157 };
+		static const u8 ch_80[] = { 36, 52, 100, 116, 132, 149 };
+		static const u8 ch_160[] = { 36, 100 };
+
+		/* 20 MHz channels */
+		memset(&cal, 0, sizeof(cal));
+		memcpy(cal.chan_nums, ch_20, sizeof(ch_20));
+		cal.num_chans = sizeof(ch_20);
+		cal.chan_width = 0; /* CW_20 */
+		dev_info(wdev->dev, "initiating Radio 1 RF calibration for 20 MHz channels (count %zu)...\n",
+			 sizeof(ch_20));
+		ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_CALIBRATE_REQ,
+				      WAVE600_MC_MAN_CALIBRATE_CFM,
+				      &cal, sizeof(cal), &cal, sizeof(cal), 30000);
+		if (ret) {
+			dev_warn(wdev->dev, "Radio 1 20 MHz CALIBRATE_REQ failed: %d\n", ret);
+			goto out_del_r1;
+		}
+
+		/* 40 MHz channels */
+		memset(&cal, 0, sizeof(cal));
+		memcpy(cal.chan_nums, ch_40, sizeof(ch_40));
+		cal.num_chans = sizeof(ch_40);
+		cal.chan_width = 1; /* CW_40 */
+		ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_CALIBRATE_REQ,
+				      WAVE600_MC_MAN_CALIBRATE_CFM,
+				      &cal, sizeof(cal), &cal, sizeof(cal), 30000);
+		if (ret) {
+			dev_warn(wdev->dev, "Radio 1 40 MHz CALIBRATE_REQ failed: %d\n", ret);
+			goto out_del_r1;
+		}
+
+		/* 80 MHz channels */
+		memset(&cal, 0, sizeof(cal));
+		memcpy(cal.chan_nums, ch_80, sizeof(ch_80));
+		cal.num_chans = sizeof(ch_80);
+		cal.chan_width = 2; /* CW_80 */
+		ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_CALIBRATE_REQ,
+				      WAVE600_MC_MAN_CALIBRATE_CFM,
+				      &cal, sizeof(cal), &cal, sizeof(cal), 30000);
+		if (ret) {
+			dev_warn(wdev->dev, "Radio 1 80 MHz CALIBRATE_REQ failed: %d\n", ret);
+			goto out_del_r1;
+		}
+
+		/* 160 MHz channels */
+		memset(&cal, 0, sizeof(cal));
+		memcpy(cal.chan_nums, ch_160, sizeof(ch_160));
+		cal.num_chans = sizeof(ch_160);
+		cal.chan_width = 3; /* CW_160 */
+		ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_CALIBRATE_REQ,
+				      WAVE600_MC_MAN_CALIBRATE_CFM,
+				      &cal, sizeof(cal), &cal, sizeof(cal), 30000);
+		if (ret) {
+			dev_warn(wdev->dev, "Radio 1 160 MHz CALIBRATE_REQ failed: %d\n", ret);
+			goto out_del_r1;
+		}
+
+out_del_r1:
+		ret = wave600_cal_dummy_vap_del(wdev);
+		if (ret)
+			dev_warn(wdev->dev, "Radio 1 dummy calibration REMOVE_VAP failed: %d\n", ret);
+	}
+
+	dev_info(wdev->dev, "Radio 1 RF channel calibration completed successfully\n");
+	wdev->radio_idx = 0;
 
 	return 0;
 }
