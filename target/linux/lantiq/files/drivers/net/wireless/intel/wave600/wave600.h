@@ -86,6 +86,7 @@ struct wave600_dev {
 	u64 mgmt_tx_cookie;
 	bool sta_connected;
 	u8 sta_mac[ETH_ALEN];
+	u16 sta_sid;
 
 	/* Persistent AP beacon template buffer (DMA-mapped for ARC MAC beaconing) */
 	void *beacon_buf;

@@ -119,6 +119,10 @@ struct wave600_umi_logger_set_severity {
 #define WAVE600_MC_MAN_STA_ADD_CFM           WAVE600_UMI_MSG_MAN_CFM(0x3B) /* 0x143B */
 #define WAVE600_UM_MAN_STA_REMOVE_REQ        WAVE600_UMI_MSG_MAN_REQ(0x3C) /* 0x043C */
 #define WAVE600_MC_MAN_STA_REMOVE_CFM        WAVE600_UMI_MSG_MAN_CFM(0x3C) /* 0x143C */
+#define WAVE600_UM_MAN_STOP_TRAFFIC_REQ       WAVE600_UMI_MSG_MAN_REQ(0x44) /* 0x0444 */
+#define WAVE600_MC_MAN_STOP_TRAFFIC_CFM       WAVE600_UMI_MSG_MAN_CFM(0x44) /* 0x1444 */
+#define WAVE600_UM_MAN_SET_802_1X_FILTER_REQ  WAVE600_UMI_MSG_MAN_REQ(0x46) /* 0x0446 */
+#define WAVE600_MC_MAN_SET_802_1X_FILTER_CFM  WAVE600_UMI_MSG_MAN_CFM(0x46) /* 0x1446 */
 #define WAVE600_UM_MAN_SET_BEACON_TEMPLATE_REQ  WAVE600_UMI_MSG_MAN_REQ(0x3D) /* 0x043D */
 #define WAVE600_MC_MAN_SET_BEACON_TEMPLATE_CFM  WAVE600_UMI_MSG_MAN_CFM(0x3D) /* 0x143D */
 
@@ -227,6 +231,21 @@ struct wave600_umi_sta_add {
 struct wave600_umi_sta_remove {
 	__le16 sid;
 	u8 status;
+	u8 reserved;
+} __packed;
+
+/* Vendor UMI_STOP_TRAFFIC (0x0444) */
+struct wave600_umi_stop_traffic {
+	__le16 sid;
+	u8 status;
+	u8 reserved;
+} __packed;
+
+/* Vendor UMI_802_1X_FILTER (0x0446) */
+struct wave600_umi_802_1x_filter {
+	__le16 status;
+	__le16 sid;
+	u8 is_filter_open;
 	u8 reserved;
 } __packed;
 
@@ -487,6 +506,10 @@ void wave600_ipc_cleanup(struct wave600_dev *wdev);
 int wave600_ipc_cmd(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
 		    const void *req_payload, size_t req_len,
 		    void *cfm_payload, size_t cfm_len, unsigned long timeout_ms);
+int wave600_ipc_cmd_vap(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
+			const void *req_payload, size_t req_len,
+			void *cfm_payload, size_t cfm_len, unsigned long timeout_ms,
+			u32 vap);
 /*
  * Blocking command over the DBG ring pair (vendor txdm manager,
  * _mtlk_mmb_send_fw_log_severity path). Same contract as
