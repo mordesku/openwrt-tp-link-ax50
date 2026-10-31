@@ -36,6 +36,10 @@ static int wave600_fw_copy_chunk(struct wave600_dev *wdev, u32 dst_offset,
 			mmiowb();
 			cond_resched();
 		}
+		if (size >= 262144 && (i & 0xffff) == 0 && i > 0) {
+			dev_info(wdev->dev, "IRAM staging progress: %zu / %zu bytes (%zu%%)\n",
+				 i * 4, size, (i * 4 * 100) / size);
+		}
 	}
 
 	if (size % 4) {
@@ -142,15 +146,21 @@ static void wave600_fw_init_chi(struct wave600_dev *wdev)
 	/* Zero out the entire CHI Vector Area in SHRAM */
 	memset_io(shram, 0, sizeof(struct wave600_chi_area));
 
-	/* Configure card extension (ID 12: Dual Band, Single PCI) */
+	/* Configure card extension (ID 12) per Rule 22 (native host format in SHRAM)
+	 * and vendor _mtlk_mmb_chi_init (verified in hybrid boot log:
+	 * "_wave_hw_dual_pci_mode_set: dual PCI mode OFF",
+	 * "_wave_hw_chi_area_write: id 12, data 0x01, 0x00, 0x00"):
+	 * band_cfg  = DUAL_BAND  (WAVE600_BAND_CFG_DUAL_BAND = 1)
+	 * pcie_cfg  = SINGLE_PCI (WAVE600_PCI_CFG_SINGLE_PCI = 0)
+	 * platform  = 0 (real ASIC) */
 	memset(&card_cfg, 0, sizeof(card_cfg));
-	card_cfg.header.magic = cpu_to_le32(WAVE600_HOST_EXTENSION_MAGIC);
-	card_cfg.header.id = cpu_to_le32(WAVE600_CHI_EXT_ID_CARD_CFG);
-	card_cfg.header.size = cpu_to_le32(sizeof(struct wave600_chi_card_cfg_data));
+	card_cfg.header.magic = WAVE600_HOST_EXTENSION_MAGIC;
+	card_cfg.header.id = WAVE600_CHI_EXT_ID_CARD_CFG;
+	card_cfg.header.size = sizeof(struct wave600_chi_card_cfg_data);
 
-	card_cfg.data.band_cfg = cpu_to_le32(WAVE600_BAND_CFG_DUAL_BAND);
-	card_cfg.data.pcie_cfg = cpu_to_le32(WAVE600_PCI_CFG_SINGLE_PCI);
-	card_cfg.data.platform_type = cpu_to_le32(0);
+	card_cfg.data.band_cfg = WAVE600_BAND_CFG_DUAL_BAND;
+	card_cfg.data.pcie_cfg = WAVE600_PCI_CFG_SINGLE_PCI;
+	card_cfg.data.platform_type = 0;
 
 	memcpy_toio(shram + offset, &card_cfg, sizeof(card_cfg));
 }
@@ -191,11 +201,11 @@ int wave600_fw_load_and_boot(struct wave600_dev *wdev)
 {
 	int ret;
 
-	/* Ensure ARC CPUs are in reset (do not pulse whole-chip soft reset) */
-	wave600_hw_put_cpus_to_reset(wdev);
-
-	/* Power on MAC GenRISC clocks */
-	wave600_hw_power_on_cpus(wdev);
+	/*
+	 * ARC CPUs were already placed into reset at 40 MHz XO during wave600_hw_reset(),
+	 * and MAC GenRISC QManager clocks were powered on in wave600_hw_init().
+	 * Do NOT touch CPU reset registers at 640 MHz before staging firmware (matching vendor 1:1).
+	 */
 
 	/* Initialize Shared RAM CHI vector area */
 	wave600_fw_init_chi(wdev);

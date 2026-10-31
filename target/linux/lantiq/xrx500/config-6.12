@@ -33,6 +33,9 @@ CONFIG_BCH=y
 CONFIG_SERIAL_LANTIQ=y
 CONFIG_SERIAL_LANTIQ_CONSOLE=y
 CONFIG_DEVTMPFS=y
+# /dev/mem for RAM-image diagnostics: BusyBox devmem reads of PCIe BAR0 MMIO
+# (WAV654 env registers, SHRAM). Disabled by OpenWrt default (KERNEL_DEVMEM=n).
+CONFIG_DEVMEM=y
 CONFIG_MTD_CMDLINE_PARTS=y
 CONFIG_MTD_OF_PARTS=y
 CONFIG_MTD_UBI=y

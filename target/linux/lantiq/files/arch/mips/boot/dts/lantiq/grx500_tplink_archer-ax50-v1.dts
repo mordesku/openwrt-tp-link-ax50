@@ -348,8 +348,17 @@
 	reset-gpio = <&gpio1 11 GPIO_ACTIVE_LOW>;
 	lantiq,rst-high-active = <0>;
 	lantiq,rst-interval = <200>;
+	/*
+	 * RCU_AHB_ENDIAN bit numbers per PCIe port, identical to the vendor
+	 * GRX500 SoC dtsi (xrx500.dtsi): pcie0 uses bits 5 (inbound) and 4
+	 * (outbound). The swap enables below set/clear exactly these bits;
+	 * without the shifts the driver would touch bit 0, which belongs to
+	 * a different subsystem and leaves PCIe inbound traffic unconfigured.
+	 */
 	lantiq,inbound-swap = <1>;
+	lantiq,inbound-shift = <5>;
 	lantiq,outbound-swap = <0>;
+	lantiq,outbound-shift = <4>;
 	status = "okay";
 };
 
@@ -357,8 +366,11 @@
 	reset-gpio = <&gpio1 29 GPIO_ACTIVE_LOW>;
 	lantiq,rst-high-active = <0>;
 	lantiq,rst-interval = <200>;
+	/* vendor GRX500 pcie1: bits 9 (inbound) / 8 (outbound) */
 	lantiq,inbound-swap = <1>;
+	lantiq,inbound-shift = <9>;
 	lantiq,outbound-swap = <0>;
+	lantiq,outbound-shift = <8>;
 	status = "okay";
 };
 
