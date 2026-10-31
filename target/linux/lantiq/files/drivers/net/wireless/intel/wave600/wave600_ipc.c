@@ -9,6 +9,7 @@
 #include <linux/pci.h>
 #include <linux/interrupt.h>
 #include <linux/slab.h>
+#include <net/cfg80211.h>
 #include "wave600.h"
 #include "wave600_regs.h"
 #include "wave600_chi.h"
@@ -314,6 +315,25 @@ static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 						le32_to_cpu(ev->group_id),
 						le32_to_cpu(ev->origin_id),
 						le32_to_cpu(ev->fw_interface));
+				}
+			} else if (le16_to_cpu(ind_hdr->msg_id) == WAVE600_MC_MAN_CLASS3_ERROR_IND) {
+				size_t plen = bounce_len - sizeof(*ind_hdr);
+
+				if (plen >= sizeof(struct wave600_umi_class3_error)) {
+					const struct wave600_umi_class3_error *err =
+						(const void *)(bounce + sizeof(*ind_hdr));
+					int i;
+
+					for (i = 0; i < min_t(u8, err->num_entries, 8); i++) {
+						dev_warn_ratelimited(wdev->dev,
+							"Class 3 Error: vap=%u addr=%pM\n",
+							err->entries[i].vap_id,
+							err->entries[i].addr);
+						if (wdev->ndev)
+							cfg80211_rx_spurious_frame(wdev->ndev,
+										   err->entries[i].addr,
+										   GFP_ATOMIC);
+					}
 				}
 			}
 
