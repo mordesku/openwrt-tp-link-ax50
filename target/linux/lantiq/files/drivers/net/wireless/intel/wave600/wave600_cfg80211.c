@@ -1330,26 +1330,6 @@ static int wave600_cfg80211_change_station(struct wiphy *wiphy,
 	dev_info(wdev->dev, "cfg80211: change station %pM (aid %u, flags_set=0x%x)\n",
 		 mac, params ? params->aid : 0, params ? params->sta_flags_set : 0);
 
-	/* When station is authorized, open the 802.1X filter in ARC firmware to allow data packets */
-	if (params && (params->sta_flags_set & BIT(NL80211_STA_FLAG_AUTHORIZED))) {
-		struct wave600_umi_802_1x_filter req;
-		struct wave600_umi_802_1x_filter cfm;
-		int ret;
-
-		memset(&req, 0, sizeof(req));
-		req.sid = cpu_to_le16(wdev->sta_sid ? wdev->sta_sid : 1);
-		req.is_filter_open = 1;
-
-		ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_SET_802_1X_FILTER_REQ,
-				      WAVE600_MC_MAN_SET_802_1X_FILTER_CFM,
-				      &req, sizeof(req), &cfm, sizeof(cfm), 2000);
-		if (ret)
-			dev_warn(wdev->dev, "SET_802_1X_FILTER failed: %d\n", ret);
-		else
-			dev_info(wdev->dev, "802.1X filter opened for %pM (sid %u)\n",
-				 mac, wdev->sta_sid ? wdev->sta_sid : 1);
-	}
-
 	return 0;
 }
 
