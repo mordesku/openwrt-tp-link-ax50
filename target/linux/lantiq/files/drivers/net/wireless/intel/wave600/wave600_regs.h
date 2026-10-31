@@ -75,6 +75,16 @@
  */
 #define WAVE600_SOC_SOFT_RESET          (WAVE600_SOC_REGS_BASE + 0x04)
 #define WAVE600_SOC_SOFT_RESET_WLAN     BIT(0)  /* WLAN software reset strobe request (active low) */
+/*
+ * RCU_BOOT (vendor SocRegsRegs.h REG_SOC_REGS_RCU_BOOT = SOC_REGS_BASE + 0xC):
+ * bits 8..9 hold the MSPS status strap; 0x00 means the board is wired in
+ * DUAL PCI mode (vendor mtlk_ccr_pcieg6.c MSPS_STATUS_MODE_DUAL_PCI,
+ * wave_pcieg6_is_mode_dual_pci).
+ */
+#define WAVE600_SOC_RCU_BOOT            (WAVE600_SOC_REGS_BASE + 0x0C)
+#define WAVE600_RCU_BOOT_MSPS_MASK      0x00000300
+#define WAVE600_RCU_BOOT_MSPS_SHIFT     8
+#define WAVE600_MSPS_MODE_DUAL_PCI      0x0
 #define WAVE600_SOC_PCIE_INTR_VEC       (WAVE600_SOC_REGS_BASE + 0x48)
 #define WAVE600_SOC_PCIE_MSI_ENABLE     (WAVE600_SOC_REGS_BASE + 0x4C)
 #define WAVE600_SOC_PCIE_LEGACY_INT_ENA (WAVE600_SOC_REGS_BASE + 0x50)
@@ -97,6 +107,12 @@
 #define WAVE600_SOC_EFUSE_CONTROL       (WAVE600_SOC_REGS_BASE + 0x78)
 #define WAVE600_SOC_EFUSE_STATUS        (WAVE600_SOC_REGS_BASE + 0x7C)
 #define WAVE600_SOC_EFUSE_TIMER_CONFIG1 (WAVE600_SOC_REGS_BASE + 0x80)
+#define WAVE600_SOC_EFUSE_TIMER_CONFIG2 (WAVE600_SOC_REGS_BASE + 0x84)
+#define WAVE600_SOC_EFUSE_PCIE_FSM_OVR  (WAVE600_SOC_REGS_BASE + 0x88)
+#define WAVE600_SOC_EFUSE_PD            (WAVE600_SOC_REGS_BASE + 0x8C)
+
+#define WAVE600_EFUSE_STATUS_BUSY       BIT(0)
+#define WAVE600_EFUSE_STATUS_INIT_DONE  BIT(1)
 
 /*
  * Upper MAC Environment Registers (SYS_IF_UM)
@@ -125,6 +141,14 @@
 #define WAVE600_PLL_EN_WLAN_CLK_PDN     BIT(1)  /* WLAN Clock Power Down */
 
 /*
+ * PLL Clock Divider Register Bits (SYS_IF_PLL_DIV)
+ * Bits 2..3: WLAN_CLK_DIV_D2A (0 = /1 for 640 MHz, 1 = /2 for 320 MHz, 2 = /4 for 160 MHz)
+ * Bits 8..9: SSI_CLK_DIV_D2A (SSI bus clock divider, reset value 1)
+ */
+#define WAVE600_PLL_DIV_WLAN_CLK_DIV_MASK (0x3 << 2)
+#define WAVE600_PLL_DIV_WLAN_CLK_DIV_640M (0x0 << 2)
+
+/*
  * PLL Lock Status (SYS_IF_PLL_LOCK)
  */
 #define WAVE600_PLL_LOCK_LOCKED         BIT(0)
@@ -151,6 +175,7 @@
 #define WAVE600_MAC_GEN_PHI_IRQ_CLEAR   (WAVE600_MAC_GEN_BASE + 0xBC)
 #define WAVE600_MAC_GEN_NPU2UPI_SET     (WAVE600_MAC_GEN_BASE + 0xC8) /* Doorbell to FW */
 #define WAVE600_MAC_GEN_NPU2UPI_CLEAR   (WAVE600_MAC_GEN_BASE + 0xCC)
+#define WAVE600_MAC_GEN_SPARE_CONFIG_D2A (WAVE600_MAC_GEN_BASE + 0x178)
 #define WAVE600_MAC_GEN_PHY_BAND_CONFIG (WAVE600_MAC_GEN_BASE + 0x1FC)
 
 /*
@@ -167,6 +192,14 @@
 /*
  * Secure Write Magic Sequence
  * Must be written to SECURE_WRITE prior to updating MIPS_CTL, CLOCK_SELECT, or CPU_ENABLE.
+ *
+ * Hardware-verified (2026-10-31, live devmem A/B tests on PLL_DIV): the secure
+ * latch accepts ONLY these keys in the low half of the raw BE word (the
+ * secureWrite field is bits [15:0] per EmeraldEnvRegs.h). Byte-swapped
+ * variants (0xAAAA0000/0x55550000) are rejected and gate off every secured
+ * register write (PLL_CTL/PLL_EN RMW, MIPS_CTL, CLOCK_SELECT), which is what
+ * broke LCPLL re-lock in the 2026-10-31 test build. See
+ * docs/wave600-boot-mode-root-cause.md.
  */
 #define WAVE600_SECURE_KEY1             0xAAAA
 #define WAVE600_SECURE_KEY2             0x5555
@@ -175,6 +208,11 @@
  * ARC CPU Reset State Values (MIPS_CTL 0x74) for Wave600 Gen 6 (WAV654)
  * Bit 0: RELEASE_FROM_RESET / RUN (0x01)
  * Bit 1: MIPS_RESET (0x02)
+ *
+ * Vendor mtlk_ccr_pcieg6.c uses the same constants through a raw-transparent
+ * path; the 2026-10-31 live experiments proved our __raw path delivers them
+ * identically (secure latch keys land numerically, low half). Do NOT byte-swap
+ * these values - see docs/wave600-boot-mode-root-cause.md (REFUTED section).
  */
 #define WAVE600_MIPS_RESET              0x02 /* Gen 6 MIPS CPU in reset */
 #define WAVE600_MIPS_RELEASE            0x01 /* Gen 6 MIPS CPU released from reset / running */

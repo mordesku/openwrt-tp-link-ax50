@@ -12,6 +12,7 @@
 #define WAVE600_HOST_EXTENSION_MAGIC        0xBEADFEED
 
 #define WAVE600_CHI_EXT_ID_CARD_CFG         12
+#define WAVE600_CHI_EXT_ID_STATS_MANAGER    7
 
 /* Band configuration */
 #define WAVE600_BAND_CFG_SINGLE_BAND        0
