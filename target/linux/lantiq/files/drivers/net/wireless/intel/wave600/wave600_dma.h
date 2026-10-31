@@ -125,6 +125,8 @@ struct wave600_dma {
 	/* TX bookkeeping: one mirror per ring slot */
 	spinlock_t tx_lock;
 	struct sk_buff *tx_skbs[WAVE600_DMA_RING_SIZE];
+	dma_addr_t tx_dma[WAVE600_DMA_RING_SIZE];
+	u32 tx_len[WAVE600_DMA_RING_SIZE];
 	u32 tx_write;
 	u32 tx_in_use;
 

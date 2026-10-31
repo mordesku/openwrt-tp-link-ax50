@@ -246,6 +246,7 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 
 	while (processed < hds) {
 		struct wave600_host_dsc *hd = &r->descs[r->read_ptr];
+		struct wave600_host_dsc recycle_hd;
 		struct wave600_dma_buf *buf;
 		struct sk_buff *skb;
 		u32 info3, offset, len, total, bd;
@@ -255,19 +256,26 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 		 * are little-endian on the wire per vendor _mtlk_hw_send_data /
 		 * _mtlk_mmb_put_hd_to_ring). */
 		info3 = le32_to_cpu(hd->info3);
-		while ((info3 & W600_TX_OWN) == W600_OWN_FW) {
+		while (FIELD_GET(W600_TX_OWN, info3) == W600_OWN_FW) {
 			if (--iters == 0) {
-				dev_err(wdev->dev,
-					"RX HD own bit stuck (ptr %u)\n", r->read_ptr);
-				goto out;
+				dev_err_ratelimited(wdev->dev,
+					"RX HD own bit stuck (ptr %u, info3=0x%08x)\n",
+					r->read_ptr, info3);
+				r->read_ptr = (r->read_ptr + 1) % r->size;
+				processed++;
+				break;
 			}
 			info3 = le32_to_cpu(hd->info3);
 		}
+		if (iters == 0)
+			continue;
 
 		bd = FIELD_GET(W600_TX_BD_INDEX, le32_to_cpu(hd->bd_index));
 		if (bd >= dma->rd_pool_num) {
 			dev_err(wdev->dev, "RX HD bad bd index %u\n", bd);
-			goto skip;
+			r->read_ptr = (r->read_ptr + 1) % r->size;
+			processed++;
+			continue;
 		}
 
 		buf = &dma->rx_bufs[bd];
@@ -277,60 +285,58 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 		len = FIELD_GET(W600_TX_LENGTH, info3);
 		total = offset + len;
 
-		if (total > buf->size) {
-			dev_err(wdev->dev, "RX frame %u > buffer %u (bd %u)\n",
-				total, buf->size, bd);
-			goto skip;
+		if (total > buf->size || len < ETH_HLEN) {
+			dev_dbg(wdev->dev, "RX frame invalid (len %u, offset %u, bd %u)\n",
+				len, offset, bd);
+			goto recycle_reuse;
 		}
 
-		dma_unmap_single(wdev->dev, buf->dma, buf->size, DMA_FROM_DEVICE);
+		dma_sync_single_for_cpu(wdev->dev, buf->dma, buf->size,
+					DMA_FROM_DEVICE);
 
-		skb = buf->skb;
-		skb_put(skb, total);
-		skb_pull(skb, offset);
+		/*
+		 * Allocate an aligned skb via napi_alloc_skb().
+		 * On MIPS, napi_alloc_skb() automatically reserves NET_SKB_PAD +
+		 * NET_IP_ALIGN (2 bytes). When the 14-byte Ethernet header is
+		 * pulled by eth_type_trans(), the resulting L3 header is at
+		 * offset 16 (4-byte aligned), preventing fatal MIPS ADEL exceptions.
+		 * (Canon pattern from grx500-datapath.c:1445-1463).
+		 */
+		skb = napi_alloc_skb(&dma->napi, len);
+		if (unlikely(!skb)) {
+			dma->ndev->stats.rx_dropped++;
+			dma_sync_single_for_device(wdev->dev, buf->dma,
+						   buf->size, DMA_FROM_DEVICE);
+			goto recycle_reuse;
+		}
+
+		skb_put_data(skb, buf->skb->data + offset, len);
+		dma_sync_single_for_device(wdev->dev, buf->dma, buf->size,
+					   DMA_FROM_DEVICE);
+
 		skb->protocol = eth_type_trans(skb, dma->ndev);
 		skb->ip_summed = CHECKSUM_NONE;
 
 		napi_gro_receive(&dma->napi, skb);
 		dma->rx_packets++;
+		dma->ndev->stats.rx_packets++;
+		dma->ndev->stats.rx_bytes += len;
+
+recycle_reuse:
+		recycle_hd = *hd;
+		recycle_hd.info3 = cpu_to_le32((le32_to_cpu(recycle_hd.info3) & ~W600_TX_OWN) |
+					       W600_OWN_FW);
+		wave600_dma_ring_push(dma, r, &recycle_hd);
 		processed++;
-
-		/* Recycle: new skb into the same pool slot, re-post the HD */
-		skb = netdev_alloc_skb(dma->ndev, buf->size);
-		if (!skb) {
-			dev_err(wdev->dev, "RX recycle alloc failed (bd %u)\n", bd);
-			/* Leave the slot dead; FW will not use it again until
-			 * a new HD with a valid address is posted. */
-			goto skip;
-		}
-		buf->skb = skb;
-		buf->dma = dma_map_single(wdev->dev, skb->data, buf->size,
-					  DMA_FROM_DEVICE);
-		if (dma_mapping_error(wdev->dev, buf->dma)) {
-			dev_kfree_skb_any(skb);
-			buf->skb = NULL;
-			goto skip;
-		}
-
-		hd->payload_addr = cpu_to_le32((u32)buf->dma);
-		hd->info3 = cpu_to_le32(FIELD_PREP(W600_TX_SOP_EOP, W600_NO_FRAG) |
-					FIELD_PREP(W600_TX_OFFSET, buf->dma & 7) |
-					FIELD_PREP(W600_TX_LENGTH, buf->size) |
-					W600_OWN_FW);
-		hd->info0 = 0;
-		hd->info1 = 0;
-		hd->bd_index = cpu_to_le32(FIELD_PREP(W600_TX_BD_INDEX, bd));
-		wave600_dma_ring_push(dma, r, hd);
-skip:
 		r->read_ptr = (r->read_ptr + 1) % r->size;
 	}
-out:
 	ring_clear_interrupt(r, processed);
 	return processed;
 }
 
 static int wave600_dma_tx_clean(struct wave600_dma *dma, int budget)
 {
+	struct wave600_dev *wdev = dma->wdev;
 	struct wave600_dma_ring *r = &dma->tx;
 	u32 processed = 0;
 	u32 hds;
@@ -348,9 +354,13 @@ static int wave600_dma_tx_clean(struct wave600_dma *dma, int budget)
 
 		if (bd < WAVE600_DMA_RING_SIZE && dma->tx_skbs[bd]) {
 			spin_lock_irqsave(&dma->tx_lock, flags);
-			dev_kfree_skb_any(dma->tx_skbs[bd]);
-			dma->tx_skbs[bd] = NULL;
-			dma->tx_in_use--;
+			if (dma->tx_skbs[bd]) {
+				dma_unmap_single(wdev->dev, dma->tx_dma[bd],
+						 dma->tx_len[bd], DMA_TO_DEVICE);
+				dev_kfree_skb_any(dma->tx_skbs[bd]);
+				dma->tx_skbs[bd] = NULL;
+				dma->tx_in_use--;
+			}
 			spin_unlock_irqrestore(&dma->tx_lock, flags);
 		}
 		dma->tx_done++;
@@ -391,15 +401,19 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 		int iters = W600_OWN_POLL_ITERS;
 
 		info3 = le32_to_cpu(hd->info3);
-		while ((info3 & W600_TX_OWN) == W600_OWN_FW) {
+		while (FIELD_GET(W600_TX_OWN, info3) == W600_OWN_FW) {
 			if (--iters == 0) {
-				dev_err(wdev->dev,
-					"Mgmt RX HD own bit stuck (ptr %u)\n",
-					r->read_ptr);
-				goto out;
+				dev_err_ratelimited(wdev->dev,
+					"Mgmt RX HD own bit stuck (ptr %u, info3=0x%08x)\n",
+					r->read_ptr, info3);
+				r->read_ptr = (r->read_ptr + 1) % r->size;
+				processed++;
+				break;
 			}
 			info3 = le32_to_cpu(hd->info3);
 		}
+		if (iters == 0)
+			continue;
 
 		bd = FIELD_GET(W600_TX_BD_INDEX, le32_to_cpu(hd->bd_index));
 		offset = FIELD_GET(W600_TX_OFFSET, info3);
@@ -432,7 +446,6 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 		wave600_dma_ring_push(dma, r, &recycle_hd);
 		processed++;
 	}
-out:
 	if (processed > 0)
 		ring_clear_interrupt(r, processed);
 	return processed;
@@ -584,6 +597,8 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		goto drop_unmap;
 	}
 	dma->tx_skbs[bd] = skb;
+	dma->tx_dma[bd] = dma_addr;
+	dma->tx_len[bd] = skb->len;
 	dma->tx_write = (dma->tx_write + 1) % WAVE600_DMA_RING_SIZE;
 	dma->tx_in_use++;
 	spin_unlock_irqrestore(&dma->tx_lock, flags);
