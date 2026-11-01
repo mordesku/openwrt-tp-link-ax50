@@ -73,6 +73,7 @@ struct wave600_radio {
 
 	/* Station tracking */
 	bool sta_connected;
+	bool is_secure;
 	u8 sta_mac[ETH_ALEN];
 	u16 sta_sid;
 

@@ -406,7 +406,7 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 	while (processed < hds) {
 		struct wave600_host_dsc *hd = &r->descs[r->read_ptr];
 		struct wave600_host_dsc recycle_hd;
-		u32 info3, offset, len, bd;
+		u32 info3, offset, len;
 		int iters = W600_OWN_POLL_ITERS;
 
 		info3 = le32_to_cpu(hd->info3);
@@ -424,33 +424,54 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 		if (iters == 0)
 			continue;
 
-		bd = FIELD_GET(W600_TX_BD_INDEX, le32_to_cpu(hd->bd_index));
 		offset = FIELD_GET(W600_TX_OFFSET, info3);
-		offset += (0x08 & le32_to_cpu(hd->payload_addr));
 		len = FIELD_GET(W600_TX_LENGTH, info3);
 
-		if (bd < dma->rd_mgmt_num && dma->mgmt_bufs && dma->mgmt_bufs[bd].skb) {
-			struct wave600_dma_buf *buf = &dma->mgmt_bufs[bd];
+		if (hd->payload_addr && len > 0 && offset + len <= WAVE600_DMA_MGMT_BUF_SIZE) {
+			u32 payload_addr = le32_to_cpu(hd->payload_addr);
+			u8 *data = (u8 *)phys_to_virt(payload_addr + offset);
+			struct ethhdr *eth = (struct ethhdr *)data;
+			u32 info0 = le32_to_cpu(hd->info0);
+			u32 info1 = le32_to_cpu(hd->info1);
+			u8 frame_type = FIELD_GET(W600_TX_FRAMETYPE, info0);
+			u8 type = FIELD_GET(GENMASK(25, 24), info0);
+			u8 ep = FIELD_GET(W600_TX_EP, info1);
+			u8 radio_idx = (ep ^ 1) & 1;
+			struct wave600_radio *radio = (radio_idx < 2) ? &wdev->radios[radio_idx] : NULL;
+			int freq = (radio && radio->ap_freq) ? radio->ap_freq :
+				   ((radio_idx == 1) ? 5180 : 2437);
+			bool is_eapol;
 
-			if (len > 0 && offset + len <= buf->size) {
-				u8 *data = buf->skb->data + offset;
-				u32 info1 = le32_to_cpu(hd->info1);
-				u8 ep = FIELD_GET(W600_TX_EP, info1);
-				u8 radio_idx = (ep ^ 1) & 1;
-				struct wave600_radio *radio = (radio_idx < 2) ? &wdev->radios[radio_idx] : NULL;
-				int freq = (radio && radio->ap_freq) ? radio->ap_freq :
-					   ((radio_idx == 1) ? 5180 : 2437);
+			dma_sync_single_for_cpu(wdev->dev, (dma_addr_t)payload_addr,
+						offset + len, DMA_FROM_DEVICE);
 
-				dma_sync_single_for_cpu(wdev->dev, buf->dma,
-							buf->size, DMA_FROM_DEVICE);
+			is_eapol = (frame_type == W600_FRAME_TYPE_EAPOL && type == 2) ||
+				   (len >= ETH_HLEN && eth->h_proto == htons(ETH_P_PAE));
 
-				if (radio && radio->ap_started && radio->wdev_net)
-					cfg80211_rx_mgmt(radio->wdev_net, freq, 0,
-							 data, len, 0);
+			if (is_eapol && radio && radio->ndev) {
+				struct sk_buff *rskb = napi_alloc_skb(&dma->napi, len);
 
-				dma_sync_single_for_device(wdev->dev, buf->dma,
-							   buf->size, DMA_FROM_DEVICE);
+				dev_info_ratelimited(wdev->dev,
+						     "Radio %u RX EAPOL frame len=%u src=%pM dst=%pM proto=0x%04x\n",
+						     radio->radio_idx, len, eth->h_source, eth->h_dest,
+						     ntohs(eth->h_proto));
+				print_hex_dump(KERN_INFO, "rx-eapol: ", DUMP_PREFIX_OFFSET,
+					       16, 1, data, min_t(u32, len, 64), false);
+				if (rskb) {
+					skb_put_data(rskb, data, len);
+					rskb->protocol = eth_type_trans(rskb, radio->ndev);
+					rskb->ip_summed = CHECKSUM_NONE;
+					napi_gro_receive(&dma->napi, rskb);
+					radio->ndev->stats.rx_packets++;
+					radio->ndev->stats.rx_bytes += len;
+				}
+			} else if (radio && radio->ap_started && radio->wdev_net) {
+				cfg80211_rx_mgmt(radio->wdev_net, freq, 0,
+						 data, len, 0);
 			}
+
+			dma_sync_single_for_device(wdev->dev, (dma_addr_t)payload_addr,
+						   offset + len, DMA_FROM_DEVICE);
 		}
 
 		recycle_hd = *hd;
@@ -545,6 +566,65 @@ int wave600_dma_mgmt_tx(struct wave600_radio *radio, const u8 *buf, size_t len)
 	return 0;
 }
 
+int wave600_dma_mgmt_tx_eapol(struct wave600_radio *radio, const u8 *buf, size_t len)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_dma *dma = &wdev->dma;
+	struct wave600_dma_ring *r = &dma->mgmt_tx;
+	struct wave600_host_dsc hd;
+	u32 slot_idx, info0_val;
+	dma_addr_t slot_dma;
+	void *slot_va;
+	const struct ethhdr *eth = (const struct ethhdr *)buf;
+
+	if (!dma->data_path_ready || !dma->mgmt_tx_pool || !radio->ap_started)
+		return -ENETDOWN;
+
+	if (len > WAVE600_DMA_MGMT_BUF_SIZE)
+		return -EMSGSIZE;
+
+	slot_idx = r->write_ptr;
+	slot_va = dma->mgmt_tx_pool + (slot_idx * WAVE600_DMA_MGMT_BUF_SIZE);
+	slot_dma = dma->mgmt_tx_pool_dma + (slot_idx * WAVE600_DMA_MGMT_BUF_SIZE);
+
+	memcpy(slot_va, buf, len);
+
+	/*
+	 * ARC FullMAC firmware EAPOL TX over Mgmt TX ring:
+	 * vendor hw_mmb.c:11011-11046 (PROCESS_EAPOL):
+	 * type = 2 (IEEE80211_FTYPE_DATA >> 2)
+	 * subtype = 8 (IEEE80211_STYPE_QOS_DATA >> 4)
+	 * frame_type = 3 (W600_FRAME_TYPE_EAPOL)
+	 * class = 15 (GEN6 max priority)
+	 * ep = radio->ep
+	 */
+	info0_val = FIELD_PREP(GENMASK(25, 24), 2) | /* TX_BSS_EXTRA_TYPE = DATA */
+		    FIELD_PREP(GENMASK(29, 26), 8) | /* TX_BSS_EXTRA_SUBTYPE = QOS_DATA */
+		    FIELD_PREP(W600_TX_FRAMETYPE, W600_FRAME_TYPE_EAPOL) |
+		    FIELD_PREP(W600_TX_VAPID, radio->vap_id);
+
+	if (radio->sta_connected && len >= ETH_HLEN &&
+	    ether_addr_equal(eth->h_dest, radio->sta_mac)) {
+		info0_val |= FIELD_PREP(W600_TX_STAID, radio->sta_sid);
+	} else {
+		info0_val |= W600_TX_UNKNOWN_SID;
+	}
+
+	memset(&hd, 0, sizeof(hd));
+	hd.info0 = cpu_to_le32(info0_val);
+	hd.info1 = cpu_to_le32(FIELD_PREP(W600_TX_CLASS, 15) |
+			       FIELD_PREP(W600_TX_EP, radio->ep));
+	hd.payload_addr = cpu_to_le32((u32)slot_dma);
+	hd.info3 = cpu_to_le32(FIELD_PREP(W600_TX_SOP_EOP, W600_NO_FRAG) |
+			       FIELD_PREP(W600_TX_OFFSET, 0) |
+			       FIELD_PREP(W600_TX_LENGTH, len) |
+			       W600_OWN_FW);
+	hd.bd_index = cpu_to_le32(FIELD_PREP(W600_TX_BD_INDEX, slot_idx));
+
+	wave600_dma_ring_push(dma, r, &hd);
+	return 0;
+}
+
 static int wave600_dma_poll(struct napi_struct *napi, int budget)
 {
 	struct wave600_dma *dma = container_of(napi, struct wave600_dma, napi);
@@ -607,6 +687,31 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	if (skb->len < ETH_HLEN)
 		goto drop;
+
+	/*
+	 * EAPOL frames (Ethertype 0x888E / ETH_P_PAE):
+	 * In WAV654 FullMAC firmware, when 802.1X filter is closed,
+	 * EAPOL frames MUST be dispatched over the Mgmt TX ring (sMangTxRING)
+	 * with FRAME_TYPE_EAPOL, rather than the data TX ring (vendor hw_mmb.c:11016).
+	 */
+	if (skb->protocol == htons(ETH_P_PAE) ||
+	    ((struct ethhdr *)skb->data)->h_proto == htons(ETH_P_PAE)) {
+		int ret;
+
+		dev_info_ratelimited(wdev->dev, "Radio %u TX EAPOL frame len=%u dst=%pM\n",
+				     radio->radio_idx, skb->len, ((struct ethhdr *)skb->data)->h_dest);
+		ret = wave600_dma_mgmt_tx_eapol(radio, skb->data, skb->len);
+		if (ret == 0) {
+			dma->tx_packets++;
+			ndev->stats.tx_packets++;
+			ndev->stats.tx_bytes += skb->len;
+		} else {
+			dma->tx_dropped++;
+			ndev->stats.tx_dropped++;
+		}
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
 
 	dma_addr = dma_map_single(wdev->dev, skb->data, skb->len,
 				  DMA_TO_DEVICE);
