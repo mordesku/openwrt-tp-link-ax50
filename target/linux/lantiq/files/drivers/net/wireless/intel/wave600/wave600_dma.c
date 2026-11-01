@@ -425,8 +425,12 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 
 			if (len > 0 && offset + len <= buf->size) {
 				u8 *data = buf->skb->data + offset;
-				int freq = wdev->ap_channel ?
-					(2412 + (wdev->ap_channel - 1) * 5) : 2437;
+				int freq;
+
+				if (wdev->ap_channel >= 36 || wdev->radio_idx == 1)
+					freq = wdev->ap_channel ? (5000 + wdev->ap_channel * 5) : 5180;
+				else
+					freq = wdev->ap_channel ? (2412 + (wdev->ap_channel - 1) * 5) : 2437;
 
 				dma_sync_single_for_cpu(wdev->dev, buf->dma,
 							buf->size, DMA_FROM_DEVICE);
@@ -508,10 +512,13 @@ int wave600_dma_mgmt_tx(struct wave600_dev *wdev, const u8 *buf, size_t len)
 	if (subtype == 0x0d && len > 24)
 		info0_val |= FIELD_PREP(GENMASK(23, 17), buf[24]);
 
-	if (mcf)
+	if (mcf) {
 		info0_val |= W600_TX_MCF;
-	else
+	} else if (wdev->sta_connected && len >= 10 && ether_addr_equal(buf + 4, wdev->sta_mac)) {
+		info0_val |= FIELD_PREP(W600_TX_STAID, wdev->sta_sid);
+	} else {
 		info0_val |= W600_TX_UNKNOWN_SID;
+	}
 
 	memset(&hd, 0, sizeof(hd));
 	hd.info0 = cpu_to_le32(info0_val);
@@ -618,7 +625,7 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	if (is_multicast_ether_addr(skb->data)) {
 		info0 |= W600_TX_MCF;
 	} else if (wdev->sta_connected && ether_addr_equal(skb->data, wdev->sta_mac)) {
-		info0 |= FIELD_PREP(W600_TX_STAID, wdev->sta_sid ? wdev->sta_sid : 1);
+		info0 |= FIELD_PREP(W600_TX_STAID, wdev->sta_sid);
 	} else {
 		info0 |= W600_TX_UNKNOWN_SID;
 	}
