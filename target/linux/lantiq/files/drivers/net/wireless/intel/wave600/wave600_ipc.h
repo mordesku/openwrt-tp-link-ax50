@@ -543,6 +543,10 @@ int wave600_ipc_cmd_vap(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
 			const void *req_payload, size_t req_len,
 			void *cfm_payload, size_t cfm_len, unsigned long timeout_ms,
 			u32 vap);
+int wave600_ipc_cmd_radio(struct wave600_dev *wdev, u8 radio_idx, u16 req_id, u16 cfm_id,
+			  const void *req_payload, size_t req_len,
+			  void *cfm_payload, size_t cfm_len, unsigned long timeout_ms,
+			  u32 vap);
 /*
  * Blocking command over the DBG ring pair (vendor txdm manager,
  * _mtlk_mmb_send_fw_log_severity path). Same contract as

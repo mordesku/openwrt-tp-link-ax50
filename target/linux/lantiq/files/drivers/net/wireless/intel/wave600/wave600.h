@@ -12,6 +12,8 @@
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
+#include <linux/netdevice.h>
+#include <net/cfg80211.h>
 #include "wave600_ipc.h"
 #include "wave600_dma.h"
 #include "wave600_chi.h"
@@ -53,6 +55,33 @@ struct wave600_efuse_afe {
 	bool valid;
 };
 
+struct wave600_radio {
+	struct wave600_dev *wdev;
+	u8 radio_idx;		/* 0 = 2.4 GHz, 1 = 5 GHz */
+	u8 ep;			/* 1 for Radio 0, 0 for Radio 1 */
+	u8 vap_id;		/* Local VAP index on this radio (0 for primary AP) */
+	u8 antenna_mask;	/* 0x05 for Radio 0, 0x0A for Radio 1 */
+
+	struct wiphy *wiphy;
+	struct net_device *ndev;
+	struct wireless_dev *wdev_net;
+	bool ap_started;
+	bool radio_enabled;
+	u16 ap_channel;
+	u32 ap_freq;
+	u64 mgmt_tx_cookie;
+
+	/* Station tracking */
+	bool sta_connected;
+	u8 sta_mac[ETH_ALEN];
+	u16 sta_sid;
+
+	/* Persistent AP beacon template buffer (DMA-mapped for ARC MAC beaconing) */
+	void *beacon_buf;
+	dma_addr_t beacon_dma;
+	size_t beacon_len;
+};
+
 struct wave600_dev {
 	struct pci_dev *pdev;
 	struct device *dev;
@@ -76,22 +105,8 @@ struct wave600_dev {
 	struct wave600_ipc ipc;
 	struct wave600_dma dma;
 
-	/* AP bring-up (Phase 8) */
-	struct wiphy *wiphy;
-	struct net_device *ndev;
-	struct wireless_dev *wdev_net;
-	bool ap_started;
-	u16 ap_channel;
-	u8 antenna_mask;
-	u64 mgmt_tx_cookie;
-	bool sta_connected;
-	u8 sta_mac[ETH_ALEN];
-	u16 sta_sid;
-
-	/* Persistent AP beacon template buffer (DMA-mapped for ARC MAC beaconing) */
-	void *beacon_buf;
-	dma_addr_t beacon_dma;
-	size_t beacon_len;
+	/* DBDC Radios: [0] = 2.4 GHz (wlan0), [1] = 5 GHz (wlan1) */
+	struct wave600_radio radios[2];
 
 	/* Calibration cache DMA memory */
 	void *cal_buf;
@@ -109,6 +124,18 @@ struct wave600_dev {
 	/* Delayed second FW state snapshot (diagnostic, 10 s after probe) */
 	struct delayed_work diag_work;
 };
+
+static inline struct wave600_radio *wave600_wiphy_to_radio(struct wiphy *wiphy)
+{
+	return *(struct wave600_radio **)wiphy_priv(wiphy);
+}
+
+static inline struct wave600_radio *wave600_ndev_to_radio(struct net_device *ndev)
+{
+	if (!ndev || !ndev->ieee80211_ptr || !ndev->ieee80211_ptr->wiphy)
+		return NULL;
+	return wave600_wiphy_to_radio(ndev->ieee80211_ptr->wiphy);
+}
 
 int wave600_cal_init(struct wave600_dev *wdev);
 void wave600_cal_cleanup(struct wave600_dev *wdev);

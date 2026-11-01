@@ -253,7 +253,7 @@ static int wave600_pci_probe(struct pci_dev *pdev, const struct pci_device_id *i
 		goto err_dma;
 	}
 
-	wave600_dma_attach(wdev, wdev->ndev);
+	wave600_dma_attach(wdev);
 
 	/*
 	 * RF bring-up (vendor radio bring-up after card finalize/READY):
