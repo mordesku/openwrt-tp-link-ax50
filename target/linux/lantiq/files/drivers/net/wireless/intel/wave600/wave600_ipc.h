@@ -125,8 +125,12 @@ struct wave600_umi_logger_set_severity {
 #define WAVE600_MC_MAN_REMOVE_SID_CFM         WAVE600_UMI_MSG_MAN_CFM(0x43) /* 0x1443 */
 #define WAVE600_UM_MAN_STOP_TRAFFIC_REQ       WAVE600_UMI_MSG_MAN_REQ(0x44) /* 0x0444 */
 #define WAVE600_MC_MAN_STOP_TRAFFIC_CFM       WAVE600_UMI_MSG_MAN_CFM(0x44) /* 0x1444 */
+#define WAVE600_UM_MAN_SET_DEFAULT_KEY_INDEX_REQ WAVE600_UMI_MSG_MAN_REQ(0x45) /* 0x0445 */
+#define WAVE600_MC_MAN_SET_DEFAULT_KEY_INDEX_CFM WAVE600_UMI_MSG_MAN_CFM(0x45) /* 0x1445 */
 #define WAVE600_UM_MAN_SET_802_1X_FILTER_REQ  WAVE600_UMI_MSG_MAN_REQ(0x46) /* 0x0446 */
 #define WAVE600_MC_MAN_SET_802_1X_FILTER_CFM  WAVE600_UMI_MSG_MAN_CFM(0x46) /* 0x1446 */
+#define WAVE600_UM_MAN_SET_KEY_REQ            WAVE600_UMI_MSG_MAN_REQ(0x05) /* 0x0405 */
+#define WAVE600_MC_MAN_SET_KEY_CFM            WAVE600_UMI_MSG_MAN_CFM(0x05) /* 0x1405 */
 #define WAVE600_UM_MAN_SET_BEACON_TEMPLATE_REQ  WAVE600_UMI_MSG_MAN_REQ(0x3D) /* 0x043D */
 #define WAVE600_MC_MAN_SET_BEACON_TEMPLATE_CFM  WAVE600_UMI_MSG_MAN_CFM(0x3D) /* 0x143D */
 
@@ -253,6 +257,47 @@ struct wave600_umi_802_1x_filter {
 	__le16 sid;
 	u8 is_filter_open;
 	u8 reserved;
+} __packed;
+
+#define WAVE600_UMI_RSN_SEQ_NUM_LEN 8 /* 6 bytes seq num + 2 bytes pad */
+#define WAVE600_UMI_RSN_TK_LEN      32 /* 16 bytes TK1 + 16 bytes TK2 */
+
+/* RSN Key types (vendor umi_rsn.h) */
+#define WAVE600_UMI_RSN_PAIRWISE_KEY    0
+#define WAVE600_UMI_RSN_GROUP_KEY       1
+#define WAVE600_UMI_RSN_MGMT_GROUP_KEY  2
+
+/* RSN Cipher Suite selectors (vendor umi_rsn.h) */
+#define WAVE600_UMI_CIPHER_SUITE_TKIP    0
+#define WAVE600_UMI_CIPHER_SUITE_WEP40   1
+#define WAVE600_UMI_CIPHER_SUITE_CCMP    2
+#define WAVE600_UMI_CIPHER_SUITE_WAPI    3
+#define WAVE600_UMI_CIPHER_SUITE_BIP     4
+#define WAVE600_UMI_CIPHER_SUITE_WEP104  5
+#define WAVE600_UMI_CIPHER_SUITE_GCMP128 6
+#define WAVE600_UMI_CIPHER_SUITE_GCMP256 7
+#define WAVE600_UMI_CIPHER_SUITE_NONE    8
+
+#define WAVE600_BCAST_DEST_SID           0x3FFA
+
+/* Vendor UMI_SET_KEY (0x0405) */
+struct wave600_umi_set_key {
+	__le16 status;
+	__le16 sid;
+	__le16 key_type;
+	__le16 cipher_suite;
+	__le16 key_index;
+	u8 rx_seq_num[WAVE600_UMI_RSN_SEQ_NUM_LEN];
+	u8 tx_seq_num[WAVE600_UMI_RSN_SEQ_NUM_LEN];
+	u8 tk[WAVE600_UMI_RSN_TK_LEN];
+} __packed;
+
+/* Vendor UMI_DEFAULT_KEY_INDEX (0x0445) */
+struct wave600_umi_default_key_index {
+	__le16 status;
+	__le16 sid;
+	__le16 key_type;
+	__le16 key_index;
 } __packed;
 
 /* Vendor UMI_REQUEST_SID (0x0442) */

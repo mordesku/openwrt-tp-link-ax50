@@ -1156,6 +1156,8 @@ static int wave600_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *ndev
 
 	radio->ap_started = false;
 	radio->sta_connected = false;
+	radio->sta_sid = 0;
+	radio->is_secure = false;
 	eth_zero_addr(radio->sta_mac);
 	return 0;
 }
@@ -1416,8 +1418,12 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 	req.rates_len = rates_len;
 	memcpy(req.rates, rates, rates_len);
 
-	/* Flags: STA_ADD_FLAGS_IS_8021X_FILTER_OPEN (0x04) | STA_ADD_FLAGS_WME (0x02) */
-	req.flags = 0x06;
+	/*
+	 * Flags:
+	 * In open AP mode: STA_ADD_FLAGS_IS_8021X_FILTER_OPEN (0x04) | STA_ADD_FLAGS_WME (0x02) = 0x06.
+	 * In WPA/WPA2 mode: STA_ADD_FLAGS_WME (0x02) only. Port is closed until PTK handshake completes.
+	 */
+	req.flags = radio->is_secure ? 0x02 : 0x06;
 
 	/* If client has HT capabilities, copy HT parameters and set STA_ADD_FLAGS_IS_HT (0x10) */
 	if (params && params->link_sta_params.ht_capa) {
@@ -1466,9 +1472,38 @@ static int wave600_cfg80211_change_station(struct wiphy *wiphy,
 					   struct station_parameters *params)
 {
 	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	struct wave600_dev *wdev = radio->wdev;
 
-	dev_info(radio->wdev->dev, "Radio %u cfg80211: change station %pM (aid %u, flags_set=0x%x)\n",
+	dev_info(wdev->dev, "Radio %u cfg80211: change station %pM (aid %u, flags_set=0x%x)\n",
 		 radio->radio_idx, mac, params ? params->aid : 0, params ? params->sta_flags_set : 0);
+
+	/*
+	 * When station completes 4-way handshake, hostapd authorizes the station:
+	 * Open the 802.1X filter via UM_MAN_SET_802_1X_FILTER_REQ (0x0446).
+	 * Vendor core.c:9674-9690 _mtlk_send_filter_req.
+	 */
+	if (params && (params->sta_flags_set & BIT(NL80211_STA_FLAG_AUTHORIZED)) && radio->is_secure) {
+		struct wave600_umi_802_1x_filter req;
+		struct wave600_umi_802_1x_filter cfm;
+		int ret;
+
+		memset(&req, 0, sizeof(req));
+		req.sid = cpu_to_le16(radio->sta_sid);
+		req.is_filter_open = 1;
+
+		ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+					    WAVE600_UM_MAN_SET_802_1X_FILTER_REQ,
+					    WAVE600_MC_MAN_SET_802_1X_FILTER_CFM,
+					    &req, sizeof(req),
+					    &cfm, sizeof(cfm), 2000,
+					    radio->vap_id);
+		if (ret)
+			dev_warn(wdev->dev, "Radio %u SET_802_1X_FILTER IPC failed: %d\n",
+				 radio->radio_idx, ret);
+		else
+			dev_info(wdev->dev, "Radio %u SET_802_1X_FILTER %pM (sid %u) OPENED\n",
+				 radio->radio_idx, mac, radio->sta_sid);
+	}
 
 	return 0;
 }
@@ -1544,6 +1579,148 @@ static int wave600_cfg80211_get_station(struct wiphy *wiphy,
 	return 0;
 }
 
+static int wave600_cfg80211_add_key(struct wiphy *wiphy,
+				    struct net_device *ndev,
+				    int link_id,
+				    u8 key_index,
+				    bool pairwise,
+				    const u8 *mac_addr,
+				    struct key_params *params)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_umi_set_key req;
+	struct wave600_umi_set_key cfm;
+	u16 u16_cipher;
+	u16 sid;
+	u16 key_type;
+	int ret;
+
+	if (!params || !params->key || params->key_len == 0)
+		return -EINVAL;
+
+	switch (params->cipher) {
+	case WLAN_CIPHER_SUITE_CCMP:
+		u16_cipher = WAVE600_UMI_CIPHER_SUITE_CCMP;
+		break;
+	case WLAN_CIPHER_SUITE_TKIP:
+		u16_cipher = WAVE600_UMI_CIPHER_SUITE_TKIP;
+		break;
+	case WLAN_CIPHER_SUITE_GCMP:
+		u16_cipher = WAVE600_UMI_CIPHER_SUITE_GCMP128;
+		break;
+	case WLAN_CIPHER_SUITE_GCMP_256:
+		u16_cipher = WAVE600_UMI_CIPHER_SUITE_GCMP256;
+		break;
+	case WLAN_CIPHER_SUITE_AES_CMAC:
+		u16_cipher = WAVE600_UMI_CIPHER_SUITE_BIP;
+		break;
+	default:
+		dev_warn(wdev->dev, "Radio %u add_key: unsupported cipher 0x%08x\n",
+			 radio->radio_idx, params->cipher);
+		return -EOPNOTSUPP;
+	}
+
+	if (pairwise && mac_addr) {
+		sid = radio->sta_sid;
+		key_type = WAVE600_UMI_RSN_PAIRWISE_KEY;
+		dev_info(wdev->dev, "Radio %u add_key (PAIRWISE): STA %pM sid=%u key_idx=%u cipher=0x%04x len=%u\n",
+			 radio->radio_idx, mac_addr, sid, key_index, u16_cipher, params->key_len);
+	} else {
+		sid = WAVE600_BCAST_DEST_SID;
+		key_type = WAVE600_UMI_RSN_GROUP_KEY;
+		radio->is_secure = true;
+		dev_info(wdev->dev, "Radio %u add_key (GROUP): bcast sid=0x%04x key_idx=%u cipher=0x%04x len=%u\n",
+			 radio->radio_idx, sid, key_index, u16_cipher, params->key_len);
+	}
+
+	memset(&req, 0, sizeof(req));
+	req.sid = cpu_to_le16(sid);
+	req.key_type = cpu_to_le16(key_type);
+	req.cipher_suite = cpu_to_le16(u16_cipher);
+	req.key_index = cpu_to_le16(key_index);
+
+	if (params->seq && params->seq_len > 0) {
+		size_t seq_len = min_t(size_t, params->seq_len, sizeof(req.rx_seq_num));
+		memcpy(req.rx_seq_num, params->seq, seq_len);
+	}
+
+	req.tx_seq_num[0] = 1;
+
+	memcpy(req.tk, params->key, min_t(size_t, params->key_len, sizeof(req.tk)));
+
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_SET_KEY_REQ,
+				    WAVE600_MC_MAN_SET_KEY_CFM,
+				    &req, sizeof(req),
+				    &cfm, sizeof(cfm), 2000,
+				    radio->vap_id);
+	if (ret) {
+		dev_warn(wdev->dev, "Radio %u SET_KEY IPC failed: %d\n", radio->radio_idx, ret);
+		return ret;
+	}
+
+	if (cfm.status) {
+		dev_warn(wdev->dev, "Radio %u SET_KEY rejected by FW: status=%u\n",
+			 radio->radio_idx, le16_to_cpu(cfm.status));
+		return -EIO;
+	}
+
+	dev_info(wdev->dev, "Radio %u SET_KEY confirmed: sid=0x%04x key_type=%u key_idx=%u\n",
+		 radio->radio_idx, sid, key_type, key_index);
+
+	return 0;
+}
+
+static int wave600_cfg80211_del_key(struct wiphy *wiphy,
+				    struct net_device *ndev,
+				    int link_id,
+				    u8 key_index,
+				    bool pairwise,
+				    const u8 *mac_addr)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+
+	dev_dbg(radio->wdev->dev, "Radio %u del_key: key_idx=%u pairwise=%d\n",
+		radio->radio_idx, key_index, pairwise);
+	return 0;
+}
+
+static int wave600_cfg80211_set_default_key(struct wiphy *wiphy,
+					    struct net_device *ndev,
+					    int link_id,
+					    u8 key_index,
+					    bool unicast,
+					    bool multicast)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_umi_default_key_index req;
+	struct wave600_umi_default_key_index cfm;
+	int ret;
+
+	dev_info(wdev->dev, "Radio %u set_default_key: key_idx=%u unicast=%d multicast=%d\n",
+		 radio->radio_idx, key_index, unicast, multicast);
+
+	memset(&req, 0, sizeof(req));
+	req.sid = cpu_to_le16(WAVE600_BCAST_DEST_SID);
+	req.key_type = cpu_to_le16(WAVE600_UMI_RSN_GROUP_KEY);
+	req.key_index = cpu_to_le16(key_index);
+
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_SET_DEFAULT_KEY_INDEX_REQ,
+				    WAVE600_MC_MAN_SET_DEFAULT_KEY_INDEX_CFM,
+				    &req, sizeof(req),
+				    &cfm, sizeof(cfm), 2000,
+				    radio->vap_id);
+	if (ret) {
+		dev_warn(wdev->dev, "Radio %u SET_DEFAULT_KEY IPC failed: %d\n", radio->radio_idx, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
 static const struct ieee80211_txrx_stypes wave600_mgmt_stypes[NUM_NL80211_IFTYPES] = {
 	[NL80211_IFTYPE_AP] = {
 		.tx = 0xffff,
@@ -1572,6 +1749,9 @@ static const struct cfg80211_ops wave600_cfg80211_ops = {
 	.del_station = wave600_cfg80211_del_station,
 	.change_station = wave600_cfg80211_change_station,
 	.get_station = wave600_cfg80211_get_station,
+	.add_key = wave600_cfg80211_add_key,
+	.del_key = wave600_cfg80211_del_key,
+	.set_default_key = wave600_cfg80211_set_default_key,
 	.auth = wave600_cfg80211_auth,
 	.assoc = wave600_cfg80211_assoc,
 	.deauth = wave600_cfg80211_deauth,
@@ -1687,6 +1867,14 @@ static const u8 wlan_macs[2][ETH_ALEN] = {
 	{ 0x02, 0x50, 0x43, 0x00, 0x00, 0x02 }, /* wlan1: 5 GHz */
 };
 
+static const u32 wave600_cipher_suites[] = {
+	WLAN_CIPHER_SUITE_CCMP,
+	WLAN_CIPHER_SUITE_TKIP,
+	WLAN_CIPHER_SUITE_GCMP,
+	WLAN_CIPHER_SUITE_GCMP_256,
+	WLAN_CIPHER_SUITE_AES_CMAC,
+};
+
 static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 {
 	struct wave600_radio *radio = &wdev->radios[radio_idx];
@@ -1711,6 +1899,8 @@ static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_AP);
 	wiphy->flags |= WIPHY_FLAG_REPORTS_OBSS;
+	wiphy->cipher_suites = wave600_cipher_suites;
+	wiphy->n_cipher_suites = ARRAY_SIZE(wave600_cipher_suites);
 	wiphy->mgmt_stypes = wave600_mgmt_stypes;
 	wiphy->signal_type = CFG80211_SIGNAL_TYPE_UNSPEC;
 	wiphy->max_scan_ssids = 1;
