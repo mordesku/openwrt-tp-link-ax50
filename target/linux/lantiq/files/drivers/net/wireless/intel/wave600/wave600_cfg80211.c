@@ -2,19 +2,20 @@
 /*
  * Intel / MaxLinear Wave600 (WAV654) cfg80211 interface
  *
- * Minimal AP bring-up for the data-path milestone (Phase 8.1-8.3):
- *  - wiphy with a 2.4 GHz band (b/g/n HT20),
- *  - one AP interface pre-allocated at probe ("wlan%d"),
+ * Dual-Band Concurrent (DBDC) AP implementation (Variant B):
+ *  - Radio 0: 2.4 GHz band (b/g/n HT20), phy0, wlan0 (MAC 02:50:43:00:00:01), ep=1, vap_id=0
+ *  - Radio 1: 5 GHz band (a/n/ac HT20/40/80/160), phy1, wlan1 (MAC 02:50:43:00:00:02), ep=0, vap_id=0
  *  - start_ap implementing the vendor sequence (core.c/beacon_manager.c):
- *      VAP_DB ADD (0x041E) -> MIB_PRE_ACTIVATE (0x0109) ->
- *      MIB_SPECTRUM_MODE (0x1202) -> MBSS_PRE_ACTIVATE (0x0452) ->
- *      ADD_VAP (0x041F) -> SET_CHAN (0x0412) -> SET_BSS (0x0421) ->
- *      SET_BEACON_TEMPLATE (0x043D) -> SET_BEACON_INTERVAL (0x0476),
+ *      VAP_DB ADD (0x041E) -> MIB_IEEE_ADDRESS (0x0040) ->
+ *      MIB_PRE_ACTIVATE (0x0109) -> MIB_SPECTRUM_MODE (0x1202) ->
+ *      MBSS_PRE_ACTIVATE (0x0452) -> ADD_VAP (0x041F) ->
+ *      ENABLE_RADIO (0x045C) -> SET_CHAN (0x0412) ->
+ *      SET_TPC_ANT_PARAMS (0x044E) -> SET_TPC_CONFIG (0x044F) ->
+ *      SET_ANTENNAS (0x0418) -> SET_BEACON_TEMPLATE (0x043D) ->
+ *      SET_BSS (0x0421) -> SET_WMM_PARAMETERS (0x040A),
  *  - stop_ap via STOP_VAP_TRAFFIC + REMOVE_VAP.
- *
- * Station handling: NETWORK_EVENT_IND (0x3326) is dumped by the mailbox
- * tasklet (diagnostic first step); full station tracking (STA_ADD,
- * SID requests) is the next iteration.
+ *  - add_station via REQUEST_SID (0x0442) + STA_ADD (0x043B).
+ *  - del_station via STOP_TRAFFIC (0x0444) + STA_REMOVE (0x043C) + REMOVE_SID (0x0443).
  */
 
 #include <linux/module.h>
@@ -27,7 +28,6 @@
 #include "wave600_ipc.h"
 #include "wave600_dma.h"
 
-#define W600_VAP_ID		0
 #define W600_BEACON_INT		100
 #define W600_DTIM		1
 
@@ -156,12 +156,10 @@ struct wave600_umi_tpc_config {
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-/* 2.4 GHz OFDM + basic rates as raw IE-style rate bytes (500 kbps units,
- * basic bit set on 1/2/5.5/11) - vendor SET_BSS basic_rates defaults. */
+/* 2.4 GHz OFDM rates (6, 12, 24 basic rates - pure ERP/OFDM mode without 11b CCK) */
 static const u8 wave600_rates_2g[] = {
-	0x82, 0x84, 0x8b, 0x96,		/* 1, 2, 5.5, 11 basic */
-	0x0c, 0x12, 0x18, 0x24,		/* 6, 9, 12, 18 */
-	0x30, 0x48, 0x60, 0x6c,		/* 24, 36, 48, 54 */
+	0x8c, 0x12, 0x98, 0x24,		/* 6 basic, 9, 12 basic, 18 */
+	0xb0, 0x48, 0x60, 0x6c,		/* 24 basic, 36, 48, 54 */
 };
 
 /* 5 GHz OFDM rates (6, 12, 24 Mbps marked as basic rates with 0x80) */
@@ -236,6 +234,7 @@ static const u8 wave600_rates_5g[] = {
 #define W600_NETWORK_11BGN_MIXED		5	/* NETWORK_MODES_E (2.4 GHz) */
 #define W600_NETWORK_11AN_MIXED			8	/* NETWORK_MODES_E (5 GHz) */
 #define W600_VAP_OPERATION_ADD			1
+#define W600_VAP_OPERATION_DEL			2
 #define W600_OPERATE_RATE_SET_11BGN		0xffffffffU
 #define W600_BSS_BASIC_RATE_SET_11BGN_DEFAULT	0x00007800U
 #define W600_OPERATE_RATE_SET_11AN		0xffff80ffU
@@ -250,49 +249,92 @@ static const u8 wave600_rates_5g[] = {
  * warns that zero limits crash the FW. */
 #define W600_TPC_LIMIT_MAX			0x7FFF
 
-static int wave600_send_set_chan(struct wave600_dev *wdev, u8 chan, u8 width, u8 primary_idx)
+/*
+ * switch_type values (switchType enum, mhi_umi_propr.h):
+ * ST_NORMAL = 0 — regular channel change (hot or cold)
+ * ST_CSA = 2 — channel switch announcement
+ */
+#define W600_SWITCH_TYPE_NORMAL		0
+#define W600_SWITCH_TYPE_CSA		2
+
+static int wave600_send_set_chan(struct wave600_radio *radio, u8 chan, u8 width,
+				 u8 primary_idx, u8 switch_type,
+				 u16 chan_switch_time)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_set_chan p;
 	struct wave600_umi_set_chan cfm;
 	int ret;
+	bool is_5g = (radio->radio_idx == 1);
+	bool is_dfs_chan = false;
 
 	memset(&p, 0, sizeof(p));
 	p.low_chan_num = chan;
 	p.chan_width = width;	/* chanWidth_e */
 	p.primary_chan_idx = primary_idx;
+	p.switch_type = switch_type;
+	p.chan_switch_time = cpu_to_le16(chan_switch_time);
+
 	/*
-	 * Vendor (core_config.c core_cfg_send_set_chan) always sends a
-	 * valid regulatory domain code: core_cfg_get_regd_code() with the
-	 * radio country code, defaulting to "US" (COUNTRY_CODE_DFLT,
-	 * mtlk_psdb.h) -> REGD_CODE_FCC (mhi_umi_propr.h). Zero is
+	 * Regulatory domain: vendor sends core_cfg_get_regd_code() result,
+	 * defaulting to "US" (REGD_CODE_FCC = 0x10). Zero is
 	 * REGD_CODE_UNKNOWN and is never sent by the vendor driver.
 	 */
-	p.regulation_type = 0x10; /* REGD_CODE_FCC, vendor default "US" */
+	p.regulation_type = 0x10;
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_SET_CHAN_REQ,
-			      WAVE600_MC_SET_CHAN_CFM,
-			      &p, sizeof(p), &cfm, sizeof(cfm), 5000);
+	/*
+	 * isContinuousInterfererDetectionNeeded: vendor scan_support.h
+	 * is_interf_det_needed() returns 1 for all channels.
+	 */
+	p.is_continuous_interferer_detection_needed = 1;
+
+	/*
+	 * isRadarDetectionNeeded: true when the channel requires DFS
+	 * (5 GHz DFS channels). For 2.4 GHz it is always false.
+	 * We approximate by checking if the primary channel is in the
+	 * 5 GHz DFS range (channels 36-64, 100-144).
+	 */
+	if (is_5g) {
+		if ((chan >= 36 && chan <= 64) || (chan >= 100 && chan <= 144))
+			is_dfs_chan = true;
+	}
+	p.is_radar_detection_needed = is_dfs_chan ? 1 : 0;
+
+	/*
+	 * channel_notification_mode: only set for DFS channels
+	 * (matching sb_dfs.sb_dfs_bw from vendor core_cfg_set_chan).
+	 * CHANNEL_NOTIFICATION_NORMAL = 0 means full-band notification.
+	 */
+	if (is_dfs_chan)
+		p.channel_notification_mode = 0; /* CHANNEL_NOTIFICATION_NORMAL */
+
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_SET_CHAN_REQ,
+				    WAVE600_MC_SET_CHAN_CFM,
+				    &p, sizeof(p), &cfm, sizeof(cfm), 5000,
+				    radio->vap_id);
 	if (ret)
 		return ret;
 
 	/* Vendor checks req->result after send (setChanReport, 0 = OK) */
 	if (cfm.result != W600_UMI_OK) {
-		dev_err(wdev->dev, "SET_CHAN: FW rejected (result=%u)\n",
-			cfm.result);
+		dev_err(wdev->dev, "Radio %u SET_CHAN: FW rejected (result=%u)\n",
+			radio->radio_idx, cfm.result);
 		return -EIO;
 	}
 
 	/* Antenna mask returned by FW in SET_CHAN CFM (byte 12) */
 	if (cfm.antenna_mask)
-		wdev->antenna_mask = cfm.antenna_mask;
+		radio->antenna_mask = cfm.antenna_mask;
 	else
-		wdev->antenna_mask = (wdev->radio_idx == 1) ? 0x0A : 0x05;
+		radio->antenna_mask = (radio->radio_idx == 1) ? 0x0A : 0x05;
 
 	return 0;
 }
 
-static int wave600_send_set_bss(struct wave600_dev *wdev, bool is_5g)
+static int wave600_send_set_bss(struct wave600_radio *radio, bool is_5g)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_set_bss p;
 	const u8 *rates = is_5g ? wave600_rates_5g : wave600_rates_2g;
 	u8 rates_len = is_5g ? sizeof(wave600_rates_5g) : sizeof(wave600_rates_2g);
@@ -303,7 +345,7 @@ static int wave600_send_set_bss(struct wave600_dev *wdev, bool is_5g)
 	 * copies the payload verbatim). */
 	p.beacon_interval = cpu_to_le16(W600_BEACON_INT);
 	p.dtim_interval = cpu_to_le16(W600_DTIM);
-	p.vap_id = W600_VAP_ID;
+	p.vap_id = radio->vap_id;
 	p.slot_time = 1;	/* short slot for OFDM */
 	p.use_short_preamble = 1;
 	memcpy(p.rates, rates, rates_len);
@@ -315,25 +357,28 @@ static int wave600_send_set_bss(struct wave600_dev *wdev, bool is_5g)
 	memset(p.he_mcs_nss, 0xff, sizeof(p.he_mcs_nss));
 	p.he_bss_color = 1;	/* vendor HE_BSS_COLOR = 1 (core.c:2555) */
 
-	return wave600_ipc_cmd(wdev, WAVE600_UM_BSS_SET_BSS_REQ,
-			       WAVE600_MC_BSS_SET_BSS_CFM,
-			       &p, sizeof(p), NULL, 0, 5000);
+	return wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				     WAVE600_UM_BSS_SET_BSS_REQ,
+				     WAVE600_MC_BSS_SET_BSS_CFM,
+				     &p, sizeof(p), NULL, 0, 5000,
+				     radio->vap_id);
 }
 
 /* Initial basic rates for ADD_VAP (vendor core_pdb_def.h / core.c:2329-2348:
- * PARAM_DB_CORE_BASIC_RATES_2 and PARAM_DB_CORE_BASIC_RATES_5, no 0x80 flags) */
-static const u8 wave600_add_vap_rates_2g[] = { 2, 4, 11, 22 };
+ * pure OFDM 6, 12, 24 Mbps in 500 kbps units: 12, 24, 48) */
+static const u8 wave600_add_vap_rates_2g[] = { 12, 24, 48 };
 static const u8 wave600_add_vap_rates_5g[] = { 12, 24, 48 };
 
-static int wave600_send_add_vap(struct wave600_dev *wdev, bool is_5g)
+static int wave600_send_add_vap(struct wave600_radio *radio, bool is_5g)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_add_vap p;
 	const u8 *rates = is_5g ? wave600_add_vap_rates_5g : wave600_add_vap_rates_2g;
 	u8 rates_len = is_5g ? sizeof(wave600_add_vap_rates_5g) : sizeof(wave600_add_vap_rates_2g);
 
 	memset(&p, 0, sizeof(p));
-	memcpy(p.bssid, wdev->ndev->dev_addr, ETH_ALEN);
-	p.vap_id = W600_VAP_ID;
+	memcpy(p.bssid, radio->ndev->dev_addr, ETH_ALEN);
+	p.vap_id = radio->vap_id;
 	p.operation_mode = 0;	/* OPERATION_MODE_NORMAL */
 	memcpy(p.rates, rates, rates_len);
 	p.rates_len = rates_len;
@@ -344,16 +389,19 @@ static int wave600_send_add_vap(struct wave600_dev *wdev, bool is_5g)
 	memset(p.vht_mcs_nss, 0xff, sizeof(p.vht_mcs_nss));
 	memset(p.he_mcs_nss, 0xff, sizeof(p.he_mcs_nss));
 
-	return wave600_ipc_cmd(wdev, WAVE600_UM_MAN_ADD_VAP_REQ,
-			       WAVE600_MC_MAN_ADD_VAP_CFM,
-			       &p, sizeof(p), NULL, 0, 5000);
+	return wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				     WAVE600_UM_MAN_ADD_VAP_REQ,
+				     WAVE600_MC_MAN_ADD_VAP_CFM,
+				     &p, sizeof(p), NULL, 0, 5000,
+				     radio->vap_id);
 }
 
 /* Vendor mtlk_mbss_send_vap_db_add (core.c): register the VAP index in the
  * firmware VAP DB before any activation. CFM returns u16Status at payload
  * offset 2 (UMI_VAP_DB_OP). */
-static int wave600_send_vap_db_add(struct wave600_dev *wdev)
+static int wave600_send_vap_db_add(struct wave600_radio *radio)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_vap_db_op p;
 	u8 cfm[4] = { 0 };
 	u16 status;
@@ -361,18 +409,51 @@ static int wave600_send_vap_db_add(struct wave600_dev *wdev)
 
 	memset(&p, 0, sizeof(p));
 	p.operation_code = W600_VAP_OPERATION_ADD;
-	p.vap_idx = W600_VAP_ID;
+	p.vap_idx = radio->vap_id;
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_VAP_DB_REQ,
-			      WAVE600_MC_MAN_VAP_DB_CFM,
-			      &p, sizeof(p), cfm, sizeof(cfm), 5000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_VAP_DB_REQ,
+				    WAVE600_MC_MAN_VAP_DB_CFM,
+				    &p, sizeof(p), cfm, sizeof(cfm), 5000,
+				    radio->vap_id);
 	if (ret)
 		return ret;
 
 	status = (u16)(cfm[2] | (cfm[3] << 8));
 	if (status != W600_UMI_OK) {
-		dev_err(wdev->dev, "VAP_DB ADD: FW rejected (status=0x%04x)\n",
-			status);
+		dev_err(wdev->dev, "Radio %u VAP_DB ADD: FW rejected (status=0x%04x)\n",
+			radio->radio_idx, status);
+		return -EIO;
+	}
+	return 0;
+}
+
+/* Vendor mtlk_mbss_send_vap_db_del (core.c:2962): unregister the VAP index
+ * from the firmware VAP DB when tearing down an AP interface. */
+static int wave600_send_vap_db_del(struct wave600_radio *radio)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_umi_vap_db_op p;
+	u8 cfm[4] = { 0 };
+	u16 status;
+	int ret;
+
+	memset(&p, 0, sizeof(p));
+	p.operation_code = W600_VAP_OPERATION_DEL;
+	p.vap_idx = radio->vap_id;
+
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_VAP_DB_REQ,
+				    WAVE600_MC_MAN_VAP_DB_CFM,
+				    &p, sizeof(p), cfm, sizeof(cfm), 5000,
+				    radio->vap_id);
+	if (ret)
+		return ret;
+
+	status = (u16)(cfm[2] | (cfm[3] << 8));
+	if (status != W600_UMI_OK) {
+		dev_warn(wdev->dev, "Radio %u VAP_DB DEL: FW rejected (status=0x%04x)\n",
+			 radio->radio_idx, status);
 		return -EIO;
 	}
 	return 0;
@@ -380,9 +461,10 @@ static int wave600_send_vap_db_add(struct wave600_dev *wdev)
 
 /* Vendor mtlk_set_mib_value_raw (mtlkmib.c): payload is always the full
  * UMI_MIB (object id + status + 80-byte MIB_VALUE union). */
-static int wave600_send_mib(struct wave600_dev *wdev, u16 object_id,
-			     const void *value, size_t value_len)
+static int wave600_send_mib(struct wave600_radio *radio, u16 object_id,
+			    const void *value, size_t value_len)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_mib p;
 	u8 cfm[4] = { 0 };
 	u16 status;
@@ -397,16 +479,18 @@ static int wave600_send_mib(struct wave600_dev *wdev, u16 object_id,
 	if (value_len)
 		memcpy(p.value, value, value_len);
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_SET_MIB_REQ,
-			      WAVE600_MC_MAN_SET_MIB_CFM,
-			      &p, sizeof(p), cfm, sizeof(cfm), 5000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_SET_MIB_REQ,
+				    WAVE600_MC_MAN_SET_MIB_CFM,
+				    &p, sizeof(p), cfm, sizeof(cfm), 5000,
+				    radio->vap_id);
 	if (ret)
 		return ret;
 
 	status = (u16)(cfm[2] | (cfm[3] << 8));
 	if (status != W600_UMI_OK) {
-		dev_err(wdev->dev, "SET_MIB 0x%04x: FW rejected (status=0x%04x)\n",
-			object_id, status);
+		dev_err(wdev->dev, "Radio %u SET_MIB 0x%04x: FW rejected (status=0x%04x)\n",
+			radio->radio_idx, object_id, status);
 		return -EIO;
 	}
 	return 0;
@@ -415,7 +499,7 @@ static int wave600_send_mib(struct wave600_dev *wdev, u16 object_id,
 /* Vendor mtlk_mib_set_pre_activate (mib_osdep.c): common physical
  * operational parameters for the pre-activation phase. Only the fields
  * the vendor sets are non-zero (PRE_ACTIVATE_MIB_TYPE layout). */
-static int wave600_send_mib_pre_activate(struct wave600_dev *wdev, bool is_5g)
+static int wave600_send_mib_pre_activate(struct wave600_radio *radio, bool is_5g)
 {
 	struct {
 		u8 reserved[3];
@@ -436,22 +520,22 @@ static int wave600_send_mib_pre_activate(struct wave600_dev *wdev, bool is_5g)
 	v.operational_rate_set = cpu_to_le32(is_5g ? W600_OPERATE_RATE_SET_11AN : W600_OPERATE_RATE_SET_11BGN);
 	v.bss_basic_rate_set = cpu_to_le32(is_5g ? W600_BSS_BASIC_RATE_SET_11AN : W600_BSS_BASIC_RATE_SET_11BGN_DEFAULT);
 
-	return wave600_send_mib(wdev, W600_MIB_PRE_ACTIVATE, &v, sizeof(v));
+	return wave600_send_mib(radio, W600_MIB_PRE_ACTIVATE, &v, sizeof(v));
 }
 
-static int wave600_send_mib_spectrum_mode(struct wave600_dev *wdev)
+static int wave600_send_mib_spectrum_mode(struct wave600_radio *radio)
 {
 	u8 v = W600_MIB_SPECTRUM_20M;
 
-	return wave600_send_mib(wdev, W600_MIB_SPECTRUM_MODE, &v, sizeof(v));
+	return wave600_send_mib(radio, W600_MIB_SPECTRUM_MODE, &v, sizeof(v));
 }
 
 /* Vendor mtlk_set_vap_mibs (mib_osdep.c): MIB_IEEE_ADDRESS carries the
  * interface MAC before VAP activation. */
-static int wave600_send_mib_ieee_addr(struct wave600_dev *wdev)
+static int wave600_send_mib_ieee_addr(struct wave600_radio *radio)
 {
-	return wave600_send_mib(wdev, W600_MIB_IEEE_ADDRESS,
-				wdev->ndev->dev_addr, ETH_ALEN);
+	return wave600_send_mib(radio, W600_MIB_IEEE_ADDRESS,
+				radio->ndev->dev_addr, ETH_ALEN);
 }
 
 /*
@@ -462,10 +546,11 @@ static int wave600_send_mib_ieee_addr(struct wave600_dev *wdev)
  * confirmations carry no real state and every "confirmed" message in the
  * AP bring-up sequence is suspect (2026-10-31 diagnostic session).
  */
-static void wave600_diag_mib_readback(struct wave600_dev *wdev, u16 object_id,
+static void wave600_diag_mib_readback(struct wave600_radio *radio, u16 object_id,
 				      const void *written, size_t written_len,
 				      const char *what)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_mib p;
 	struct wave600_umi_mib cfm;
 	int ret;
@@ -474,19 +559,21 @@ static void wave600_diag_mib_readback(struct wave600_dev *wdev, u16 object_id,
 	/* UMI payload scalars are little-endian (vendor HOST_TO_MAC16) */
 	p.object_id = cpu_to_le16(object_id);
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_GET_MIB_REQ,
-			      WAVE600_MC_MAN_GET_MIB_CFM,
-			      &p, sizeof(p), &cfm, sizeof(cfm), 5000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_GET_MIB_REQ,
+				    WAVE600_MC_MAN_GET_MIB_CFM,
+				    &p, sizeof(p), &cfm, sizeof(cfm), 5000,
+				    radio->vap_id);
 	if (ret) {
 		dev_info(wdev->dev,
-			 "diag: GET_MIB 0x%04x (%s): request failed: %d\n",
-			 object_id, what, ret);
+			 "diag Radio %u: GET_MIB 0x%04x (%s): request failed: %d\n",
+			 radio->radio_idx, object_id, what, ret);
 		return;
 	}
 
 	dev_info(wdev->dev,
-		 "diag: GET_MIB 0x%04x (%s): status=0x%04x value=%*ph (written: %*ph)\n",
-		 object_id, what, le16_to_cpu(cfm.status),
+		 "diag Radio %u: GET_MIB 0x%04x (%s): status=0x%04x value=%*ph (written: %*ph)\n",
+		 radio->radio_idx, object_id, what, le16_to_cpu(cfm.status),
 		 (int)min_t(size_t, written_len, 16), cfm.value,
 		 (int)min_t(size_t, written_len, 16), written);
 }
@@ -494,17 +581,20 @@ static void wave600_diag_mib_readback(struct wave600_dev *wdev, u16 object_id,
 /* Vendor _mtlk_core_set_radio_mode_req (core.c): userspace enables the
  * radio via "sEnableRadio"; without this request the firmware keeps the
  * radio disabled and transmits nothing. */
-static int wave600_send_enable_radio(struct wave600_dev *wdev)
+static int wave600_send_enable_radio(struct wave600_radio *radio, u32 on)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_enable_radio p;
 
 	memset(&p, 0, sizeof(p));
 	/* UMI payload scalars are little-endian (vendor HOST_TO_MAC32) */
-	p.radio_on = cpu_to_le32(1);
+	p.radio_on = cpu_to_le32(on);
 
-	return wave600_ipc_cmd(wdev, WAVE600_UM_MAN_ENABLE_RADIO_REQ,
-			       WAVE600_MC_MAN_ENABLE_RADIO_CFM,
-			       &p, sizeof(p), NULL, 0, 5000);
+	return wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				     WAVE600_UM_MAN_ENABLE_RADIO_REQ,
+				     WAVE600_MC_MAN_ENABLE_RADIO_CFM,
+				     &p, sizeof(p), NULL, 0, 5000,
+				     radio->vap_id);
 }
 
 /* Vendor _mtlk_reload_tpc_g5_g6 (mtlk_eeprom.c): for every antenna with
@@ -515,165 +605,14 @@ static int wave600_send_enable_radio(struct wave600_dev *wdev)
  * calibration file (little-endian, preserved by the mailbox writer). */
 #define W600_TPC_ANT_MSG_SIZE		(4 + 8 * WAVE600_TPC_FREQ_SIZE)
 
-static int wave600_send_tpc_ant_params(struct wave600_dev *wdev, u8 chan)
-{
-	struct wave600_cal *cal = &wdev->cal;
-	u8 band = (chan <= 14) ? 0 : 1;
-	int ant, bw, i;
-	int sent = 0;
 
-	for (ant = 0; ant < WAVE600_CAL_MAX_ANT; ant++) {
-		u8 msg[W600_TPC_ANT_MSG_SIZE];
-		u32 count = 0;
-		int ret;
-
-		memset(msg, 0, sizeof(msg));
-
-		for (bw = 0; bw < 4; bw++) {
-			const struct wave600_cal_tssi_entry *match = NULL;
-			const struct wave600_cal_tssi_entry *lower = NULL;
-
-			for (i = 0; i < cal->entry_count[ant]; i++) {
-				const struct wave600_cal_tssi_entry *e =
-					&cal->entries[ant][i];
-
-				if (e->band != band || e->bw != bw)
-					continue;
-				if (e->chan == chan) {
-					lower = NULL;
-					match = e;
-					break;
-				}
-				if (e->chan > chan) {
-					match = e;
-					break;
-				}
-				lower = e;
-			}
-
-			if (match && count < 8) {
-				memcpy(msg + 4 + count * WAVE600_TPC_FREQ_SIZE,
-				       match->raw, WAVE600_TPC_FREQ_SIZE);
-				count++;
-			}
-			if (lower && count < 8) {
-				memcpy(msg + 4 + count * WAVE600_TPC_FREQ_SIZE,
-				       lower->raw, WAVE600_TPC_FREQ_SIZE);
-				count++;
-			}
-		}
-
-		if (!count) {
-			/* vendor: no TPC data for this antenna/band is
-			 * allowed on Gen6, the message is canceled */
-			continue;
-		}
-
-		msg[0] = (u8)ant;
-		msg[1] = (u8)cal->tpc_data_size;
-
-		ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_SET_TPC_ANT_PARAMS_REQ,
-				      WAVE600_MC_MAN_SET_TPC_ANT_PARAMS_CFM,
-				      msg, sizeof(msg), NULL, 0, 5000);
-		if (ret) {
-			dev_err(wdev->dev, "SET_TPC_ANT_PARAMS (ant %d) failed: %d\n",
-				ant, ret);
-			return ret;
-		}
-
-		dev_info(wdev->dev, "TPC ant %d: %u TPC_FREQ entries sent for channel %u\n",
-			 ant, count, chan);
-		sent++;
-	}
-
-	if (!sent)
-		dev_warn(wdev->dev, "TPC: no calibration data for channel %u band %u\n",
-			 chan, band);
-
-	return 0;
-}
-
-/* Vendor mtlk_set_tpc_config (core.c) with the vendor default closed
- * loop: the open loop is only forced when the calibration file has no
- * TPC data for the current band (mib_osdep.c). The limits come from
- * the PSDB REGD table (MIN of the regulatory limit and the PSDB value,
- * core_config.c core_cfg_set_tx_power_limit). */
-#define W600_TPC_REGD_CODE_FCC		0x10 /* vendor default country "US" */
-#define W600_TPC_REG_LIMIT_POWER	(20 << 3) /* 20 dBm in POWER_PER_DBM units */
-
-static int wave600_send_tpc_config(struct wave600_dev *wdev, u8 chan)
-{
-	struct wave600_umi_tpc_config p;
-	u16 pw[13] = { 0 };
-	u16 power_limit_11b = 0;
-	bool have_cal = false;
-	int i;
-	u8 band = (chan <= 14) ? 0 : 1;
-
-	memset(&p, 0, sizeof(p));
-
-	/* Closed loop unless the calibration has no TPC data for this band */
-	for (i = 0; i < WAVE600_CAL_MAX_ANT; i++) {
-		if (wdev->cal.entry_count[i]) {
-			for (u32 j = 0; j < wdev->cal.entry_count[i]; j++) {
-				if (wdev->cal.entries[i][j].band == band) {
-					have_cal = true;
-					break;
-				}
-			}
-		}
-	}
-
-	if (wave600_psdb_regd_limits(wdev, W600_TPC_REGD_CODE_FCC, chan, pw) == 0) {
-		power_limit_11b = min_t(u16, W600_TPC_REG_LIMIT_POWER, pw[0]);
-		for (i = 0; i < 4; i++) {
-			u16 ofdm = min_t(u16, W600_TPC_REG_LIMIT_POWER, pw[1 + i]);
-
-			p.regulation_limit[i] = cpu_to_le16(ofdm);
-			p.regulation_limit_mu[i] =
-				cpu_to_le16(min_t(u16, W600_TPC_REG_LIMIT_POWER, pw[5 + i]));
-			p.regulation_limit_bf[i] =
-				cpu_to_le16(min_t(u16, W600_TPC_REG_LIMIT_POWER, pw[9 + i]));
-		}
-	} else {
-		/* No REGD data: large limits, the firmware applies its own
-		 * PSDB values (vendor asserts the value is never zero). */
-		for (i = 0; i < 4; i++) {
-			p.regulation_limit[i] = cpu_to_le16(W600_TPC_LIMIT_MAX);
-			p.regulation_limit_mu[i] = cpu_to_le16(W600_TPC_LIMIT_MAX);
-			p.regulation_limit_bf[i] = cpu_to_le16(W600_TPC_LIMIT_MAX);
-		}
-		power_limit_11b = W600_TPC_LIMIT_MAX;
-	}
-
-	/* UMI payload scalars are little-endian (vendor HOST_TO_MAC16) */
-	p.power_limit_11b = cpu_to_le16(power_limit_11b);
-
-	p.cal_type = W600_TPC_CAL_TYPE_LOGARITHMIC;
-	p.tpc_loop_type = have_cal ? 0 /* TPC_CLOSED_LOOP, vendor default */ :
-				    W600_TPC_OPEN_LOOP;
-	p.fixed_gain = W600_TPC_NO_FIXED_GAIN;
-	p.get_set_operation = 0;
-
-	dev_info(wdev->dev, "TPC config: loop=%s 11b=%d ofdm20=%d\n",
-		 have_cal ? "closed" : "open", power_limit_11b,
-		 le16_to_cpu(p.regulation_limit[0]));
-
-	/*
-	 * tpcConfig_t (vendor mhi_mib_id.h:504-514) has no status field;
-	 * bytes 0..1 are regulationLimit[0]. Arrival of 0x144f is the
-	 * confirmation (same as SET_TPC_ANT_PARAMS).
-	 */
-	return wave600_ipc_cmd(wdev, WAVE600_UM_MAN_SET_TPC_CONFIG_REQ,
-			       WAVE600_MC_MAN_SET_TPC_CONFIG_CFM,
-			       &p, sizeof(p), NULL, 0, 5000);
-}
 
 /* Vendor _mtlk_mbss_send_preactivate_req (core.c): issued prior to the
  * first VAP activation; coexistence / 40 MHz intolerance stay disabled.
  * CFM returns u16Status at payload offset 0 (UMI_MBSS_PRE_ACTIVATE_HDR). */
-static int wave600_send_pre_activate(struct wave600_dev *wdev)
+static int wave600_send_pre_activate(struct wave600_radio *radio)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_mbss_pre_activate p;
 	u8 cfm[4] = { 0 };
 	u16 status;
@@ -681,24 +620,27 @@ static int wave600_send_pre_activate(struct wave600_dev *wdev)
 
 	memset(&p, 0, sizeof(p));
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_MBSS_PRE_ACTIVATE_REQ,
-			      WAVE600_MC_MAN_MBSS_PRE_ACTIVATE_CFM,
-			      &p, sizeof(p), cfm, sizeof(cfm), 5000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_MBSS_PRE_ACTIVATE_REQ,
+				    WAVE600_MC_MAN_MBSS_PRE_ACTIVATE_CFM,
+				    &p, sizeof(p), cfm, sizeof(cfm), 5000,
+				    radio->vap_id);
 	if (ret)
 		return ret;
 
 	status = (u16)(cfm[0] | (cfm[1] << 8));
 	if (status != W600_UMI_OK) {
-		dev_err(wdev->dev, "MBSS_PRE_ACTIVATE: FW rejected (status=0x%04x)\n",
-			status);
+		dev_err(wdev->dev, "Radio %u MBSS_PRE_ACTIVATE: FW rejected (status=0x%04x)\n",
+			radio->radio_idx, status);
 		return -EIO;
 	}
 	return 0;
 }
 
 /* Vendor MC_MAN_SET_ANTENNAS_REQ (0x0418) */
-static int wave600_send_set_antennas(struct wave600_dev *wdev, u8 mask)
+static int wave600_send_set_antennas(struct wave600_radio *radio, u8 mask)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_set_antennas p;
 	struct wave600_umi_set_antennas cfm;
 	int ret;
@@ -707,30 +649,34 @@ static int wave600_send_set_antennas(struct wave600_dev *wdev, u8 mask)
 	p.tx_ants_mask = mask;
 	p.rx_ants_mask = mask;
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_MC_MAN_SET_ANTENNAS_REQ,
-			      WAVE600_MC_MAN_SET_ANTENNAS_CFM,
-			      &p, sizeof(p), &cfm, sizeof(cfm), 5000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_MC_MAN_SET_ANTENNAS_REQ,
+				    WAVE600_MC_MAN_SET_ANTENNAS_CFM,
+				    &p, sizeof(p), &cfm, sizeof(cfm), 5000,
+				    radio->vap_id);
 	if (ret)
 		return ret;
 
 	if (cfm.status != W600_UMI_OK) {
-		dev_err(wdev->dev, "SET_ANTENNAS: FW rejected (status=%u)\n",
-			cfm.status);
+		dev_err(wdev->dev, "Radio %u SET_ANTENNAS: FW rejected (status=%u)\n",
+			radio->radio_idx, cfm.status);
 		return -EIO;
 	}
-	dev_info(wdev->dev, "active antennas set to 0x%02x\n", mask);
+	dev_info(wdev->dev, "Radio %u active antennas set to 0x%02x\n",
+		 radio->radio_idx, mask);
 	return 0;
 }
 
 /* Vendor UM_MAN_SET_WMM_PARAMETERS_REQ (0x040A) */
-static int wave600_send_set_wmm_params(struct wave600_dev *wdev)
+static int wave600_send_set_wmm_params(struct wave600_radio *radio)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_set_wmm_params p;
 	struct wave600_umi_set_wmm_params cfm;
 	int ret;
 
 	memset(&p, 0, sizeof(p));
-	p.vap_id = W600_VAP_ID;
+	p.vap_id = radio->vap_id;
 
 	/*
 	 * Default WMM / EDCA parameters for Access Categories (vendor core_pdb_def.h / core_config.c):
@@ -759,24 +705,28 @@ static int wave600_send_set_wmm_params(struct wave600_dev *wdev)
 	p.ac[3].txop_limit = cpu_to_le16(47);
 	p.ac[3].aifsn = 2;
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_SET_WMM_PARAMETERS_REQ,
-			      WAVE600_UM_MAN_SET_WMM_PARAMETERS_CFM,
-			      &p, sizeof(p), &cfm, sizeof(cfm), 5000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_SET_WMM_PARAMETERS_REQ,
+				    WAVE600_UM_MAN_SET_WMM_PARAMETERS_CFM,
+				    &p, sizeof(p), &cfm, sizeof(cfm), 5000,
+				    radio->vap_id);
 	if (ret)
 		return ret;
 
 	if (cfm.status != W600_UMI_OK) {
-		dev_err(wdev->dev, "SET_WMM_PARAMS: FW rejected (status=%u)\n",
-			cfm.status);
+		dev_err(wdev->dev, "Radio %u SET_WMM_PARAMS: FW rejected (status=%u)\n",
+			radio->radio_idx, cfm.status);
 		return -EIO;
 	}
-	dev_info(wdev->dev, "WMM / EDCA parameters set (VAP transmit queues activated)\n");
+	dev_info(wdev->dev, "Radio %u WMM / EDCA parameters set (VAP transmit queues activated)\n",
+		 radio->radio_idx);
 	return 0;
 }
 
-static int wave600_send_beacon(struct wave600_dev *wdev,
+static int wave600_send_beacon(struct wave600_radio *radio,
 			       const struct cfg80211_beacon_data *beacon)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_beacon_set p;
 	struct wave600_umi_beacon_set cfm;
 	dma_addr_t dma;
@@ -818,8 +768,8 @@ static int wave600_send_beacon(struct wave600_dev *wdev,
 		u16 ie_len = ie[1] + 2;
 
 		if (ie + ie_len > buf + total) {
-			dev_err(wdev->dev, "beacon template: wrong IE length (id %u len %u)\n",
-				id, ie[1]);
+			dev_err(wdev->dev, "Radio %u beacon template: wrong IE length (id %u len %u)\n",
+				radio->radio_idx, id, ie[1]);
 			dma_unmap_single(wdev->dev, dma, total, DMA_TO_DEVICE);
 			kfree(buf);
 			return -EINVAL;
@@ -893,8 +843,8 @@ static int wave600_send_beacon(struct wave600_dev *wdev,
 	}
 
 	if (total != part1_len + part2_len + part3_len + part4_len + part5_len) {
-		dev_err(wdev->dev, "beacon template lengths mismatch: %zu != %u+%u+%u+%u+%u\n",
-			total, part1_len, part2_len, part3_len, part4_len,
+		dev_err(wdev->dev, "Radio %u beacon template lengths mismatch: %zu != %u+%u+%u+%u+%u\n",
+			radio->radio_idx, total, part1_len, part2_len, part3_len, part4_len,
 			part5_len);
 		dma_unmap_single(wdev->dev, dma, total, DMA_TO_DEVICE);
 		kfree(buf);
@@ -911,19 +861,21 @@ static int wave600_send_beacon(struct wave600_dev *wdev,
 	p.part3_len = cpu_to_le16((u16)part3_len);
 	p.part4_len = cpu_to_le16((u16)part4_len);
 	p.part5_len = cpu_to_le16((u16)part5_len);
-	p.vap_index = W600_VAP_ID;
+	p.vap_index = radio->vap_id;
 
-	dev_info(wdev->dev, "beacon template: total %zu = %u/%u/%u/%u/%u (dma %pad)\n",
-		 total, part1_len, part2_len, part3_len, part4_len, part5_len,
+	dev_info(wdev->dev, "Radio %u beacon template: total %zu = %u/%u/%u/%u/%u (dma %pad)\n",
+		 radio->radio_idx, total, part1_len, part2_len, part3_len, part4_len, part5_len,
 		 &dma);
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_SET_BEACON_TEMPLATE_REQ,
-			      WAVE600_MC_MAN_SET_BEACON_TEMPLATE_CFM,
-			      &p, sizeof(p), &cfm, sizeof(cfm), 5000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_SET_BEACON_TEMPLATE_REQ,
+				    WAVE600_MC_MAN_SET_BEACON_TEMPLATE_CFM,
+				    &p, sizeof(p), &cfm, sizeof(cfm), 5000,
+				    radio->vap_id);
 	if (ret || cfm.status != W600_UMI_OK) {
 		if (!ret) {
-			dev_err(wdev->dev, "SET_BEACON_TEMPLATE: FW rejected (status=%u)\n",
-				cfm.status);
+			dev_err(wdev->dev, "Radio %u SET_BEACON_TEMPLATE: FW rejected (status=%u)\n",
+				radio->radio_idx, cfm.status);
 			ret = -EIO;
 		}
 		dma_unmap_single(wdev->dev, dma, total, DMA_TO_DEVICE);
@@ -936,14 +888,14 @@ static int wave600_send_beacon(struct wave600_dev *wdev,
 	 * ARC firmware periodic beacon engine DMAs this buffer across PCIe
 	 * on every beacon interval (~100ms). Free old buffer if reallocated.
 	 */
-	if (wdev->beacon_buf) {
-		dma_unmap_single(wdev->dev, wdev->beacon_dma, wdev->beacon_len,
+	if (radio->beacon_buf) {
+		dma_unmap_single(wdev->dev, radio->beacon_dma, radio->beacon_len,
 				 DMA_TO_DEVICE);
-		kfree(wdev->beacon_buf);
+		kfree(radio->beacon_buf);
 	}
-	wdev->beacon_buf = buf;
-	wdev->beacon_dma = dma;
-	wdev->beacon_len = total;
+	radio->beacon_buf = buf;
+	radio->beacon_dma = dma;
+	radio->beacon_len = total;
 
 	return 0;
 }
@@ -952,25 +904,22 @@ static int wave600_send_beacon(struct wave600_dev *wdev,
 /* cfg80211 operations                                                 */
 /* ------------------------------------------------------------------ */
 
-static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *ndev,
-				     struct cfg80211_ap_settings *settings)
+static int wave600_chandef_to_params(struct wave600_radio *radio,
+				     const struct cfg80211_chan_def *chandef,
+				     u8 *out_chan, u8 *out_width,
+				     u8 *out_low_chan, u8 *out_primary_idx)
 {
-	struct wave600_dev *wdev = *(struct wave600_dev **)wiphy_priv(wiphy);
-	bool is_5g;
+	bool is_5g = (radio->radio_idx == 1);
 	u8 chan, width, low_chan, primary_idx = 0;
-	int ret;
 
-	if (settings->chandef.chan->band != NL80211_BAND_2GHZ &&
-	    settings->chandef.chan->band != NL80211_BAND_5GHZ)
+	if (radio->radio_idx == 0 && chandef->chan->band != NL80211_BAND_2GHZ)
 		return -EOPNOTSUPP;
-	if (settings->ssid_len == 0 || settings->ssid_len > W600_SSID_MAX_LEN)
-		return -EINVAL;
+	if (radio->radio_idx == 1 && chandef->chan->band != NL80211_BAND_5GHZ)
+		return -EOPNOTSUPP;
 
-	is_5g = (settings->chandef.chan->band == NL80211_BAND_5GHZ);
-	chan = settings->chandef.chan->hw_value;
-	wdev->radio_idx = is_5g ? 1 : 0;
+	chan = chandef->chan->hw_value;
 
-	switch (settings->chandef.width) {
+	switch (chandef->width) {
 	case NL80211_CHAN_WIDTH_20:
 	case NL80211_CHAN_WIDTH_20_NOHT:
 		width = 0;	/* CW_20 */
@@ -980,19 +929,19 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 	case NL80211_CHAN_WIDTH_40:
 		width = 1;	/* CW_40 */
 		if (is_5g) {
-			u32 cf1 = settings->chandef.center_freq1;
+			u32 cf1 = chandef->center_freq1;
 			u32 low_freq = cf1 - 10;
 			low_chan = (u8)((low_freq - 5000) / 5);
 			primary_idx = (chan >= low_chan) ? (chan - low_chan) / 4 : 0;
 		} else {
-			low_chan = (settings->chandef.center_freq1 > settings->chandef.chan->center_freq) ? chan : (chan - 4);
+			low_chan = (chandef->center_freq1 > chandef->chan->center_freq) ? chan : (chan - 4);
 			primary_idx = (chan - low_chan) / 4;
 		}
 		break;
 	case NL80211_CHAN_WIDTH_80:
 		width = 2;	/* CW_80 */
 		if (is_5g) {
-			u32 cf1 = settings->chandef.center_freq1;
+			u32 cf1 = chandef->center_freq1;
 			u32 low_freq = cf1 - 30;
 			low_chan = (u8)((low_freq - 5000) / 5);
 			primary_idx = (chan >= low_chan) ? (chan - low_chan) / 4 : 0;
@@ -1003,7 +952,7 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 	case NL80211_CHAN_WIDTH_160:
 		width = 3;	/* CW_160 */
 		if (is_5g) {
-			u32 cf1 = settings->chandef.center_freq1;
+			u32 cf1 = chandef->center_freq1;
 			u32 low_freq = cf1 - 70;
 			low_chan = (u8)((low_freq - 5000) / 5);
 			primary_idx = (chan >= low_chan) ? (chan - low_chan) / 4 : 0;
@@ -1015,9 +964,37 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 		return -EOPNOTSUPP;
 	}
 
-	dev_info(wdev->dev, "start_ap: SSID '%.*s' band %s channel %d (low %u, idx %u) width %d (radio_idx %u)\n",
-		 (int)settings->ssid_len, settings->ssid,
-		 is_5g ? "5GHz" : "2.4GHz", chan, low_chan, primary_idx, width, wdev->radio_idx);
+	*out_chan = chan;
+	*out_width = width;
+	*out_low_chan = low_chan;
+	*out_primary_idx = primary_idx;
+	return 0;
+}
+
+static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *ndev,
+				     struct cfg80211_ap_settings *settings)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	struct wave600_dev *wdev = radio->wdev;
+	bool is_5g;
+	u8 chan, width, low_chan, primary_idx = 0;
+	int ret;
+
+	if (settings->ssid_len == 0 || settings->ssid_len > W600_SSID_MAX_LEN)
+		return -EINVAL;
+
+	ret = wave600_chandef_to_params(radio, &settings->chandef,
+					&chan, &width, &low_chan, &primary_idx);
+	if (ret)
+		return ret;
+
+	is_5g = (radio->radio_idx == 1);
+	radio->ap_channel = chan;
+	radio->ap_freq = settings->chandef.chan->center_freq;
+
+	dev_info(wdev->dev, "Radio %u start_ap: SSID '%.*s' band %s channel %d (low %u, idx %u) width %d\n",
+		 radio->radio_idx, (int)settings->ssid_len, settings->ssid,
+		 is_5g ? "5GHz" : "2.4GHz", chan, low_chan, primary_idx, width);
 
 	/*
 	 * Vendor AP bring-up sequence (verified against _mtlk_core_on_rcvry_configure
@@ -1028,112 +1005,102 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 	 *  3. SET_CHAN -> SET_TPC_ANT_PARAMS -> SET_TPC_CONFIG
 	 *  4. SET_BEACON_TEMPLATE -> SET_BEACON_INTERVAL -> SET_BSS
 	 */
-	ret = wave600_send_vap_db_add(wdev);
+	ret = wave600_send_vap_db_add(radio);
 	if (ret) {
-		dev_err(wdev->dev, "start_ap: VAP_DB ADD failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u start_ap: VAP_DB ADD failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
-	ret = wave600_send_mib_ieee_addr(wdev);
+	ret = wave600_send_mib_ieee_addr(radio);
 	if (ret) {
-		dev_err(wdev->dev, "start_ap: MIB_IEEE_ADDRESS failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u start_ap: MIB_IEEE_ADDRESS failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
 	/* Pseudo-ACK discriminator: verify the FW really stored the MAC */
-	wave600_diag_mib_readback(wdev, W600_MIB_IEEE_ADDRESS,
-				  wdev->ndev->dev_addr, ETH_ALEN,
+	wave600_diag_mib_readback(radio, W600_MIB_IEEE_ADDRESS,
+				  radio->ndev->dev_addr, ETH_ALEN,
 				  "IEEE_ADDRESS after SET");
 
-	ret = wave600_send_mib_pre_activate(wdev, is_5g);
+	ret = wave600_send_mib_pre_activate(radio, is_5g);
 	if (ret) {
-		dev_err(wdev->dev, "start_ap: MIB_PRE_ACTIVATE failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u start_ap: MIB_PRE_ACTIVATE failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
-	ret = wave600_send_mib_spectrum_mode(wdev);
+	ret = wave600_send_mib_spectrum_mode(radio);
 	if (ret) {
-		dev_err(wdev->dev, "start_ap: MIB_SPECTRUM_MODE failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u start_ap: MIB_SPECTRUM_MODE failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
-	ret = wave600_send_pre_activate(wdev);
+	ret = wave600_send_pre_activate(radio);
 	if (ret) {
-		dev_err(wdev->dev, "start_ap: MBSS_PRE_ACTIVATE failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u start_ap: MBSS_PRE_ACTIVATE failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
-	ret = wave600_send_add_vap(wdev, is_5g);
+	ret = wave600_send_add_vap(radio, is_5g);
 	if (ret) {
-		dev_err(wdev->dev, "start_ap: ADD_VAP failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u start_ap: ADD_VAP failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
-	ret = wave600_send_enable_radio(wdev);
-	if (ret) {
-		dev_err(wdev->dev, "start_ap: ENABLE_RADIO failed: %d\n", ret);
-		return ret;
+	if (!radio->radio_enabled) {
+		ret = wave600_send_enable_radio(radio, 1);
+		if (ret) {
+			dev_err(wdev->dev, "Radio %u start_ap: ENABLE_RADIO failed: %d\n", radio->radio_idx, ret);
+			return ret;
+		}
+		radio->radio_enabled = true;
 	}
 
-	wdev->ap_channel = chan;
-	ret = wave600_send_set_chan(wdev, low_chan, width, primary_idx);
+	ret = wave600_send_set_chan(radio, low_chan, width, primary_idx,
+				    W600_SWITCH_TYPE_NORMAL, 0);
 	if (ret) {
-		dev_err(wdev->dev, "start_ap: SET_CHAN failed: %d\n", ret);
-		return ret;
-	}
-
-	/* Vendor reloads TPC on every channel set (core_config.c
-	 * core_cfg_set_tx_power_limit -> mtlk_reload_tpc_wrapper: the
-	 * per-antenna TPC_FREQ entries first, then the TPC configuration). */
-	ret = wave600_send_tpc_ant_params(wdev, chan);
-	if (ret) {
-		dev_err(wdev->dev, "start_ap: SET_TPC_ANT_PARAMS failed: %d\n", ret);
-		return ret;
-	}
-
-	ret = wave600_send_tpc_config(wdev, chan);
-	if (ret) {
-		dev_err(wdev->dev, "start_ap: SET_TPC_CONFIG failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u start_ap: SET_CHAN failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
 	/* Vendor core_config.c:646-650 mtlk_core_set_coc_actual_power_mode -> MC_MAN_SET_ANTENNAS_REQ */
-	ret = wave600_send_set_antennas(wdev, wdev->antenna_mask ? wdev->antenna_mask : (is_5g ? 0x0A : 0x05));
+	ret = wave600_send_set_antennas(radio, radio->antenna_mask ? radio->antenna_mask : (is_5g ? 0x0A : 0x05));
 	if (ret) {
-		dev_err(wdev->dev, "start_ap: SET_ANTENNAS failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u start_ap: SET_ANTENNAS failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
-	ret = wave600_send_beacon(wdev, &settings->beacon);
+	ret = wave600_send_beacon(radio, &settings->beacon);
 	if (ret) {
-		dev_err(wdev->dev, "start_ap: SET_BEACON_TEMPLATE failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u start_ap: SET_BEACON_TEMPLATE failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
-	ret = wave600_send_set_bss(wdev, is_5g);
+	ret = wave600_send_set_bss(radio, is_5g);
 	if (ret) {
-		dev_err(wdev->dev, "start_ap: SET_BSS failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u start_ap: SET_BSS failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
 	/* Vendor core_config.c:150-205 _mtlk_core_cfg_wmm_param_send -> UM_MAN_SET_WMM_PARAMETERS_REQ */
-	ret = wave600_send_set_wmm_params(wdev);
+	ret = wave600_send_set_wmm_params(radio);
 	if (ret) {
-		dev_err(wdev->dev, "start_ap: SET_WMM_PARAMS failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u start_ap: SET_WMM_PARAMS failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
-	wdev->ap_started = true;
+	radio->ap_started = true;
 	netif_carrier_on(ndev);
 	netif_tx_wake_all_queues(ndev);
-	dev_info(wdev->dev, "AP started (VAP_DB -> MIBs -> PRE_ACTIVATE -> ADD_VAP -> ENABLE_RADIO -> SET_CHAN -> TPC -> ANTENNAS -> BEACON -> SET_BSS -> WMM confirmed)\n");
+	dev_info(wdev->dev, "Radio %u AP started on %s (%s, channel %u)\n",
+		 radio->radio_idx, ndev->name, is_5g ? "5GHz" : "2.4GHz", chan);
 	return 0;
 }
 
 static int wave600_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *ndev,
 				    unsigned int link_id)
 {
-	struct wave600_dev *wdev = *(struct wave600_dev **)wiphy_priv(wiphy);
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	struct wave600_dev *wdev = radio->wdev;
 	struct {
 		u16 status;
 		u8 vap_id;
@@ -1141,77 +1108,133 @@ static int wave600_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *ndev
 	} __packed p;
 	int ret;
 
-	if (!wdev->ap_started)
+	if (!radio->ap_started)
 		return 0;
 
 	netif_tx_stop_all_queues(ndev);
 	netif_carrier_off(ndev);
 
 	memset(&p, 0, sizeof(p));
-	p.vap_id = W600_VAP_ID;
+	p.vap_id = radio->vap_id;
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_STOP_VAP_TRAFFIC_REQ,
-			      WAVE600_MC_MAN_STOP_VAP_TRAFFIC_CFM,
-			      &p, sizeof(p), NULL, 0, 5000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_STOP_VAP_TRAFFIC_REQ,
+				    WAVE600_MC_MAN_STOP_VAP_TRAFFIC_CFM,
+				    &p, sizeof(p), NULL, 0, 5000,
+				    radio->vap_id);
 	if (ret)
-		dev_err(wdev->dev, "stop_ap: STOP_VAP_TRAFFIC failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u stop_ap: STOP_VAP_TRAFFIC failed: %d\n", radio->radio_idx, ret);
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_REMOVE_VAP_REQ,
-			      WAVE600_MC_MAN_REMOVE_VAP_CFM,
-			      &p, sizeof(p), NULL, 0, 5000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_REMOVE_VAP_REQ,
+				    WAVE600_MC_MAN_REMOVE_VAP_CFM,
+				    &p, sizeof(p), NULL, 0, 5000,
+				    radio->vap_id);
 	if (ret)
-		dev_err(wdev->dev, "stop_ap: REMOVE_VAP failed: %d\n", ret);
+		dev_err(wdev->dev, "Radio %u stop_ap: REMOVE_VAP failed: %d\n", radio->radio_idx, ret);
 
-	if (wdev->beacon_buf) {
-		dma_unmap_single(wdev->dev, wdev->beacon_dma, wdev->beacon_len,
-				 DMA_TO_DEVICE);
-		kfree(wdev->beacon_buf);
-		wdev->beacon_buf = NULL;
-		wdev->beacon_dma = 0;
-		wdev->beacon_len = 0;
+	ret = wave600_send_vap_db_del(radio);
+	if (ret)
+		dev_warn(wdev->dev, "Radio %u stop_ap: VAP_DB DEL failed: %d\n", radio->radio_idx, ret);
+
+	if (radio->radio_enabled) {
+		ret = wave600_send_enable_radio(radio, 0);
+		if (ret)
+			dev_warn(wdev->dev, "Radio %u stop_ap: DISABLE_RADIO failed: %d\n",
+				 radio->radio_idx, ret);
+		radio->radio_enabled = false;
 	}
 
-	wdev->ap_started = false;
-	wdev->sta_connected = false;
-	eth_zero_addr(wdev->sta_mac);
-	wdev->radio_idx = 0;
+	if (radio->beacon_buf) {
+		dma_unmap_single(wdev->dev, radio->beacon_dma, radio->beacon_len,
+				 DMA_TO_DEVICE);
+		kfree(radio->beacon_buf);
+		radio->beacon_buf = NULL;
+		radio->beacon_dma = 0;
+		radio->beacon_len = 0;
+	}
+
+	radio->ap_started = false;
+	radio->sta_connected = false;
+	eth_zero_addr(radio->sta_mac);
 	return 0;
 }
 
 static int wave600_cfg80211_change_beacon(struct wiphy *wiphy, struct net_device *ndev,
 					  struct cfg80211_ap_update *params)
 {
-	struct wave600_dev *wdev = *(struct wave600_dev **)wiphy_priv(wiphy);
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
 
-	return wave600_send_beacon(wdev, &params->beacon);
+	return wave600_send_beacon(radio, &params->beacon);
 }
 
 static int wave600_cfg80211_set_channel(struct wiphy *wiphy,
 					struct cfg80211_chan_def *chandef)
 {
-	struct wave600_dev *wdev = *(struct wave600_dev **)wiphy_priv(wiphy);
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	u8 chan, width, low_chan, primary_idx = 0;
+	int ret;
 
-	if (chandef->chan->band != NL80211_BAND_2GHZ &&
-	    chandef->chan->band != NL80211_BAND_5GHZ)
-		return -EOPNOTSUPP;
+	ret = wave600_chandef_to_params(radio, chandef, &chan, &width, &low_chan, &primary_idx);
+	if (ret)
+		return ret;
 
-	wdev->ap_channel = chandef->chan->hw_value;
-	if (!wdev->ap_started)
+	radio->ap_channel = chan;
+	radio->ap_freq = chandef->chan->center_freq;
+
+	if (!radio->ap_started)
 		return 0;
 
-	switch (chandef->width) {
-	case NL80211_CHAN_WIDTH_20:
-	case NL80211_CHAN_WIDTH_20_NOHT:
-		return wave600_send_set_chan(wdev, wdev->ap_channel, 0, 0);
-	case NL80211_CHAN_WIDTH_40:
-		return wave600_send_set_chan(wdev, wdev->ap_channel, 1, 0);
-	case NL80211_CHAN_WIDTH_80:
-		return wave600_send_set_chan(wdev, wdev->ap_channel, 2, 0);
-	case NL80211_CHAN_WIDTH_160:
-		return wave600_send_set_chan(wdev, wdev->ap_channel, 3, 0);
-	default:
-		return -EOPNOTSUPP;
+	dev_info(radio->wdev->dev, "Radio %u set_channel: band %s channel %u (low %u, idx %u, width %u)\n",
+		 radio->radio_idx, (radio->radio_idx == 1) ? "5GHz" : "2.4GHz",
+		 chan, low_chan, primary_idx, width);
+
+	/* Hot channel change: vendor sends SET_CHAN with switch_type=ST_NORMAL.
+	 * Do NOT send TPC commands here — vendor only reloads TPC during
+	 * start_ap; sending SET_TPC on hot channel change can crash the LM0
+	 * core in PowerAdaptation.c:1717. */
+	ret = wave600_send_set_chan(radio, low_chan, width, primary_idx,
+				    W600_SWITCH_TYPE_NORMAL, 0);
+	if (ret) {
+		dev_err(radio->wdev->dev, "Radio %u set_channel: SET_CHAN failed: %d\n",
+			radio->radio_idx, ret);
+		return ret;
 	}
+
+	return 0;
+}
+
+static int wave600_cfg80211_channel_switch(struct wiphy *wiphy,
+					   struct net_device *ndev,
+					   struct cfg80211_csa_settings *params)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	u8 chan, width, low_chan, primary_idx = 0;
+	int ret;
+
+	ret = wave600_chandef_to_params(radio, &params->chandef, &chan, &width, &low_chan, &primary_idx);
+	if (ret)
+		return ret;
+
+	dev_info(radio->wdev->dev, "Radio %u channel_switch: band %s channel %d -> %d (low %u, idx %u, width %d)\n",
+		 radio->radio_idx, (radio->radio_idx == 1) ? "5GHz" : "2.4GHz",
+		 radio->ap_channel, chan, low_chan, primary_idx, width);
+
+	/* CSA: vendor core_cfg_set_chan sets switch_type=ST_CSA and
+	 * chan_switch_time = nb_beacons * beacon_interval_ms. */
+	u16 chan_switch_time = params->count * W600_BEACON_INT;
+	ret = wave600_send_set_chan(radio, low_chan, width, primary_idx,
+				    W600_SWITCH_TYPE_CSA, chan_switch_time);
+	if (ret) {
+		dev_err(radio->wdev->dev, "Radio %u channel_switch: SET_CHAN failed: %d\n", radio->radio_idx, ret);
+		return ret;
+	}
+
+	radio->ap_channel = chan;
+	radio->ap_freq = params->chandef.chan->center_freq;
+
+	cfg80211_ch_switch_notify(ndev, &params->chandef, 0);
+	return 0;
 }
 
 static struct wireless_dev *
@@ -1226,7 +1249,7 @@ wave600_cfg80211_add_virt_intf(struct wiphy *wiphy, const char *name,
 	if (type != NL80211_IFTYPE_AP)
 		return ERR_PTR(-EOPNOTSUPP);
 
-	/* Single pre-created AP interface (wlan0) */
+	/* Static pre-created AP interfaces (wlan0, wlan1) */
 	return ERR_PTR(-ENOSPC);
 }
 
@@ -1239,16 +1262,6 @@ static int wave600_cfg80211_del_virt_intf(struct wiphy *wiphy, struct wireless_d
 	return -EBUSY;
 }
 
-/*
- * STA-side command stubs. Stock hostapd refuses to initialize a wiphy
- * that does not advertise NL80211_CMD_AUTHENTICATE (or CONNECT); the
- * kernel only lists those commands when the corresponding ops are
- * non-NULL. STA mode itself is not implemented - the FullMAC firmware
- * handles authentication/association for the AP, and stations are
- * reported from MC_MAN_NETWORK_EVENT_IND via cfg80211_new_sta().
- * Every stub logs its invocation, so hostapd's init sequence and the
- * exact nl80211 failing step are visible from dmesg.
- */
 static int wave600_cfg80211_auth(struct wiphy *wiphy, struct net_device *ndev,
 				 struct cfg80211_auth_request *req)
 {
@@ -1300,8 +1313,6 @@ static int wave600_cfg80211_change_virt_intf(struct wiphy *wiphy,
 	dev_info(wiphy_dev(wiphy), "cfg80211 op: change_virtual_intf (ndev %s -> type %d)\n",
 		 ndev->name, type);
 
-	/* hostapd issues SET_INTERFACE during BSS init; the only supported
-	 * configuration is the pre-created wlan0 already in AP mode. */
 	if (type != NL80211_IFTYPE_AP) {
 		dev_info(wiphy_dev(wiphy), "change_virtual_intf: type %d not supported\n",
 			 type);
@@ -1316,20 +1327,20 @@ static int wave600_cfg80211_mgmt_tx(struct wiphy *wiphy,
 				    struct cfg80211_mgmt_tx_params *params,
 				    u64 *cookie)
 {
-	struct wave600_dev *wdev = *(struct wave600_dev **)wiphy_priv(wiphy);
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
 	int ret;
 
-	if (!wdev || !params || !params->buf || !params->len)
+	if (!radio || !params || !params->buf || !params->len)
 		return -EINVAL;
 
-	*cookie = ++wdev->mgmt_tx_cookie;
+	*cookie = ++radio->mgmt_tx_cookie;
 
-	if (!wdev->ap_started) {
+	if (!radio->ap_started) {
 		cfg80211_mgmt_tx_status(wdev_net, *cookie, params->buf, params->len, false, GFP_KERNEL);
 		return 0;
 	}
 
-	ret = wave600_dma_mgmt_tx(wdev, params->buf, params->len);
+	ret = wave600_dma_mgmt_tx(radio, params->buf, params->len);
 	if (ret)
 		return ret;
 
@@ -1349,18 +1360,22 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 					const u8 *mac,
 					struct station_parameters *params)
 {
-	struct wave600_dev *wdev = *(struct wave600_dev **)wiphy_priv(wiphy);
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_request_sid sid_req;
 	struct wave600_umi_request_sid sid_cfm;
 	struct wave600_umi_sta_add req;
 	struct wave600_umi_sta_add cfm;
+	const u8 *rates = (radio->radio_idx == 1) ? wave600_rates_5g : wave600_rates_2g;
+	u8 rates_len = (radio->radio_idx == 1) ? sizeof(wave600_rates_5g) : sizeof(wave600_rates_2g);
 	u16 sid;
 	int ret;
 
-	if (!wdev->ap_started)
+	if (!radio->ap_started)
 		return -ENETDOWN;
 
-	dev_info(wdev->dev, "cfg80211: add station %pM (aid %u)\n", mac, params ? params->aid : 0);
+	dev_info(wdev->dev, "Radio %u cfg80211: add station %pM (aid %u)\n",
+		 radio->radio_idx, mac, params ? params->aid : 0);
 
 	/*
 	 * Step 1: Request a Station ID (SID) from FullMAC firmware.
@@ -1370,31 +1385,32 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 	 */
 	memset(&sid_req, 0, sizeof(sid_req));
 	ether_addr_copy(sid_req.addr, mac);
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_REQUEST_SID_REQ,
-			      WAVE600_MC_MAN_REQUEST_SID_CFM,
-			      &sid_req, sizeof(sid_req),
-			      &sid_cfm, sizeof(sid_cfm), 2000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_REQUEST_SID_REQ,
+				    WAVE600_MC_MAN_REQUEST_SID_CFM,
+				    &sid_req, sizeof(sid_req),
+				    &sid_cfm, sizeof(sid_cfm), 2000,
+				    radio->vap_id);
 	if (ret) {
-		dev_warn(wdev->dev, "REQUEST_SID IPC failed: %d\n", ret);
+		dev_warn(wdev->dev, "Radio %u REQUEST_SID IPC failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 	if (sid_cfm.status) {
-		dev_warn(wdev->dev, "REQUEST_SID rejected by FW: status=%u\n", sid_cfm.status);
+		dev_warn(wdev->dev, "Radio %u REQUEST_SID rejected by FW: status=%u\n",
+			 radio->radio_idx, sid_cfm.status);
 		return -EIO;
 	}
 
 	sid = le16_to_cpu(sid_cfm.sid);
-	dev_info(wdev->dev, "REQUEST_SID %pM confirmed: sid=%u\n", mac, sid);
+	dev_info(wdev->dev, "Radio %u REQUEST_SID %pM confirmed: sid=%u\n",
+		 radio->radio_idx, mac, sid);
 
 	/*
 	 * Step 2: Configure station capabilities via UM_MAN_STA_ADD_REQ (0x043B).
 	 */
-	const u8 *rates = (wdev->radio_idx == 1) ? wave600_rates_5g : wave600_rates_2g;
-	u8 rates_len = (wdev->radio_idx == 1) ? sizeof(wave600_rates_5g) : sizeof(wave600_rates_2g);
-
 	memset(&req, 0, sizeof(req));
 	req.sid = sid_cfm.sid;
-	req.vap_id = 0;
+	req.vap_id = radio->vap_id;
 	req.aid = cpu_to_le16(params && params->aid ? params->aid : (sid + 1));
 	ether_addr_copy(req.addr, mac);
 	req.rates_len = rates_len;
@@ -1413,29 +1429,33 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 		req.flags |= 0x10; /* STA_ADD_FLAGS_IS_HT */
 	}
 
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_STA_ADD_REQ,
-			      WAVE600_MC_MAN_STA_ADD_CFM,
-			      &req, sizeof(req), &cfm, sizeof(cfm), 2000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_STA_ADD_REQ,
+				    WAVE600_MC_MAN_STA_ADD_CFM,
+				    &req, sizeof(req), &cfm, sizeof(cfm), 2000,
+				    radio->vap_id);
 	if (ret) {
 		struct wave600_umi_remove_sid rem_req;
 		struct wave600_umi_remove_sid rem_cfm;
 
-		dev_warn(wdev->dev, "STA_ADD IPC failed: %d\n", ret);
+		dev_warn(wdev->dev, "Radio %u STA_ADD IPC failed: %d\n", radio->radio_idx, ret);
 		/* Cleanup allocated SID on error */
 		memset(&rem_req, 0, sizeof(rem_req));
 		rem_req.sid = sid_cfm.sid;
-		wave600_ipc_cmd(wdev, WAVE600_UM_MAN_REMOVE_SID_REQ,
-				WAVE600_MC_MAN_REMOVE_SID_CFM,
-				&rem_req, sizeof(rem_req),
-				&rem_cfm, sizeof(rem_cfm), 2000);
+		wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				      WAVE600_UM_MAN_REMOVE_SID_REQ,
+				      WAVE600_MC_MAN_REMOVE_SID_CFM,
+				      &rem_req, sizeof(rem_req),
+				      &rem_cfm, sizeof(rem_cfm), 2000,
+				      radio->vap_id);
 		return ret;
 	}
 
-	wdev->sta_connected = true;
-	wdev->sta_sid = sid;
-	ether_addr_copy(wdev->sta_mac, mac);
-	dev_info(wdev->dev, "STA_ADD %pM confirmed: status=%u sid=%u (flags=0x%02x)\n",
-		 mac, cfm.status, wdev->sta_sid, req.flags);
+	radio->sta_connected = true;
+	radio->sta_sid = sid;
+	ether_addr_copy(radio->sta_mac, mac);
+	dev_info(wdev->dev, "Radio %u STA_ADD %pM confirmed: status=%u sid=%u (flags=0x%02x)\n",
+		 radio->radio_idx, mac, cfm.status, radio->sta_sid, req.flags);
 
 	return 0;
 }
@@ -1445,10 +1465,10 @@ static int wave600_cfg80211_change_station(struct wiphy *wiphy,
 					   const u8 *mac,
 					   struct station_parameters *params)
 {
-	struct wave600_dev *wdev = *(struct wave600_dev **)wiphy_priv(wiphy);
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
 
-	dev_info(wdev->dev, "cfg80211: change station %pM (aid %u, flags_set=0x%x)\n",
-		 mac, params ? params->aid : 0, params ? params->sta_flags_set : 0);
+	dev_info(radio->wdev->dev, "Radio %u cfg80211: change station %pM (aid %u, flags_set=0x%x)\n",
+		 radio->radio_idx, mac, params ? params->aid : 0, params ? params->sta_flags_set : 0);
 
 	return 0;
 }
@@ -1457,7 +1477,8 @@ static int wave600_cfg80211_del_station(struct wiphy *wiphy,
 					struct net_device *ndev,
 					struct station_del_parameters *params)
 {
-	struct wave600_dev *wdev = *(struct wave600_dev **)wiphy_priv(wiphy);
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_stop_traffic sreq;
 	struct wave600_umi_stop_traffic scfm;
 	struct wave600_umi_sta_remove req;
@@ -1467,45 +1488,51 @@ static int wave600_cfg80211_del_station(struct wiphy *wiphy,
 	u16 sid;
 	int ret;
 
-	if (!wdev->ap_started || !wdev->sta_connected)
+	if (!radio->ap_started || !radio->sta_connected)
 		return 0;
 
-	if (params && params->mac && !ether_addr_equal(params->mac, wdev->sta_mac))
+	if (params && params->mac && !ether_addr_equal(params->mac, radio->sta_mac))
 		return 0;
 
-	sid = wdev->sta_sid;
-	dev_info(wdev->dev, "cfg80211: del station %pM (sid %u)\n",
-		 wdev->sta_mac, sid);
+	sid = radio->sta_sid;
+	dev_info(wdev->dev, "Radio %u cfg80211: del station %pM (sid %u)\n",
+		 radio->radio_idx, radio->sta_mac, sid);
 
 	/* Stop traffic queues before removing station to prevent FW assertion 0x03c2 */
 	memset(&sreq, 0, sizeof(sreq));
 	sreq.sid = cpu_to_le16(sid);
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_STOP_TRAFFIC_REQ,
-			      WAVE600_MC_MAN_STOP_TRAFFIC_CFM,
-			      &sreq, sizeof(sreq), &scfm, sizeof(scfm), 2000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_STOP_TRAFFIC_REQ,
+				    WAVE600_MC_MAN_STOP_TRAFFIC_CFM,
+				    &sreq, sizeof(sreq), &scfm, sizeof(scfm), 2000,
+				    radio->vap_id);
 	if (ret)
-		dev_warn(wdev->dev, "STOP_TRAFFIC IPC failed: %d\n", ret);
+		dev_warn(wdev->dev, "Radio %u STOP_TRAFFIC IPC failed: %d\n", radio->radio_idx, ret);
 
 	memset(&req, 0, sizeof(req));
 	req.sid = cpu_to_le16(sid);
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_STA_REMOVE_REQ,
-			      WAVE600_MC_MAN_STA_REMOVE_CFM,
-			      &req, sizeof(req), &cfm, sizeof(cfm), 2000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_STA_REMOVE_REQ,
+				    WAVE600_MC_MAN_STA_REMOVE_CFM,
+				    &req, sizeof(req), &cfm, sizeof(cfm), 2000,
+				    radio->vap_id);
 	if (ret)
-		dev_warn(wdev->dev, "STA_REMOVE IPC failed: %d\n", ret);
+		dev_warn(wdev->dev, "Radio %u STA_REMOVE IPC failed: %d\n", radio->radio_idx, ret);
 
 	/* Release SID in ARC firmware hardware table (vendor core.c:14879 UM_MAN_REMOVE_SID_REQ) */
 	memset(&rreq, 0, sizeof(rreq));
 	rreq.sid = cpu_to_le16(sid);
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_REMOVE_SID_REQ,
-			      WAVE600_MC_MAN_REMOVE_SID_CFM,
-			      &rreq, sizeof(rreq), &rcfm, sizeof(rcfm), 2000);
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_REMOVE_SID_REQ,
+				    WAVE600_MC_MAN_REMOVE_SID_CFM,
+				    &rreq, sizeof(rreq), &rcfm, sizeof(rcfm), 2000,
+				    radio->vap_id);
 	if (ret)
-		dev_warn(wdev->dev, "REMOVE_SID IPC failed: %d\n", ret);
+		dev_warn(wdev->dev, "Radio %u REMOVE_SID IPC failed: %d\n", radio->radio_idx, ret);
 
-	wdev->sta_connected = false;
-	wdev->sta_sid = 0;
-	eth_zero_addr(wdev->sta_mac);
+	radio->sta_connected = false;
+	radio->sta_sid = 0;
+	eth_zero_addr(radio->sta_mac);
 	return 0;
 }
 
@@ -1538,6 +1565,7 @@ static const struct cfg80211_ops wave600_cfg80211_ops = {
 	.stop_ap = wave600_cfg80211_stop_ap,
 	.change_beacon = wave600_cfg80211_change_beacon,
 	.set_monitor_channel = wave600_cfg80211_set_channel,
+	.channel_switch = wave600_cfg80211_channel_switch,
 	.mgmt_tx = wave600_cfg80211_mgmt_tx,
 	.mgmt_tx_cancel_wait = wave600_cfg80211_mgmt_tx_cancel_wait,
 	.add_station = wave600_cfg80211_add_station,
@@ -1616,27 +1644,6 @@ static void wave600_setup_band_5g(struct ieee80211_supported_band *band)
 /* Handler-liveness diagnostic (one-shot, end of probe)               */
 /* ------------------------------------------------------------------ */
 
-/*
- * Every mailbox confirmation observed so far carries only content the
- * host itself wrote (request residue) plus a zeroed u16 result - no
- * firmware-computed value has ever been verified through the mailbox.
- * The vendor driver notes that the firmware "may send pseudo-responses
- * for non-allocated messages" (hw_mmb.c, HW_RX_PEND_TIMER comment).
- * This one-shot diagnostic separates a live handler set from a generic
- * pseudo-ACK layer:
- *   1. positive control: GET_MAC_VERSION (0x0408) must return the FW
- *      version string in the CFM payload - text the host never wrote
- *      into any slot. The request payload is zero-prefilled so any
- *      non-zero response content must come from the firmware;
- *   2. positive control: GET_MIB readback (start_ap) must return the
- *      value the host previously SET.
- * The former negative controls (SET_CHAN chan=200, SET_MIB 0xDEAD)
- * were REMOVED 2026-10-31: they established that the firmware does not
- * validate parameters, but if the messages are actually applied they
- * actively wedge the RF/PHY state machine before every start_ap, so
- * every beacon test ran on a possibly corrupted radio state. Only
- * read-only probes remain - start_ap now runs on a clean radio state.
- */
 void wave600_diag_handlers_probe(struct wave600_dev *wdev)
 {
 	struct wave600_mac_version ver;
@@ -1645,7 +1652,7 @@ void wave600_diag_handlers_probe(struct wave600_dev *wdev)
 	int i;
 	bool nonzero = false;
 
-	/* 1. Positive control: GET_MAC_VERSION (read-only) */
+	/* Positive control: GET_MAC_VERSION (read-only) */
 	memset(req, 0, sizeof(req));
 	memset(&ver, 0, sizeof(ver));
 	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_GET_MAC_VERSION_REQ,
@@ -1671,216 +1678,264 @@ void wave600_diag_handlers_probe(struct wave600_dev *wdev)
 	}
 }
 
-int wave600_cfg80211_init(struct wave600_dev *wdev)
+/* ------------------------------------------------------------------ */
+/* DBDC Radio Registration                                            */
+/* ------------------------------------------------------------------ */
+
+static const u8 wlan_macs[2][ETH_ALEN] = {
+	{ 0x02, 0x50, 0x43, 0x00, 0x00, 0x01 }, /* wlan0: 2.4 GHz */
+	{ 0x02, 0x50, 0x43, 0x00, 0x00, 0x02 }, /* wlan1: 5 GHz */
+};
+
+static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 {
+	struct wave600_radio *radio = &wdev->radios[radio_idx];
 	struct wiphy *wiphy;
 	struct ieee80211_supported_band *band;
 	struct wireless_dev *wdev_net;
 	int ret;
 
-	wiphy = wiphy_new(&wave600_cfg80211_ops, sizeof(struct wave600_dev *));
+	radio->wdev = wdev;
+	radio->radio_idx = radio_idx;
+	radio->ep = (radio_idx == 0) ? 1 : 0;
+	radio->vap_id = 0; /* primary AP VAP index is 0 on both radios */
+	radio->antenna_mask = (radio_idx == 0) ? 0x05 : 0x0A;
+
+	wiphy = wiphy_new(&wave600_cfg80211_ops, sizeof(struct wave600_radio *));
 	if (!wiphy)
 		return -ENOMEM;
 
-	/* priv points back at wdev */
-	*(struct wave600_dev **)wiphy_priv(wiphy) = wdev;
+	/* priv points back at radio */
+	*(struct wave600_radio **)wiphy_priv(wiphy) = radio;
+	radio->wiphy = wiphy;
 
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_AP);
 	wiphy->flags |= WIPHY_FLAG_REPORTS_OBSS;
 	wiphy->mgmt_stypes = wave600_mgmt_stypes;
-	wiphy->bands[NL80211_BAND_2GHZ] =
-		kzalloc(sizeof(*wiphy->bands[NL80211_BAND_2GHZ]), GFP_KERNEL);
-	if (!wiphy->bands[NL80211_BAND_2GHZ]) {
-		ret = -ENOMEM;
-		goto err_wiphy;
-	}
-
-	band = wiphy->bands[NL80211_BAND_2GHZ];
-	band->channels = kcalloc(13, sizeof(struct ieee80211_channel), GFP_KERNEL);
-	band->bitrates = kcalloc(12, sizeof(struct ieee80211_rate), GFP_KERNEL);
-	if (!band->channels || !band->bitrates) {
-		ret = -ENOMEM;
-		goto err_band_2g;
-	}
-	wave600_setup_band_2g(band);
-
-	/* Bitrates (500 kbps units as cfg80211_rate flags) */
-	{
-		static const int rates[] = { 10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540 };
-		static const u32 flags[] = { IEEE80211_RATE_SHORT_PREAMBLE | IEEE80211_RATE_MANDATORY_B,
-					     IEEE80211_RATE_SHORT_PREAMBLE | IEEE80211_RATE_MANDATORY_B,
-					     IEEE80211_RATE_SHORT_PREAMBLE | IEEE80211_RATE_MANDATORY_B,
-					     IEEE80211_RATE_SHORT_PREAMBLE | IEEE80211_RATE_MANDATORY_B,
-					     0, 0, 0, 0, 0, 0, 0, 0 };
-		int i;
-
-		for (i = 0; i < 12; i++) {
-			band->bitrates[i].bitrate = rates[i];
-			band->bitrates[i].flags = flags[i];
-			band->bitrates[i].hw_value = i;
-		}
-		band->n_bitrates = 12;
-	}
-
-	/* HT20 capabilities, single stream (MCS 0-7) */
-	band->ht_cap.ht_supported = true;
-	band->ht_cap.cap = IEEE80211_HT_CAP_SGI_20 | BIT(8);	/* RX STBC 1SS */
-	band->ht_cap.ampdu_factor = IEEE80211_HT_MAX_AMPDU_32K;
-	band->ht_cap.ampdu_density = IEEE80211_HT_MPDU_DENSITY_16;
-	memset(&band->ht_cap.mcs, 0, sizeof(band->ht_cap.mcs));
-	band->ht_cap.mcs.rx_mask[0] = 0xff;
-
-	/* 5 GHz Band */
-	wiphy->bands[NL80211_BAND_5GHZ] =
-		kzalloc(sizeof(*wiphy->bands[NL80211_BAND_5GHZ]), GFP_KERNEL);
-	if (!wiphy->bands[NL80211_BAND_5GHZ]) {
-		ret = -ENOMEM;
-		goto err_band_2g;
-	}
-
-	band = wiphy->bands[NL80211_BAND_5GHZ];
-	band->channels = kcalloc(25, sizeof(struct ieee80211_channel), GFP_KERNEL);
-	band->bitrates = kcalloc(8, sizeof(struct ieee80211_rate), GFP_KERNEL);
-	if (!band->channels || !band->bitrates) {
-		ret = -ENOMEM;
-		goto err_band_5g;
-	}
-	wave600_setup_band_5g(band);
-
-	/* 5 GHz Bitrates (6, 9, 12, 18, 24, 36, 48, 54 Mbps in 100 kbps units) */
-	{
-		static const int rates_5g[] = { 60, 90, 120, 180, 240, 360, 480, 540 };
-		static const u32 flags_5g[] = {
-			IEEE80211_RATE_MANDATORY_A,
-			0,
-			IEEE80211_RATE_MANDATORY_A,
-			0,
-			IEEE80211_RATE_MANDATORY_A,
-			0, 0, 0
-		};
-		int i;
-
-		for (i = 0; i < 8; i++) {
-			band->bitrates[i].bitrate = rates_5g[i];
-			band->bitrates[i].flags = flags_5g[i];
-			band->bitrates[i].hw_value = i;
-		}
-		band->n_bitrates = 8;
-	}
-
-	/* HT20/40 capabilities, single stream (MCS 0-7) */
-	band->ht_cap.ht_supported = true;
-	band->ht_cap.cap = IEEE80211_HT_CAP_SGI_20 | IEEE80211_HT_CAP_SGI_40 |
-			   IEEE80211_HT_CAP_SUP_WIDTH_20_40 | BIT(8); /* RX STBC 1SS */
-	band->ht_cap.ampdu_factor = IEEE80211_HT_MAX_AMPDU_32K;
-	band->ht_cap.ampdu_density = IEEE80211_HT_MPDU_DENSITY_16;
-	memset(&band->ht_cap.mcs, 0, sizeof(band->ht_cap.mcs));
-	band->ht_cap.mcs.rx_mask[0] = 0xff;
-
-	/* VHT capabilities (80 / 160 MHz) */
-	band->vht_cap.vht_supported = true;
-	band->vht_cap.cap = IEEE80211_VHT_CAP_SHORT_GI_80 |
-			    IEEE80211_VHT_CAP_SHORT_GI_160 |
-			    IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ |
-			    IEEE80211_VHT_CAP_RXSTBC_1;
-	band->vht_cap.vht_mcs.rx_mcs_map = cpu_to_le16(0xfffa);
-	band->vht_cap.vht_mcs.tx_mcs_map = cpu_to_le16(0xfffa);
-
 	wiphy->signal_type = CFG80211_SIGNAL_TYPE_UNSPEC;
 	wiphy->max_scan_ssids = 1;
 	strscpy(wiphy->fw_version, wdev->fw_version, sizeof(wiphy->fw_version));
 
-	wdev->ndev = alloc_netdev(sizeof(struct wireless_dev), "wlan%d",
-				  NET_NAME_UNKNOWN, ether_setup);
-	if (!wdev->ndev) {
-		ret = -ENOMEM;
-		goto err_band_5g;
+	if (radio_idx == 0) {
+		/* 2.4 GHz Band Only */
+		wiphy->bands[NL80211_BAND_2GHZ] =
+			kzalloc(sizeof(*wiphy->bands[NL80211_BAND_2GHZ]), GFP_KERNEL);
+		if (!wiphy->bands[NL80211_BAND_2GHZ]) {
+			ret = -ENOMEM;
+			goto err_wiphy;
+		}
+
+		band = wiphy->bands[NL80211_BAND_2GHZ];
+		band->channels = kcalloc(13, sizeof(struct ieee80211_channel), GFP_KERNEL);
+		band->bitrates = kcalloc(12, sizeof(struct ieee80211_rate), GFP_KERNEL);
+		if (!band->channels || !band->bitrates) {
+			ret = -ENOMEM;
+			goto err_band;
+		}
+		wave600_setup_band_2g(band);
+
+		{
+			static const int rates[] = { 10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540 };
+			static const u32 flags[] = {
+				IEEE80211_RATE_SHORT_PREAMBLE | IEEE80211_RATE_MANDATORY_B,
+				IEEE80211_RATE_SHORT_PREAMBLE | IEEE80211_RATE_MANDATORY_B,
+				IEEE80211_RATE_SHORT_PREAMBLE | IEEE80211_RATE_MANDATORY_B,
+				IEEE80211_RATE_SHORT_PREAMBLE | IEEE80211_RATE_MANDATORY_B,
+				0, 0, 0, 0, 0, 0, 0, 0
+			};
+			int i;
+
+			for (i = 0; i < 12; i++) {
+				band->bitrates[i].bitrate = rates[i];
+				band->bitrates[i].flags = flags[i];
+				band->bitrates[i].hw_value = i;
+			}
+			band->n_bitrates = 12;
+		}
+
+		band->ht_cap.ht_supported = true;
+		band->ht_cap.cap = IEEE80211_HT_CAP_SGI_20 | BIT(8); /* RX STBC 1SS */
+		band->ht_cap.ampdu_factor = IEEE80211_HT_MAX_AMPDU_32K;
+		band->ht_cap.ampdu_density = IEEE80211_HT_MPDU_DENSITY_16;
+		memset(&band->ht_cap.mcs, 0, sizeof(band->ht_cap.mcs));
+		band->ht_cap.mcs.rx_mask[0] = 0xff;
+	} else {
+		/* 5 GHz Band Only */
+		wiphy->bands[NL80211_BAND_5GHZ] =
+			kzalloc(sizeof(*wiphy->bands[NL80211_BAND_5GHZ]), GFP_KERNEL);
+		if (!wiphy->bands[NL80211_BAND_5GHZ]) {
+			ret = -ENOMEM;
+			goto err_wiphy;
+		}
+
+		band = wiphy->bands[NL80211_BAND_5GHZ];
+		band->channels = kcalloc(25, sizeof(struct ieee80211_channel), GFP_KERNEL);
+		band->bitrates = kcalloc(8, sizeof(struct ieee80211_rate), GFP_KERNEL);
+		if (!band->channels || !band->bitrates) {
+			ret = -ENOMEM;
+			goto err_band;
+		}
+		wave600_setup_band_5g(band);
+
+		{
+			static const int rates_5g[] = { 60, 90, 120, 180, 240, 360, 480, 540 };
+			static const u32 flags_5g[] = {
+				IEEE80211_RATE_MANDATORY_A,
+				0,
+				IEEE80211_RATE_MANDATORY_A,
+				0,
+				IEEE80211_RATE_MANDATORY_A,
+				0, 0, 0
+			};
+			int i;
+
+			for (i = 0; i < 8; i++) {
+				band->bitrates[i].bitrate = rates_5g[i];
+				band->bitrates[i].flags = flags_5g[i];
+				band->bitrates[i].hw_value = i;
+			}
+			band->n_bitrates = 8;
+		}
+
+		band->ht_cap.ht_supported = true;
+		band->ht_cap.cap = IEEE80211_HT_CAP_SGI_20 | IEEE80211_HT_CAP_SGI_40 |
+				   IEEE80211_HT_CAP_SUP_WIDTH_20_40 | BIT(8); /* RX STBC 1SS */
+		band->ht_cap.ampdu_factor = IEEE80211_HT_MAX_AMPDU_32K;
+		band->ht_cap.ampdu_density = IEEE80211_HT_MPDU_DENSITY_16;
+		memset(&band->ht_cap.mcs, 0, sizeof(band->ht_cap.mcs));
+		band->ht_cap.mcs.rx_mask[0] = 0xff;
+
+		band->vht_cap.vht_supported = true;
+		band->vht_cap.cap = IEEE80211_VHT_CAP_SHORT_GI_80 |
+				    IEEE80211_VHT_CAP_SHORT_GI_160 |
+				    IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ |
+				    IEEE80211_VHT_CAP_RXSTBC_1;
+		band->vht_cap.vht_mcs.rx_mcs_map = cpu_to_le16(0xfffa);
+		band->vht_cap.vht_mcs.tx_mcs_map = cpu_to_le16(0xfffa);
 	}
-	SET_NETDEV_DEV(wdev->ndev, wdev->dev);
-	wdev_net = netdev_priv(wdev->ndev);
+
+	radio->ndev = alloc_netdev(sizeof(struct wireless_dev),
+				   (radio_idx == 0) ? "wlan0" : "wlan1",
+				   NET_NAME_UNKNOWN, ether_setup);
+	if (!radio->ndev) {
+		ret = -ENOMEM;
+		goto err_band;
+	}
+	SET_NETDEV_DEV(radio->ndev, wdev->dev);
+	wdev_net = netdev_priv(radio->ndev);
 	wdev_net->iftype = NL80211_IFTYPE_AP;
 	wdev_net->wiphy = wiphy;
-	wdev_net->netdev = wdev->ndev;
-	wdev->ndev->ieee80211_ptr = wdev_net;
-	eth_hw_addr_random(wdev->ndev);
-	wdev->ndev->netdev_ops = &wave600_netdev_ops;
+	wdev_net->netdev = radio->ndev;
+	radio->ndev->ieee80211_ptr = wdev_net;
+	eth_hw_addr_set(radio->ndev, wlan_macs[radio_idx]);
+	radio->ndev->netdev_ops = &wave600_netdev_ops;
 
 	ret = wiphy_register(wiphy);
 	if (ret)
 		goto err_ndev;
 
-	ret = register_netdev(wdev->ndev);
+	ret = register_netdev(radio->ndev);
 	if (ret)
 		goto err_wiphy_reg;
 
-	wdev->wiphy = wiphy;
-	wdev->wdev_net = wdev_net;
-	dev_info(wdev->dev, "cfg80211 wiphy registered, AP interface %s (dual-band 2.4/5GHz ready)\n",
-		 wdev->ndev->name);
+	radio->wdev_net = wdev_net;
+	dev_info(wdev->dev, "cfg80211 wiphy registered for Radio %u (%s, AP %s, MAC %pM)\n",
+		 radio_idx, (radio_idx == 0) ? "2.4GHz" : "5GHz",
+		 radio->ndev->name, radio->ndev->dev_addr);
 	return 0;
 
 err_wiphy_reg:
 	wiphy_unregister(wiphy);
 err_ndev:
-	free_netdev(wdev->ndev);
-err_band_5g:
-	if (wiphy->bands[NL80211_BAND_5GHZ]) {
-		kfree(wiphy->bands[NL80211_BAND_5GHZ]->bitrates);
-		kfree(wiphy->bands[NL80211_BAND_5GHZ]->channels);
-		kfree(wiphy->bands[NL80211_BAND_5GHZ]);
-		wiphy->bands[NL80211_BAND_5GHZ] = NULL;
-	}
-err_band_2g:
+	free_netdev(radio->ndev);
+	radio->ndev = NULL;
+err_band:
 	if (wiphy->bands[NL80211_BAND_2GHZ]) {
 		kfree(wiphy->bands[NL80211_BAND_2GHZ]->bitrates);
 		kfree(wiphy->bands[NL80211_BAND_2GHZ]->channels);
 		kfree(wiphy->bands[NL80211_BAND_2GHZ]);
 		wiphy->bands[NL80211_BAND_2GHZ] = NULL;
 	}
+	if (wiphy->bands[NL80211_BAND_5GHZ]) {
+		kfree(wiphy->bands[NL80211_BAND_5GHZ]->bitrates);
+		kfree(wiphy->bands[NL80211_BAND_5GHZ]->channels);
+		kfree(wiphy->bands[NL80211_BAND_5GHZ]);
+		wiphy->bands[NL80211_BAND_5GHZ] = NULL;
+	}
 err_wiphy:
 	wiphy_free(wiphy);
+	radio->wiphy = NULL;
 	return ret;
+}
+
+static void wave600_radio_cleanup(struct wave600_radio *radio)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	struct ieee80211_supported_band *band;
+
+	if (radio->beacon_buf) {
+		dma_unmap_single(wdev->dev, radio->beacon_dma, radio->beacon_len,
+				 DMA_TO_DEVICE);
+		kfree(radio->beacon_buf);
+		radio->beacon_buf = NULL;
+		radio->beacon_dma = 0;
+		radio->beacon_len = 0;
+	}
+
+	if (radio->ndev) {
+		unregister_netdev(radio->ndev);
+		free_netdev(radio->ndev);
+		radio->ndev = NULL;
+	}
+
+	if (!radio->wiphy)
+		return;
+
+	wiphy_unregister(radio->wiphy);
+
+	band = radio->wiphy->bands[NL80211_BAND_5GHZ];
+	if (band) {
+		kfree(band->bitrates);
+		kfree(band->channels);
+		kfree(band);
+		radio->wiphy->bands[NL80211_BAND_5GHZ] = NULL;
+	}
+
+	band = radio->wiphy->bands[NL80211_BAND_2GHZ];
+	if (band) {
+		kfree(band->bitrates);
+		kfree(band->channels);
+		kfree(band);
+		radio->wiphy->bands[NL80211_BAND_2GHZ] = NULL;
+	}
+
+	wiphy_free(radio->wiphy);
+	radio->wiphy = NULL;
+}
+
+int wave600_cfg80211_init(struct wave600_dev *wdev)
+{
+	int ret;
+
+	ret = wave600_radio_init(wdev, 0);
+	if (ret) {
+		dev_err(wdev->dev, "failed to initialize Radio 0 (2.4 GHz): %d\n", ret);
+		return ret;
+	}
+
+	ret = wave600_radio_init(wdev, 1);
+	if (ret) {
+		dev_err(wdev->dev, "failed to initialize Radio 1 (5 GHz): %d\n", ret);
+		wave600_radio_cleanup(&wdev->radios[0]);
+		return ret;
+	}
+
+	dev_info(wdev->dev, "DBDC Wi-Fi ready: wlan0 (2.4 GHz) and wlan1 (5 GHz) registered\n");
+	return 0;
 }
 
 void wave600_cfg80211_cleanup(struct wave600_dev *wdev)
 {
-	struct ieee80211_supported_band *band;
-
-	if (wdev->beacon_buf) {
-		dma_unmap_single(wdev->dev, wdev->beacon_dma, wdev->beacon_len,
-				 DMA_TO_DEVICE);
-		kfree(wdev->beacon_buf);
-		wdev->beacon_buf = NULL;
-		wdev->beacon_dma = 0;
-		wdev->beacon_len = 0;
-	}
-
-	if (!wdev->wiphy)
-		return;
-
-	if (wdev->ndev) {
-		unregister_netdev(wdev->ndev);
-		free_netdev(wdev->ndev);
-		wdev->ndev = NULL;
-	}
-	wiphy_unregister(wdev->wiphy);
-
-	band = wdev->wiphy->bands[NL80211_BAND_5GHZ];
-	if (band) {
-		kfree(band->bitrates);
-		kfree(band->channels);
-		kfree(band);
-		wdev->wiphy->bands[NL80211_BAND_5GHZ] = NULL;
-	}
-
-	band = wdev->wiphy->bands[NL80211_BAND_2GHZ];
-	if (band) {
-		kfree(band->bitrates);
-		kfree(band->channels);
-		kfree(band);
-		wdev->wiphy->bands[NL80211_BAND_2GHZ] = NULL;
-	}
-
-	wiphy_free(wdev->wiphy);
-	wdev->wiphy = NULL;
+	wave600_radio_cleanup(&wdev->radios[1]);
+	wave600_radio_cleanup(&wdev->radios[0]);
 }

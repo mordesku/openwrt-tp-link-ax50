@@ -302,9 +302,16 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 		 * offset 16 (4-byte aligned), preventing fatal MIPS ADEL exceptions.
 		 * (Canon pattern from grx500-datapath.c:1445-1463).
 		 */
+		u32 info1 = le32_to_cpu(hd->info1);
+		u8 ep = FIELD_GET(W600_TX_EP, info1);
+		u8 radio_idx = (ep ^ 1) & 1;
+		struct wave600_radio *radio = (radio_idx < 2) ? &wdev->radios[radio_idx] : NULL;
+		struct net_device *ndev = (radio && radio->ndev) ? radio->ndev : dma->ndev;
+
 		skb = napi_alloc_skb(&dma->napi, len);
 		if (unlikely(!skb)) {
-			dma->ndev->stats.rx_dropped++;
+			if (ndev)
+				ndev->stats.rx_dropped++;
 			dma_sync_single_for_device(wdev->dev, buf->dma,
 						   buf->size, DMA_FROM_DEVICE);
 			goto recycle_reuse;
@@ -314,13 +321,15 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 		dma_sync_single_for_device(wdev->dev, buf->dma, buf->size,
 					   DMA_FROM_DEVICE);
 
-		skb->protocol = eth_type_trans(skb, dma->ndev);
+		skb->protocol = eth_type_trans(skb, ndev);
 		skb->ip_summed = CHECKSUM_NONE;
 
 		napi_gro_receive(&dma->napi, skb);
 		dma->rx_packets++;
-		dma->ndev->stats.rx_packets++;
-		dma->ndev->stats.rx_bytes += len;
+		if (ndev) {
+			ndev->stats.rx_packets++;
+			ndev->stats.rx_bytes += len;
+		}
 
 recycle_reuse:
 		recycle_hd = *hd;
@@ -425,18 +434,18 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 
 			if (len > 0 && offset + len <= buf->size) {
 				u8 *data = buf->skb->data + offset;
-				int freq;
-
-				if (wdev->ap_channel >= 36 || wdev->radio_idx == 1)
-					freq = wdev->ap_channel ? (5000 + wdev->ap_channel * 5) : 5180;
-				else
-					freq = wdev->ap_channel ? (2412 + (wdev->ap_channel - 1) * 5) : 2437;
+				u32 info1 = le32_to_cpu(hd->info1);
+				u8 ep = FIELD_GET(W600_TX_EP, info1);
+				u8 radio_idx = (ep ^ 1) & 1;
+				struct wave600_radio *radio = (radio_idx < 2) ? &wdev->radios[radio_idx] : NULL;
+				int freq = (radio && radio->ap_freq) ? radio->ap_freq :
+					   ((radio_idx == 1) ? 5180 : 2437);
 
 				dma_sync_single_for_cpu(wdev->dev, buf->dma,
 							buf->size, DMA_FROM_DEVICE);
 
-				if (wdev->ap_started && wdev->wdev_net)
-					cfg80211_rx_mgmt(wdev->wdev_net, freq, 0,
+				if (radio && radio->ap_started && radio->wdev_net)
+					cfg80211_rx_mgmt(radio->wdev_net, freq, 0,
 							 data, len, 0);
 
 				dma_sync_single_for_device(wdev->dev, buf->dma,
@@ -476,8 +485,9 @@ static int wave600_dma_mgmt_tx_clean(struct wave600_dma *dma, int budget)
 	return processed;
 }
 
-int wave600_dma_mgmt_tx(struct wave600_dev *wdev, const u8 *buf, size_t len)
+int wave600_dma_mgmt_tx(struct wave600_radio *radio, const u8 *buf, size_t len)
 {
+	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_dma *dma = &wdev->dma;
 	struct wave600_dma_ring *r = &dma->mgmt_tx;
 	struct wave600_host_dsc hd;
@@ -488,7 +498,7 @@ int wave600_dma_mgmt_tx(struct wave600_dev *wdev, const u8 *buf, size_t len)
 	u8 type, subtype;
 	bool mcf;
 
-	if (!dma->data_path_ready || !dma->mgmt_tx_pool || !wdev->ap_started)
+	if (!dma->data_path_ready || !dma->mgmt_tx_pool || !radio->ap_started)
 		return -ENETDOWN;
 
 	if (len > WAVE600_DMA_MGMT_BUF_SIZE)
@@ -507,15 +517,15 @@ int wave600_dma_mgmt_tx(struct wave600_dev *wdev, const u8 *buf, size_t len)
 
 	info0_val = FIELD_PREP(GENMASK(25, 24), type) |
 		    FIELD_PREP(GENMASK(29, 26), subtype) |
-		    FIELD_PREP(W600_TX_VAPID, 0);
+		    FIELD_PREP(W600_TX_VAPID, radio->vap_id);
 
 	if (subtype == 0x0d && len > 24)
 		info0_val |= FIELD_PREP(GENMASK(23, 17), buf[24]);
 
 	if (mcf) {
 		info0_val |= W600_TX_MCF;
-	} else if (wdev->sta_connected && len >= 10 && ether_addr_equal(buf + 4, wdev->sta_mac)) {
-		info0_val |= FIELD_PREP(W600_TX_STAID, wdev->sta_sid);
+	} else if (radio->sta_connected && len >= 10 && ether_addr_equal(buf + 4, radio->sta_mac)) {
+		info0_val |= FIELD_PREP(W600_TX_STAID, radio->sta_sid);
 	} else {
 		info0_val |= W600_TX_UNKNOWN_SID;
 	}
@@ -523,7 +533,7 @@ int wave600_dma_mgmt_tx(struct wave600_dev *wdev, const u8 *buf, size_t len)
 	memset(&hd, 0, sizeof(hd));
 	hd.info0 = cpu_to_le32(info0_val);
 	hd.info1 = cpu_to_le32(FIELD_PREP(W600_TX_CLASS, 15) |
-			       FIELD_PREP(W600_TX_EP, (wdev->radio_idx ^ 1) & 1));
+			       FIELD_PREP(W600_TX_EP, radio->ep));
 	hd.payload_addr = cpu_to_le32((u32)slot_dma);
 	hd.info3 = cpu_to_le32(FIELD_PREP(W600_TX_SOP_EOP, W600_NO_FRAG) |
 			       FIELD_PREP(W600_TX_OFFSET, 0) |
@@ -575,13 +585,20 @@ bool wave600_dma_schedule_napi(struct wave600_dev *wdev)
 
 netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
-	struct wave600_dev *wdev =
-		*(struct wave600_dev **)wiphy_priv(ndev->ieee80211_ptr->wiphy);
-	struct wave600_dma *dma = &wdev->dma;
+	struct wave600_radio *radio = wave600_ndev_to_radio(ndev);
+	struct wave600_dev *wdev;
+	struct wave600_dma *dma;
 	struct wave600_host_dsc hd;
 	dma_addr_t dma_addr;
 	u32 bd;
 	unsigned long flags;
+	u32 info0;
+
+	if (!radio)
+		goto drop;
+
+	wdev = radio->wdev;
+	dma = &wdev->dma;
 
 	if (!dma->data_path_ready) {
 		dma->tx_dropped++;
@@ -610,28 +627,25 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	dma->tx_in_use++;
 	spin_unlock_irqrestore(&dma->tx_lock, flags);
 
-	u8 ep = (wdev->radio_idx ^ 1) & 1;
-	u32 info0;
-
 	memset(&hd, 0, sizeof(hd));
 	/*
 	 * Vendor _mtlk_hw_send_data + _mtlk_mmb_put_hd_to_ring (hw_mmb.c:8346-8437):
-	 *  - In DB_2x2 mode, radio_id 0 maps to ep_bit = 1,
-	 *  - VAPID in info0 is local VAP index (0) (hw_mmb.c:8408),
+	 *  - In DB_2x2 mode, radio_id 0 maps to ep_bit = 1, radio_id 1 maps to ep_bit = 0.
+	 *  - VAPID in info0 is radio->vap_id (0 for primary AP on both radios).
 	 *  - All 5 HOST_DSC words are converted with cpu_to_le32() on write.
 	 */
-	info0 = FIELD_PREP(W600_TX_VAPID, 0) |
+	info0 = FIELD_PREP(W600_TX_VAPID, radio->vap_id) |
 		FIELD_PREP(W600_TX_FRAMETYPE, W600_FRAME_TYPE_ETHERNET);
 	if (is_multicast_ether_addr(skb->data)) {
 		info0 |= W600_TX_MCF;
-	} else if (wdev->sta_connected && ether_addr_equal(skb->data, wdev->sta_mac)) {
-		info0 |= FIELD_PREP(W600_TX_STAID, wdev->sta_sid);
+	} else if (radio->sta_connected && ether_addr_equal(skb->data, radio->sta_mac)) {
+		info0 |= FIELD_PREP(W600_TX_STAID, radio->sta_sid);
 	} else {
 		info0 |= W600_TX_UNKNOWN_SID;
 	}
 	hd.info0 = cpu_to_le32(info0);
 	hd.info1 = cpu_to_le32(FIELD_PREP(W600_TX_CLASS, skb->priority & 7) |
-			       FIELD_PREP(W600_TX_EP, ep));
+			       FIELD_PREP(W600_TX_EP, radio->ep));
 	hd.payload_addr = cpu_to_le32((u32)(dma_addr & ~7));
 	hd.info3 = cpu_to_le32(FIELD_PREP(W600_TX_SOP_EOP, W600_NO_FRAG) |
 			       FIELD_PREP(W600_TX_OFFSET, dma_addr & 7) |
@@ -974,18 +988,26 @@ int wave600_dma_data_path_start(struct wave600_dev *wdev)
 }
 
 /*
- * Bind the AP netdev (created by the cfg80211 layer, which owns its
- * lifecycle) to the DMA layer: NAPI, carrier state and TX queue.
+ * Bind the AP netdevs (created by the cfg80211 layer, which owns their
+ * lifecycle) to the DMA layer: NAPI, carrier state and TX queues.
  */
-void wave600_dma_attach(struct wave600_dev *wdev, struct net_device *ndev)
+void wave600_dma_attach(struct wave600_dev *wdev)
 {
 	struct wave600_dma *dma = &wdev->dma;
+	int i;
 
-	dma->ndev = ndev;
+	dma->ndev = wdev->radios[0].ndev;
 	wave600_dma_enable_napi(wdev);
-	netif_carrier_off(ndev);
-	netif_tx_stop_all_queues(ndev);
-	netif_start_queue(ndev);
+
+	for (i = 0; i < 2; i++) {
+		struct net_device *ndev = wdev->radios[i].ndev;
+
+		if (ndev) {
+			netif_carrier_off(ndev);
+			netif_tx_stop_all_queues(ndev);
+			netif_start_queue(ndev);
+		}
+	}
 }
 
 void wave600_dma_enable_napi(struct wave600_dev *wdev)

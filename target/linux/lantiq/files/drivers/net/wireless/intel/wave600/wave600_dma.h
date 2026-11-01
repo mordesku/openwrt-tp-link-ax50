@@ -9,6 +9,7 @@
 #include <linux/netdevice.h>
 
 struct wave600_dev;
+struct wave600_radio;
 
 /*
  * Ring geometry. Vendor defaults are 4096 for TX/RX and 128 for the
@@ -140,12 +141,12 @@ struct wave600_dma {
 int wave600_dma_post_rx_pool(struct wave600_dev *wdev);
 int wave600_dma_init(struct wave600_dev *wdev);
 int wave600_dma_data_path_start(struct wave600_dev *wdev);
-void wave600_dma_attach(struct wave600_dev *wdev, struct net_device *ndev);
+void wave600_dma_attach(struct wave600_dev *wdev);
 void wave600_dma_cleanup(struct wave600_dev *wdev);
 void wave600_dma_enable_napi(struct wave600_dev *wdev);
 bool wave600_dma_schedule_napi(struct wave600_dev *wdev);
 netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev);
-int wave600_dma_mgmt_tx(struct wave600_dev *wdev, const u8 *buf, size_t len);
+int wave600_dma_mgmt_tx(struct wave600_radio *radio, const u8 *buf, size_t len);
 extern const struct net_device_ops wave600_netdev_ops;
 void wave600_dma_stop_netdev(struct wave600_dev *wdev);
 

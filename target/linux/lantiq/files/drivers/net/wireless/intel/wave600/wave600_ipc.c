@@ -325,12 +325,15 @@ static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 					int i;
 
 					for (i = 0; i < min_t(u8, err->num_entries, 8); i++) {
+						u8 r_idx = (radio < 2) ? radio : 0;
+						struct net_device *ndev = wdev->radios[r_idx].ndev;
+
 						dev_warn_ratelimited(wdev->dev,
 							"Class 3 Error: vap=%u addr=%pM\n",
 							err->entries[i].vap_id,
 							err->entries[i].addr);
-						if (wdev->ndev)
-							cfg80211_rx_spurious_frame(wdev->ndev,
+						if (ndev)
+							cfg80211_rx_spurious_frame(ndev,
 										   err->entries[i].addr,
 										   GFP_ATOMIC);
 					}
@@ -642,10 +645,10 @@ irqreturn_t wave600_ipc_isr(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-int wave600_ipc_cmd_vap(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
-			const void *req_payload, size_t req_len,
-			void *cfm_payload, size_t cfm_len, unsigned long timeout_ms,
-			u32 vap)
+int wave600_ipc_cmd_radio(struct wave600_dev *wdev, u8 radio_idx, u16 req_id, u16 cfm_id,
+			  const void *req_payload, size_t req_len,
+			  void *cfm_payload, size_t cfm_len, unsigned long timeout_ms,
+			  u32 vap)
 {
 	struct wave600_ipc *ipc = &wdev->ipc;
 	struct wave600_ipc_cmd *cmd = NULL;
@@ -706,7 +709,7 @@ int wave600_ipc_cmd_vap(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
 	mmiowb();
 
 	/* Format 32-bit descriptor for Request FIFO */
-	descr = wave600_msg_to_descr(WAVE600_MSG_TYPE_MAN_REQ, slot, wdev->radio_idx, vap);
+	descr = wave600_msg_to_descr(WAVE600_MSG_TYPE_MAN_REQ, slot, radio_idx, vap);
 
 	/* Write descriptor into Request FIFO and advance index */
 	wave600_write32(wdev, ipc->req_offset + (ipc->req_idx * sizeof(u32)), descr);
@@ -745,12 +748,23 @@ int wave600_ipc_cmd_vap(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
 	return ret;
 }
 
+int wave600_ipc_cmd_vap(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
+			const void *req_payload, size_t req_len,
+			void *cfm_payload, size_t cfm_len, unsigned long timeout_ms,
+			u32 vap)
+{
+	return wave600_ipc_cmd_radio(wdev, wdev->radio_idx, req_id, cfm_id,
+				     req_payload, req_len, cfm_payload, cfm_len,
+				     timeout_ms, vap);
+}
+
 int wave600_ipc_cmd(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
 		    const void *req_payload, size_t req_len,
 		    void *cfm_payload, size_t cfm_len, unsigned long timeout_ms)
 {
-	return wave600_ipc_cmd_vap(wdev, req_id, cfm_id, req_payload, req_len,
-				   cfm_payload, cfm_len, timeout_ms, 0);
+	return wave600_ipc_cmd_radio(wdev, wdev->radio_idx, req_id, cfm_id,
+				     req_payload, req_len, cfm_payload, cfm_len,
+				     timeout_ms, 0);
 }
 
 int wave600_ipc_init(struct wave600_dev *wdev)

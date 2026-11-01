@@ -462,9 +462,13 @@ static int wave600_cal_dummy_vap_add(struct wave600_dev *wdev)
 {
 	struct wave600_cal_dummy_add_vap req;
 
+	struct wave600_radio *radio = (wdev->radio_idx < 2) ? &wdev->radios[wdev->radio_idx] : NULL;
+
 	memset(&req, 0, sizeof(req));
-	if (wdev->ndev)
-		memcpy(req.bssid, wdev->ndev->dev_addr, sizeof(req.bssid));
+	if (radio && radio->ndev)
+		memcpy(req.bssid, radio->ndev->dev_addr, sizeof(req.bssid));
+	else
+		eth_random_addr(req.bssid);
 	req.bssid[5] += wdev->radio_idx; /* unique for every radio (vendor wave_radio.c:4807) */
 	req.vap_id = 0;
 	req.operation_mode = 0;
