@@ -27,6 +27,7 @@
 #include "wave600_regs.h"
 #include "wave600_ipc.h"
 #include "wave600_dma.h"
+#include "wave600_cal.h"
 
 #define W600_BEACON_INT		100
 #define W600_DTIM		1
@@ -93,19 +94,6 @@ struct wave600_umi_set_bss {
 	u8 reserved[3];
 } __packed;
 
-struct wave600_umi_beacon_set {
-	u32 host_address;	/* DMA address of the template buffer */
-	u16 part1_len;
-	u16 part2_len;
-	u16 part3_len;
-	u16 part4_len;
-	u16 part5_len;
-	u8 vap_index;
-	u8 status;
-	u8 add_bss_load_ie;
-	u8 reserved;
-} __packed;
-
 /* UMI_VAP_DB_OP: vendor sends this once per VAP at interface start */
 struct wave600_umi_vap_db_op {
 	u8 operation_code;	/* VAP_OPERATION_ADD = 1 */
@@ -137,6 +125,14 @@ struct wave600_umi_beacon_interval {
 /* UMI_ENABLE_RADIO */
 struct wave600_umi_enable_radio {
 	u32 radio_on;
+} __packed;
+
+/* UMI tpcAntParams_t (mhi_mib_id.h): per-antenna frequency calibration curves */
+struct wave600_umi_tpc_ant_params {
+	u8 ant;
+	u8 tpc_freq_len;
+	u16 padding;
+	u8 tpc_freq[8 * WAVE600_TPC_FREQ_SIZE];
 } __packed;
 
 /* UMI tpcConfig_t (mhi_mib_id.h): TX power control configuration.
@@ -230,6 +226,9 @@ static const u8 wave600_rates_5g[] = {
 #define W600_MIB_PRE_ACTIVATE			0x0109
 #define W600_MIB_SPECTRUM_MODE			0x1202
 #define W600_MIB_SPECTRUM_20M			0
+#define W600_MIB_SPECTRUM_40M			1
+#define W600_MIB_SPECTRUM_80M			2
+#define W600_MIB_SPECTRUM_160M			3
 #define W600_MIB_IEEE_ADDRESS			0x0040
 #define W600_NETWORK_11BGN_MIXED		5	/* NETWORK_MODES_E (2.4 GHz) */
 #define W600_NETWORK_11AN_MIXED			8	/* NETWORK_MODES_E (5 GHz) */
@@ -240,14 +239,23 @@ static const u8 wave600_rates_5g[] = {
 #define W600_OPERATE_RATE_SET_11AN		0xffff80ffU
 #define W600_BSS_BASIC_RATE_SET_11AN		0x00000015U
 
+/* SET_BSS / ADD_VAP capability flags (mhi_umi.h) */
+#define W600_VAP_FLAG_HT			0x01
+#define W600_VAP_FLAG_VHT			0x02
+#define W600_VAP_FLAG_HE			0x04
+
+/* STA_ADD capability flags (mhi_umi.h) */
+#define W600_STA_FLAG_WME			0x02
+#define W600_STA_FLAG_8021X_OPEN		0x04
+#define W600_STA_FLAG_MFP			0x08
+#define W600_STA_FLAG_HT			0x10
+#define W600_STA_FLAG_VHT			0x20
+#define W600_STA_FLAG_EXT_HE			0x02
+
 /* TPC (mhi_mib_id.h) */
 #define W600_TPC_CAL_TYPE_LOGARITHMIC		1
 #define W600_TPC_OPEN_LOOP			1
 #define W600_TPC_NO_FIXED_GAIN			0xFF
-/* Large limit: vendor clamps with MIN(power_cfg, psd_value), so a large
- * regulation limit makes the firmware apply its own PSDB value. Vendor
- * warns that zero limits crash the FW. */
-#define W600_TPC_LIMIT_MAX			0x7FFF
 
 /*
  * switch_type values (switchType enum, mhi_umi_propr.h):
@@ -256,6 +264,594 @@ static const u8 wave600_rates_5g[] = {
  */
 #define W600_SWITCH_TYPE_NORMAL		0
 #define W600_SWITCH_TYPE_CSA		2
+
+/* Forward declaration for wave600_set_country() */
+static int wave600_send_tpc_config(struct wave600_radio *radio, u8 chan, bool is_5g);
+
+/*
+ * Regulatory domain country-to-code mapping table (vendor mtlk_psdb.c)
+ */
+struct wave600_country_to_domain {
+	char country[3];
+	u8 regd_code;
+};
+
+static const struct wave600_country_to_domain country_regdcode_table[] = {
+	{"??", WAVE600_REGD_CODE_UNKNOWN},
+	{"AD", WAVE600_REGD_CODE_ETSI},
+	{"AE", WAVE600_REGD_CODE_UAE},
+	{"AF", WAVE600_REGD_CODE_ETSI},
+	{"AG", WAVE600_REGD_CODE_FCC},
+	{"AI", WAVE600_REGD_CODE_FCC},
+	{"AL", WAVE600_REGD_CODE_ETSI},
+	{"AM", WAVE600_REGD_CODE_ETSI},
+	{"AN", WAVE600_REGD_CODE_FCC},
+	{"AO", WAVE600_REGD_CODE_ETSI},
+	{"AQ", WAVE600_REGD_CODE_ETSI},
+	{"AR", WAVE600_REGD_CODE_FCC},
+	{"AS", WAVE600_REGD_CODE_ETSI},
+	{"AT", WAVE600_REGD_CODE_ETSI},
+	{"AU", WAVE600_REGD_CODE_AUSTRALIA},
+	{"AW", WAVE600_REGD_CODE_FCC},
+	{"AX", WAVE600_REGD_CODE_ETSI},
+	{"AZ", WAVE600_REGD_CODE_ETSI},
+	{"BA", WAVE600_REGD_CODE_ETSI},
+	{"BB", WAVE600_REGD_CODE_FCC},
+	{"BD", WAVE600_REGD_CODE_MKK},
+	{"BE", WAVE600_REGD_CODE_ETSI},
+	{"BF", WAVE600_REGD_CODE_MKK},
+	{"BG", WAVE600_REGD_CODE_ETSI},
+	{"BH", WAVE600_REGD_CODE_ETSI},
+	{"BI", WAVE600_REGD_CODE_ETSI},
+	{"BJ", WAVE600_REGD_CODE_ETSI},
+	{"BL", WAVE600_REGD_CODE_FCC},
+	{"BM", WAVE600_REGD_CODE_FCC},
+	{"BN", WAVE600_REGD_CODE_MKK},
+	{"BO", WAVE600_REGD_CODE_FCC},
+	{"BR", WAVE600_REGD_CODE_BRAZIL},
+	{"BS", WAVE600_REGD_CODE_FCC},
+	{"BT", WAVE600_REGD_CODE_MKK},
+	{"BV", WAVE600_REGD_CODE_MKK},
+	{"BW", WAVE600_REGD_CODE_MKK},
+	{"BY", WAVE600_REGD_CODE_ETSI},
+	{"BZ", WAVE600_REGD_CODE_FCC},
+	{"CA", WAVE600_REGD_CODE_DOC},
+	{"CC", WAVE600_REGD_CODE_MKK},
+	{"CD", WAVE600_REGD_CODE_MKK},
+	{"CF", WAVE600_REGD_CODE_ETSI},
+	{"CG", WAVE600_REGD_CODE_ETSI},
+	{"CH", WAVE600_REGD_CODE_ETSI},
+	{"CI", WAVE600_REGD_CODE_MKK},
+	{"CK", WAVE600_REGD_CODE_MKK},
+	{"CL", WAVE600_REGD_CODE_FCC},
+	{"CM", WAVE600_REGD_CODE_ETSI},
+	{"CN", WAVE600_REGD_CODE_CHINA},
+	{"CO", WAVE600_REGD_CODE_FCC},
+	{"CR", WAVE600_REGD_CODE_FCC},
+	{"CU", WAVE600_REGD_CODE_FCC},
+	{"CV", WAVE600_REGD_CODE_MKK},
+	{"CX", WAVE600_REGD_CODE_MKK},
+	{"CY", WAVE600_REGD_CODE_ETSI},
+	{"CZ", WAVE600_REGD_CODE_ETSI},
+	{"DE", WAVE600_REGD_CODE_ETSI},
+	{"DJ", WAVE600_REGD_CODE_MKK},
+	{"DK", WAVE600_REGD_CODE_ETSI},
+	{"DM", WAVE600_REGD_CODE_FCC},
+	{"DO", WAVE600_REGD_CODE_FCC},
+	{"DZ", WAVE600_REGD_CODE_ETSI},
+	{"EC", WAVE600_REGD_CODE_FCC},
+	{"EE", WAVE600_REGD_CODE_ETSI},
+	{"EG", WAVE600_REGD_CODE_ETSI},
+	{"ER", WAVE600_REGD_CODE_ETSI},
+	{"ES", WAVE600_REGD_CODE_SPAIN},
+	{"ET", WAVE600_REGD_CODE_ETSI},
+	{"FI", WAVE600_REGD_CODE_ETSI},
+	{"FJ", WAVE600_REGD_CODE_MKK},
+	{"FK", WAVE600_REGD_CODE_ETSI},
+	{"FM", WAVE600_REGD_CODE_FCC},
+	{"FO", WAVE600_REGD_CODE_ETSI},
+	{"FR", WAVE600_REGD_CODE_FRANCE},
+	{"GA", WAVE600_REGD_CODE_ETSI},
+	{"GB", WAVE600_REGD_CODE_ETSI},
+	{"GD", WAVE600_REGD_CODE_FCC},
+	{"GE", WAVE600_REGD_CODE_ETSI},
+	{"GF", WAVE600_REGD_CODE_ETSI},
+	{"GG", WAVE600_REGD_CODE_ETSI},
+	{"GH", WAVE600_REGD_CODE_MKK},
+	{"GI", WAVE600_REGD_CODE_ETSI},
+	{"GL", WAVE600_REGD_CODE_ETSI},
+	{"GM", WAVE600_REGD_CODE_ETSI},
+	{"GN", WAVE600_REGD_CODE_ETSI},
+	{"GP", WAVE600_REGD_CODE_ETSI},
+	{"GQ", WAVE600_REGD_CODE_ETSI},
+	{"GR", WAVE600_REGD_CODE_ETSI},
+	{"GS", WAVE600_REGD_CODE_ETSI},
+	{"GT", WAVE600_REGD_CODE_FCC},
+	{"GU", WAVE600_REGD_CODE_FCC},
+	{"GW", WAVE600_REGD_CODE_ETSI},
+	{"GY", WAVE600_REGD_CODE_FCC},
+	{"HK", WAVE600_REGD_CODE_ETSI},
+	{"HM", WAVE600_REGD_CODE_MKK},
+	{"HN", WAVE600_REGD_CODE_FCC},
+	{"HR", WAVE600_REGD_CODE_ETSI},
+	{"HT", WAVE600_REGD_CODE_FCC},
+	{"HU", WAVE600_REGD_CODE_ETSI},
+	{"ID", WAVE600_REGD_CODE_MKK},
+	{"IE", WAVE600_REGD_CODE_ETSI},
+	{"IL", WAVE600_REGD_CODE_ISRAEL},
+	{"IM", WAVE600_REGD_CODE_ETSI},
+	{"IN", WAVE600_REGD_CODE_MKK},
+	{"IQ", WAVE600_REGD_CODE_ETSI},
+	{"IR", WAVE600_REGD_CODE_ETSI},
+	{"IS", WAVE600_REGD_CODE_ETSI},
+	{"IT", WAVE600_REGD_CODE_ETSI},
+	{"JE", WAVE600_REGD_CODE_ETSI},
+	{"JM", WAVE600_REGD_CODE_FCC},
+	{"JO", WAVE600_REGD_CODE_ETSI},
+	{"JP", WAVE600_REGD_CODE_JAPAN},
+	{"KE", WAVE600_REGD_CODE_ETSI},
+	{"KG", WAVE600_REGD_CODE_ETSI},
+	{"KH", WAVE600_REGD_CODE_MKK},
+	{"KI", WAVE600_REGD_CODE_MKK},
+	{"KM", WAVE600_REGD_CODE_ETSI},
+	{"KN", WAVE600_REGD_CODE_FCC},
+	{"KP", WAVE600_REGD_CODE_MKK},
+	{"KR", WAVE600_REGD_CODE_KOREA},
+	{"KW", WAVE600_REGD_CODE_ETSI},
+	{"KY", WAVE600_REGD_CODE_FCC},
+	{"KZ", WAVE600_REGD_CODE_ETSI},
+	{"LA", WAVE600_REGD_CODE_MKK},
+	{"LB", WAVE600_REGD_CODE_ETSI},
+	{"LC", WAVE600_REGD_CODE_FCC},
+	{"LI", WAVE600_REGD_CODE_ETSI},
+	{"LK", WAVE600_REGD_CODE_MKK},
+	{"LR", WAVE600_REGD_CODE_ETSI},
+	{"LS", WAVE600_REGD_CODE_ETSI},
+	{"LT", WAVE600_REGD_CODE_ETSI},
+	{"LU", WAVE600_REGD_CODE_ETSI},
+	{"LV", WAVE600_REGD_CODE_ETSI},
+	{"LY", WAVE600_REGD_CODE_ETSI},
+	{"MA", WAVE600_REGD_CODE_ETSI},
+	{"MC", WAVE600_REGD_CODE_ETSI},
+	{"MD", WAVE600_REGD_CODE_ETSI},
+	{"ME", WAVE600_REGD_CODE_ETSI},
+	{"MF", WAVE600_REGD_CODE_FCC},
+	{"MG", WAVE600_REGD_CODE_ETSI},
+	{"MH", WAVE600_REGD_CODE_FCC},
+	{"MK", WAVE600_REGD_CODE_ETSI},
+	{"ML", WAVE600_REGD_CODE_ETSI},
+	{"MM", WAVE600_REGD_CODE_MKK},
+	{"MN", WAVE600_REGD_CODE_MKK},
+	{"MO", WAVE600_REGD_CODE_MKK},
+	{"MP", WAVE600_REGD_CODE_FCC},
+	{"MQ", WAVE600_REGD_CODE_ETSI},
+	{"MR", WAVE600_REGD_CODE_ETSI},
+	{"MS", WAVE600_REGD_CODE_FCC},
+	{"MT", WAVE600_REGD_CODE_ETSI},
+	{"MU", WAVE600_REGD_CODE_ETSI},
+	{"MV", WAVE600_REGD_CODE_MKK},
+	{"MW", WAVE600_REGD_CODE_ETSI},
+	{"MX", WAVE600_REGD_CODE_FCC},
+	{"MY", WAVE600_REGD_CODE_MKK},
+	{"MZ", WAVE600_REGD_CODE_ETSI},
+	{"NA", WAVE600_REGD_CODE_ETSI},
+	{"NC", WAVE600_REGD_CODE_ETSI},
+	{"NE", WAVE600_REGD_CODE_ETSI},
+	{"NF", WAVE600_REGD_CODE_MKK},
+	{"NG", WAVE600_REGD_CODE_ETSI},
+	{"NI", WAVE600_REGD_CODE_FCC},
+	{"NL", WAVE600_REGD_CODE_ETSI},
+	{"NO", WAVE600_REGD_CODE_ETSI},
+	{"NP", WAVE600_REGD_CODE_MKK},
+	{"NR", WAVE600_REGD_CODE_MKK},
+	{"NU", WAVE600_REGD_CODE_MKK},
+	{"NZ", WAVE600_REGD_CODE_AUSTRALIA},
+	{"OM", WAVE600_REGD_CODE_ETSI},
+	{"PA", WAVE600_REGD_CODE_FCC},
+	{"PE", WAVE600_REGD_CODE_FCC},
+	{"PF", WAVE600_REGD_CODE_ETSI},
+	{"PG", WAVE600_REGD_CODE_MKK},
+	{"PH", WAVE600_REGD_CODE_MKK},
+	{"PK", WAVE600_REGD_CODE_ETSI},
+	{"PL", WAVE600_REGD_CODE_ETSI},
+	{"PM", WAVE600_REGD_CODE_ETSI},
+	{"PR", WAVE600_REGD_CODE_FCC},
+	{"PS", WAVE600_REGD_CODE_ETSI},
+	{"PT", WAVE600_REGD_CODE_ETSI},
+	{"PW", WAVE600_REGD_CODE_FCC},
+	{"PY", WAVE600_REGD_CODE_FCC},
+	{"QA", WAVE600_REGD_CODE_ETSI},
+	{"RE", WAVE600_REGD_CODE_ETSI},
+	{"RO", WAVE600_REGD_CODE_ETSI},
+	{"RS", WAVE600_REGD_CODE_ETSI},
+	{"RU", WAVE600_REGD_CODE_ETSI},
+	{"RW", WAVE600_REGD_CODE_ETSI},
+	{"SA", WAVE600_REGD_CODE_ETSI},
+	{"SB", WAVE600_REGD_CODE_MKK},
+	{"SC", WAVE600_REGD_CODE_ETSI},
+	{"SE", WAVE600_REGD_CODE_ETSI},
+	{"SG", WAVE600_REGD_CODE_SINGAPORE},
+	{"SH", WAVE600_REGD_CODE_ETSI},
+	{"SI", WAVE600_REGD_CODE_ETSI},
+	{"SJ", WAVE600_REGD_CODE_ETSI},
+	{"SK", WAVE600_REGD_CODE_ETSI},
+	{"SL", WAVE600_REGD_CODE_ETSI},
+	{"SM", WAVE600_REGD_CODE_ETSI},
+	{"SN", WAVE600_REGD_CODE_ETSI},
+	{"SO", WAVE600_REGD_CODE_ETSI},
+	{"SR", WAVE600_REGD_CODE_FCC},
+	{"ST", WAVE600_REGD_CODE_ETSI},
+	{"SV", WAVE600_REGD_CODE_FCC},
+	{"SY", WAVE600_REGD_CODE_ETSI},
+	{"SZ", WAVE600_REGD_CODE_ETSI},
+	{"TC", WAVE600_REGD_CODE_FCC},
+	{"TD", WAVE600_REGD_CODE_ETSI},
+	{"TF", WAVE600_REGD_CODE_MKK},
+	{"TG", WAVE600_REGD_CODE_ETSI},
+	{"TH", WAVE600_REGD_CODE_MKK},
+	{"TJ", WAVE600_REGD_CODE_ETSI},
+	{"TK", WAVE600_REGD_CODE_MKK},
+	{"TL", WAVE600_REGD_CODE_MKK},
+	{"TM", WAVE600_REGD_CODE_ETSI},
+	{"TN", WAVE600_REGD_CODE_ETSI},
+	{"TO", WAVE600_REGD_CODE_ETSI},
+	{"TR", WAVE600_REGD_CODE_ETSI},
+	{"TT", WAVE600_REGD_CODE_ETSI},
+	{"TV", WAVE600_REGD_CODE_MKK},
+	{"TW", WAVE600_REGD_CODE_MKK},
+	{"TZ", WAVE600_REGD_CODE_ETSI},
+	{"UA", WAVE600_REGD_CODE_ETSI},
+	{"UG", WAVE600_REGD_CODE_FCC},
+	{"UM", WAVE600_REGD_CODE_FCC},
+	{"US", WAVE600_REGD_CODE_FCC},
+	{"UY", WAVE600_REGD_CODE_FCC},
+	{"UZ", WAVE600_REGD_CODE_ETSI},
+	{"VA", WAVE600_REGD_CODE_ETSI},
+	{"VC", WAVE600_REGD_CODE_FCC},
+	{"VE", WAVE600_REGD_CODE_FCC},
+	{"VG", WAVE600_REGD_CODE_FCC},
+	{"VI", WAVE600_REGD_CODE_FCC},
+	{"VN", WAVE600_REGD_CODE_MKK},
+	{"VU", WAVE600_REGD_CODE_MKK},
+	{"WF", WAVE600_REGD_CODE_ETSI},
+	{"WS", WAVE600_REGD_CODE_MKK},
+	{"YE", WAVE600_REGD_CODE_ETSI},
+	{"YT", WAVE600_REGD_CODE_ETSI},
+	{"ZA", WAVE600_REGD_CODE_ETSI},
+	{"ZM", WAVE600_REGD_CODE_ETSI},
+	{"ZW", WAVE600_REGD_CODE_ETSI},
+};
+
+static u8 wave600_country_to_regd_code(const char *country)
+{
+	int i;
+
+	if (!country || !country[0])
+		return WAVE600_REGD_CODE_ETSI;
+
+	for (i = 0; i < ARRAY_SIZE(country_regdcode_table); i++) {
+		if (country[0] == country_regdcode_table[i].country[0] &&
+		    country[1] == country_regdcode_table[i].country[1])
+			return country_regdcode_table[i].regd_code;
+	}
+
+	return WAVE600_REGD_CODE_ETSI;
+}
+
+static u8 wave600_regd_code_to_region(u8 regd_code)
+{
+	switch (regd_code) {
+	case WAVE600_REGD_CODE_FCC:
+	case WAVE600_REGD_CODE_DOC:
+		return WAVE600_REG_DOMAIN_FCC;
+
+	case WAVE600_REGD_CODE_ETSI:
+	case WAVE600_REGD_CODE_SPAIN:
+	case WAVE600_REGD_CODE_FRANCE:
+	case WAVE600_REGD_CODE_UAE:
+	case WAVE600_REGD_CODE_GERMANY:
+		return WAVE600_REG_DOMAIN_ETSI;
+
+	case WAVE600_REGD_CODE_MKK:
+	case WAVE600_REGD_CODE_JAPAN:
+	case WAVE600_REGD_CODE_ISRAEL:
+	case WAVE600_REGD_CODE_SINGAPORE:
+	case WAVE600_REGD_CODE_AUSTRALIA:
+		return WAVE600_REG_DOMAIN_JAPAN;
+
+	case WAVE600_REGD_CODE_CHINA:
+		return WAVE600_REG_DOMAIN_CHINA;
+
+	case WAVE600_REGD_CODE_KOREA:
+		return WAVE600_REG_DOMAIN_KOREA;
+
+	default:
+		return WAVE600_REG_DOMAIN_ETSI;
+	}
+}
+
+int wave600_send_reg_domain_config(struct wave600_dev *wdev, u8 region)
+{
+	struct wave600_umi_reg_domain_config p;
+	int ret;
+
+	memset(&p, 0, sizeof(p));
+	p.reg_domain_config = region;
+	p.get_set_operation = 0; /* SET */
+
+	ret = wave600_ipc_cmd(wdev,
+			      WAVE600_UM_MAN_SET_REG_DOMAIN_CONFIG_REQ,
+			      WAVE600_MC_MAN_SET_REG_DOMAIN_CONFIG_CFM,
+			      &p, sizeof(p), NULL, 0, 5000);
+	if (ret) {
+		dev_warn(wdev->dev, "SET_REG_DOMAIN_CONFIG (region=%u) failed: %d\n", region, ret);
+		return ret;
+	}
+
+	dev_info(wdev->dev, "SET_REG_DOMAIN_CONFIG confirmed: region=%u (%s)\n",
+		 region, (region == WAVE600_REG_DOMAIN_ETSI) ? "ETSI" :
+			 (region == WAVE600_REG_DOMAIN_FCC) ? "FCC" :
+			 (region == WAVE600_REG_DOMAIN_JAPAN) ? "JAPAN" :
+			 (region == WAVE600_REG_DOMAIN_CHINA) ? "CHINA" :
+			 (region == WAVE600_REG_DOMAIN_KOREA) ? "KOREA" : "OTHER");
+	return 0;
+}
+
+/*
+ * Vendor _mtlk_core_cfg_init_pw_lim_offset (core.c:3391): on master VAP init
+ * the host reads the FW powerLimitOffset via UM_MAN_SET_POWER_LIMIT_REQ
+ * (0x045F) with API_GET_OPERATION. A non-zero offset shifts the whole TX
+ * power table down; log it so a silent clamp is visible.
+ */
+static int wave600_get_power_limit_offset(struct wave600_dev *wdev)
+{
+	struct wave600_umi_tx_power_limit req, cfm;
+	int ret;
+
+	memset(&req, 0, sizeof(req));
+	req.get_set_operation = W600_API_GET_OPERATION;
+
+	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_SET_POWER_LIMIT_REQ,
+			      WAVE600_MC_MAN_SET_POWER_LIMIT_CFM,
+			      &req, sizeof(req), &cfm, sizeof(cfm), 5000);
+	if (ret) {
+		dev_warn(wdev->dev, "GET_POWER_LIMIT (0x045F) failed: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(wdev->dev, "FW powerLimitOffset (0x045F GET) = %u (0x%02x)%s\n",
+		 cfm.power_limit_offset, cfm.power_limit_offset,
+		 cfm.power_limit_offset ? "  <-- NON-ZERO: TX power table shifted down!" : "");
+	return 0;
+}
+
+int wave600_set_country(struct wave600_dev *wdev, const char *alpha2)
+{
+	u8 regd_code, region;
+	int r;
+
+	if (!alpha2 || !alpha2[0])
+		return -EINVAL;
+
+	wdev->country[0] = alpha2[0];
+	wdev->country[1] = alpha2[1];
+	wdev->country[2] = '\0';
+
+	regd_code = wave600_country_to_regd_code(wdev->country);
+	region = wave600_regd_code_to_region(regd_code);
+
+	wdev->regd_code = regd_code;
+	wdev->reg_domain_region = region;
+
+	dev_info(wdev->dev, "userspace regulatory domain: country '%s' -> regd_code 0x%02x, region %u\n",
+		 wdev->country, regd_code, region);
+
+	wave600_get_power_limit_offset(wdev);
+
+	wave600_send_reg_domain_config(wdev, region);
+
+	/* If any AP is running, refresh TPC with the new country limits */
+	for (r = 0; r < 2; r++) {
+		struct wave600_radio *radio = &wdev->radios[r];
+		if (radio->ap_started)
+			wave600_send_tpc_config(radio, (u8)radio->ap_channel, (r == 1));
+	}
+
+	return 0;
+}
+
+static void wave600_reg_notifier(struct wiphy *wiphy, struct regulatory_request *request)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	struct wave600_dev *wdev = radio->wdev;
+	char alpha2[3];
+
+	alpha2[0] = request->alpha2[0];
+	alpha2[1] = request->alpha2[1];
+	alpha2[2] = '\0';
+
+	dev_info(wdev->dev, "Radio %u reg_notifier: userspace requested country '%s' (initiator=%d)\n",
+		 radio->radio_idx, alpha2, request->initiator);
+
+	wave600_set_country(wdev, alpha2);
+}
+
+/*
+ * Vendor radio_context_init/radio_pdb_def defaults: CCA thresholds come from
+ * the host-only PSDB 0x330000 table; if the table is absent, use the vendor
+ * initial PDB values. The firmware message is UM_MAN_CCA_TH_REQ (0x0468).
+ */
+static int wave600_send_cca_threshold(struct wave600_radio *radio)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	static const s8 wave600_default_cca_th[WAVE600_CCA_TH_PARAMS_LEN] = {
+		-62, -62, -72, -72, -69
+	};
+	struct wave600_umi_cca_th p;
+	int i, ret;
+
+	memset(&p, 0, sizeof(p));
+	for (i = 0; i < WAVE600_CCA_TH_PARAMS_LEN; i++) {
+		s8 value;
+
+		if (wdev->psdb.parsed && wdev->psdb.cca_valid[radio->radio_idx])
+			value = wdev->psdb.cca_th[radio->radio_idx][i];
+		else
+			value = wave600_default_cca_th[i];
+
+		switch (i) {
+		case 0:
+			p.primary_ch_cca = value;
+			break;
+		case 1:
+			p.secondary_ch_cca = value;
+			break;
+		case 2:
+			p.mid_pkt_primary_cca = value;
+			break;
+		case 3:
+			p.mid_pkt_secondary_20_cca = value;
+			break;
+		default:
+			p.mid_pkt_secondary_40_cca = value;
+			break;
+		}
+	}
+
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_CCA_TH_REQ,
+				    WAVE600_MC_MAN_CCA_TH_CFM,
+				    &p, sizeof(p), NULL, 0, 5000,
+				    radio->vap_id);
+	if (ret) {
+		dev_warn(wdev->dev, "Radio %u CCA_TH (0x0468) failed: %d\n",
+			 radio->radio_idx, ret);
+		return ret;
+	}
+
+	dev_info(wdev->dev,
+		 "Radio %u CCA_TH (0x0468): %d %d %d %d %d\n",
+		 radio->radio_idx,
+		 p.primary_ch_cca, p.secondary_ch_cca,
+		 p.mid_pkt_primary_cca, p.mid_pkt_secondary_20_cca,
+		 p.mid_pkt_secondary_40_cca);
+	return 0;
+}
+
+/* Vendor default PDB: BF mode is explicit (0), sent with 0x046C. */
+static int wave600_send_bf_mode(struct wave600_radio *radio, u8 bf_mode)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_umi_bf_mode_config p;
+	int ret;
+
+	memset(&p, 0, sizeof(p));
+	p.bf_mode = bf_mode;
+
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_BF_MODE_CONFIG_REQ,
+				    WAVE600_MC_MAN_BF_MODE_CONFIG_CFM,
+				    &p, sizeof(p), NULL, 0, 5000,
+				    radio->vap_id);
+	if (ret) {
+		dev_warn(wdev->dev, "Radio %u BF_MODE (0x046C) mode=%u failed: %d\n",
+			 radio->radio_idx, bf_mode, ret);
+		return ret;
+	}
+
+	dev_info(wdev->dev, "Radio %u BF_MODE (0x046C): mode=%u\n",
+		 radio->radio_idx, bf_mode);
+	return 0;
+}
+
+/* Vendor default PDB: HE MU operation is enabled (1), message 0x047A. */
+static int wave600_send_he_mu_operation(struct wave600_radio *radio,
+					u8 enable_he_mu)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_umi_he_mu_operation_config p;
+	int ret;
+
+	memset(&p, 0, sizeof(p));
+	p.enable_he_mu_operation = enable_he_mu;
+
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_HE_MU_OPERATION_CONFIG_REQ,
+				    WAVE600_MC_MAN_HE_MU_OPERATION_CONFIG_CFM,
+				    &p, sizeof(p), NULL, 0, 5000,
+				    radio->vap_id);
+	if (ret) {
+		dev_warn(wdev->dev, "Radio %u HE_MU_OPERATION (0x047A) enable=%u failed: %d\n",
+			 radio->radio_idx, enable_he_mu, ret);
+		return ret;
+	}
+
+	dev_info(wdev->dev, "Radio %u HE_MU_OPERATION (0x047A): enable=%u\n",
+		 radio->radio_idx, enable_he_mu);
+	return 0;
+}
+
+/* Vendor PDB keeps TXOP mode invalid by default; if set, send 0x0475. */
+static int wave600_send_txop_mode(struct wave600_radio *radio, u32 sid, u8 mode)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_umi_txop_config p;
+	int ret;
+
+	if (mode == WAVE600_TXOP_MODE_INVALID)
+		return 0;
+
+	memset(&p, 0, sizeof(p));
+	p.sta_id = cpu_to_le32(sid);
+	p.mode = mode;
+
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_SET_TXOP_CONFIG_REQ,
+				    WAVE600_MC_MAN_SET_TXOP_CONFIG_CFM,
+				    &p, sizeof(p), NULL, 0, 5000,
+				    radio->vap_id);
+	if (ret) {
+		dev_warn(wdev->dev, "Radio %u TXOP (0x0475) sid=%u mode=%u failed: %d\n",
+			 radio->radio_idx, sid, mode, ret);
+		return ret;
+	}
+
+	dev_info(wdev->dev, "Radio %u TXOP (0x0475): sid=%u mode=%u\n",
+		 radio->radio_idx, sid, mode);
+	return 0;
+}
+
+/*
+ * Vendor _mtlk_core_send_tx_power_limit_offset (core.c:6304) is per-core.
+ * The live nl80211 TX power path and the bring-up default offset therefore
+ * both use the radio-specific endpoint.
+ */
+static int wave600_send_power_limit_offset_radio(struct wave600_radio *radio,
+						 u8 offset_dbm)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_umi_tx_power_limit p;
+	int ret;
+
+	memset(&p, 0, sizeof(p));
+	p.get_set_operation = W600_API_SET_OPERATION;
+	p.power_limit_offset = offset_dbm;
+
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_SET_POWER_LIMIT_REQ,
+				    WAVE600_MC_MAN_SET_POWER_LIMIT_CFM,
+				    &p, sizeof(p), NULL, 0, 5000,
+				    radio->vap_id);
+	if (ret) {
+		dev_warn(wdev->dev, "Radio %u SET_POWER_LIMIT (0x045F) offset=%u dBm failed: %d\n",
+			 radio->radio_idx, offset_dbm, ret);
+		return ret;
+	}
+
+	dev_info(wdev->dev, "Radio %u SET_POWER_LIMIT (0x045F): offset=%u dBm\n",
+		 radio->radio_idx, offset_dbm);
+	return 0;
+}
 
 static int wave600_send_set_chan(struct wave600_radio *radio, u8 chan, u8 width,
 				 u8 primary_idx, u8 switch_type,
@@ -276,11 +872,10 @@ static int wave600_send_set_chan(struct wave600_radio *radio, u8 chan, u8 width,
 	p.chan_switch_time = cpu_to_le16(chan_switch_time);
 
 	/*
-	 * Regulatory domain: vendor sends core_cfg_get_regd_code() result,
-	 * defaulting to "US" (REGD_CODE_FCC = 0x10). Zero is
-	 * REGD_CODE_UNKNOWN and is never sent by the vendor driver.
+	 * Regulatory domain: dynamic from userspace (OpenWrt / hostapd / cfg80211).
+	 * Falls back to 0x30 (ETSI / Poland) if userspace has not set country yet.
 	 */
-	p.regulation_type = 0x10;
+	p.regulation_type = wdev->regd_code ? wdev->regd_code : WAVE600_REGD_CODE_ETSI;
 
 	/*
 	 * isContinuousInterfererDetectionNeeded: vendor scan_support.h
@@ -289,14 +884,21 @@ static int wave600_send_set_chan(struct wave600_radio *radio, u8 chan, u8 width,
 	p.is_continuous_interferer_detection_needed = 1;
 
 	/*
-	 * isRadarDetectionNeeded: true when the channel requires DFS
-	 * (5 GHz DFS channels). For 2.4 GHz it is always false.
-	 * We approximate by checking if the primary channel is in the
-	 * 5 GHz DFS range (channels 36-64, 100-144).
+	 * isRadarDetectionNeeded: true only when the channel requires DFS radar
+	 * detection according to IEEE80211_CHAN_RADAR flag in wiphy bands.
+	 * UNII-1 (channels 36, 40, 44, 48) is indoor non-DFS (radar NOT needed).
 	 */
-	if (is_5g) {
-		if ((chan >= 36 && chan <= 64) || (chan >= 100 && chan <= 144))
-			is_dfs_chan = true;
+	if (is_5g && radio->wiphy && radio->wiphy->bands[NL80211_BAND_5GHZ]) {
+		struct ieee80211_supported_band *b = radio->wiphy->bands[NL80211_BAND_5GHZ];
+		int c;
+
+		for (c = 0; c < b->n_channels; c++) {
+			if (b->channels[c].hw_value == chan) {
+				if (b->channels[c].flags & IEEE80211_CHAN_RADAR)
+					is_dfs_chan = true;
+				break;
+			}
+		}
 	}
 	p.is_radar_detection_needed = is_dfs_chan ? 1 : 0;
 
@@ -329,32 +931,126 @@ static int wave600_send_set_chan(struct wave600_radio *radio, u8 chan, u8 width,
 	else
 		radio->antenna_mask = (radio->radio_idx == 1) ? 0x0A : 0x05;
 
+	dev_info(wdev->dev, "Radio %u SET_CHAN: FW antenna mask 0x%02x -> local 0x%02x\n",
+		 radio->radio_idx, cfm.antenna_mask, radio->antenna_mask);
+
+	/* Vendor core_cfg_set_chan_clpb: send the current CCA threshold after SET_CHAN. */
+	wave600_send_cca_threshold(radio);
+
 	return 0;
 }
 
-static int wave600_send_set_bss(struct wave600_radio *radio, bool is_5g)
+int wave600_radio_find_sid(struct wave600_radio *radio, const u8 *mac)
+{
+	int i;
+
+	for (i = 0; i < WAVE600_MAX_STATIONS; i++) {
+		if (radio->stations[i].valid && ether_addr_equal(radio->stations[i].mac, mac))
+			return (int)radio->stations[i].sid;
+	}
+	if (radio->sta_connected && ether_addr_equal(radio->sta_mac, mac))
+		return (int)radio->sta_sid;
+	return -ENOENT;
+}
+
+static struct wave600_station *wave600_find_sta(struct wave600_radio *radio, const u8 *mac)
+{
+	int i;
+
+	for (i = 0; i < WAVE600_MAX_STATIONS; i++) {
+		if (radio->stations[i].valid && ether_addr_equal(radio->stations[i].mac, mac))
+			return &radio->stations[i];
+	}
+	return NULL;
+}
+
+static struct wave600_station *wave600_add_sta_entry(struct wave600_radio *radio,
+						     const u8 *mac, u16 sid)
+{
+	struct wave600_station *sta = wave600_find_sta(radio, mac);
+	int i;
+
+	if (sta) {
+		sta->sid = sid;
+		sta->connect_time = ktime_get_seconds();
+		sta->last_rx = jiffies;
+		return sta;
+	}
+
+	for (i = 0; i < WAVE600_MAX_STATIONS; i++) {
+		if (!radio->stations[i].valid) {
+			sta = &radio->stations[i];
+			sta->valid = true;
+			ether_addr_copy(sta->mac, mac);
+			sta->sid = sid;
+			sta->connect_time = ktime_get_seconds();
+			sta->last_rx = jiffies;
+			sta->signal = -45;
+			sta->is_authorized = false;
+			radio->num_stations++;
+			return sta;
+		}
+	}
+	return NULL;
+}
+
+static void wave600_del_sta_entry(struct wave600_radio *radio, const u8 *mac)
+{
+	struct wave600_station *sta = wave600_find_sta(radio, mac);
+
+	if (sta) {
+		memset(sta, 0, sizeof(*sta));
+		if (radio->num_stations > 0)
+			radio->num_stations--;
+	}
+}
+
+static int wave600_send_set_bss(struct wave600_radio *radio,
+				struct cfg80211_ap_settings *settings,
+				bool is_5g)
 {
 	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_set_bss p;
 	const u8 *rates = is_5g ? wave600_rates_5g : wave600_rates_2g;
 	u8 rates_len = is_5g ? sizeof(wave600_rates_5g) : sizeof(wave600_rates_2g);
+	u16 beacon_int = (settings && settings->beacon_interval) ? settings->beacon_interval : 100;
+	u16 dtim_int = (settings && settings->dtim_period) ? settings->dtim_period : 2;
 
 	memset(&p, 0, sizeof(p));
 	/* UMI payload scalars are little-endian on the wire (vendor
 	 * HOST_TO_MAC16/32 = cpu_to_le16/32, mtlkinc.h; the MAN transport
 	 * copies the payload verbatim). */
-	p.beacon_interval = cpu_to_le16(W600_BEACON_INT);
-	p.dtim_interval = cpu_to_le16(W600_DTIM);
+	p.beacon_interval = cpu_to_le16(beacon_int);
+	p.dtim_interval = cpu_to_le16(dtim_int);
 	p.vap_id = radio->vap_id;
 	p.slot_time = 1;	/* short slot for OFDM */
 	p.use_short_preamble = 1;
 	memcpy(p.rates, rates, rates_len);
 	p.rates_len = rates_len;
-	/* Single stream MCS 0-7 */
-	memset(p.tx_mcs_bitmask, 0x00, sizeof(p.tx_mcs_bitmask));
+
+	/* Supported HT MCS: 2x2 MIMO MCS 0-15 */
 	p.tx_mcs_bitmask[0] = 0xff;
-	memset(p.vht_mcs_nss, 0xff, sizeof(p.vht_mcs_nss));
-	memset(p.he_mcs_nss, 0xff, sizeof(p.he_mcs_nss));
+	p.tx_mcs_bitmask[1] = 0xff;
+
+	/* Capabilities flag: VAP_ADD_FLAGS_HT (0x01) */
+	p.flags = W600_VAP_FLAG_HT;
+
+	/* VHT MCS: 2x2 MIMO MCS 0-9 on 5 GHz (0xfffa: SS1=2, SS2=2, rest=3) */
+	if (is_5g) {
+		p.flags |= W600_VAP_FLAG_VHT;
+		p.vht_mcs_nss[0] = 0xfa;
+		p.vht_mcs_nss[1] = 0xff;
+		memset(&p.vht_mcs_nss[2], 0xff, 6);
+	} else {
+		memset(p.vht_mcs_nss, 0xff, sizeof(p.vht_mcs_nss));
+	}
+
+	/* HE MCS: 2x2 MIMO MCS 0-11 on both bands (0xfffa: SS1=2, SS2=2, rest=3) */
+	p.flags |= W600_VAP_FLAG_HE;
+	p.he_mcs_nss[0] = 0xfa;
+	p.he_mcs_nss[1] = 0xff;
+	memset(&p.he_mcs_nss[2], 0xff, 6);
+
 	p.he_bss_color = 1;	/* vendor HE_BSS_COLOR = 1 (core.c:2555) */
 
 	return wave600_ipc_cmd_radio(wdev, radio->radio_idx,
@@ -382,12 +1078,24 @@ static int wave600_send_add_vap(struct wave600_radio *radio, bool is_5g)
 	p.operation_mode = 0;	/* OPERATION_MODE_NORMAL */
 	memcpy(p.rates, rates, rates_len);
 	p.rates_len = rates_len;
-	/* Vendor core.c:2342 explicitly memsets u8TX_MCS_Bitmask to 0 */
-	memset(p.tx_mcs_bitmask, 0, sizeof(p.tx_mcs_bitmask));
-	/* Vendor memsets the VHT/HE MCS-NSS maps to 0xff: each 2-bit subfield
-	 * then reads 3 = "n spatial streams not supported" (UMI_ADD_VAP). */
-	memset(p.vht_mcs_nss, 0xff, sizeof(p.vht_mcs_nss));
-	memset(p.he_mcs_nss, 0xff, sizeof(p.he_mcs_nss));
+
+	/* Supported HT MCS: 2x2 MIMO MCS 0-15 */
+	p.tx_mcs_bitmask[0] = 0xff;
+	p.tx_mcs_bitmask[1] = 0xff;
+
+	/* VHT MCS: 2x2 MIMO MCS 0-9 on 5 GHz (0xfffa) */
+	if (is_5g) {
+		p.vht_mcs_nss[0] = 0xfa;
+		p.vht_mcs_nss[1] = 0xff;
+		memset(&p.vht_mcs_nss[2], 0xff, 6);
+	} else {
+		memset(p.vht_mcs_nss, 0xff, sizeof(p.vht_mcs_nss));
+	}
+
+	/* HE MCS: 2x2 MIMO MCS 0-11 on both bands (0xfffa) */
+	p.he_mcs_nss[0] = 0xfa;
+	p.he_mcs_nss[1] = 0xff;
+	memset(&p.he_mcs_nss[2], 0xff, 6);
 
 	return wave600_ipc_cmd_radio(wdev, radio->radio_idx,
 				     WAVE600_UM_MAN_ADD_VAP_REQ,
@@ -499,7 +1207,8 @@ static int wave600_send_mib(struct wave600_radio *radio, u16 object_id,
 /* Vendor mtlk_mib_set_pre_activate (mib_osdep.c): common physical
  * operational parameters for the pre-activation phase. Only the fields
  * the vendor sets are non-zero (PRE_ACTIVATE_MIB_TYPE layout). */
-static int wave600_send_mib_pre_activate(struct wave600_radio *radio, bool is_5g)
+static int wave600_send_mib_pre_activate(struct wave600_radio *radio, bool is_5g,
+					 u8 width, u8 primary_idx)
 {
 	struct {
 		u8 reserved[3];
@@ -514,8 +1223,12 @@ static int wave600_send_mib_pre_activate(struct wave600_radio *radio, bool is_5g
 
 	memset(&v, 0, sizeof(v));
 	v.network_mode = is_5g ? W600_NETWORK_11AN_MIXED : W600_NETWORK_11BGN_MIXED;
-	v.upper_lower_channel = 0;	/* no channel bonding (20 MHz) */
-	v.spectrum_mode = W600_MIB_SPECTRUM_20M;
+	/* Vendor core.c:2175: prog_model_spectrum_mode is CW_20 if width is 20 MHz, else CW_40 */
+	v.spectrum_mode = (width == 0) ? W600_MIB_SPECTRUM_20M : W600_MIB_SPECTRUM_40M;
+	/* Vendor mib_osdep.c:89: upper_lower_channel bonding mode (0 for 20MHz, else primary_idx) */
+	v.upper_lower_channel = (width == 0) ? 0 : primary_idx;
+	v.short_slot_time_enabled_11g = 1;
+	v.short_preamble_option_implemented = 1;
 	/* UMI payload scalars are little-endian (vendor HOST_TO_MAC32) */
 	v.operational_rate_set = cpu_to_le32(is_5g ? W600_OPERATE_RATE_SET_11AN : W600_OPERATE_RATE_SET_11BGN);
 	v.bss_basic_rate_set = cpu_to_le32(is_5g ? W600_BSS_BASIC_RATE_SET_11AN : W600_BSS_BASIC_RATE_SET_11BGN_DEFAULT);
@@ -523,9 +1236,10 @@ static int wave600_send_mib_pre_activate(struct wave600_radio *radio, bool is_5g
 	return wave600_send_mib(radio, W600_MIB_PRE_ACTIVATE, &v, sizeof(v));
 }
 
-static int wave600_send_mib_spectrum_mode(struct wave600_radio *radio)
+static int wave600_send_mib_spectrum_mode(struct wave600_radio *radio, u8 width)
 {
-	u8 v = W600_MIB_SPECTRUM_20M;
+	/* Vendor core.c:2130: MIB_SPECTRUM_MODE uses prog_model_spectrum_mode (CW_20 or CW_40) */
+	u8 v = (width == 0) ? W600_MIB_SPECTRUM_20M : W600_MIB_SPECTRUM_40M;
 
 	return wave600_send_mib(radio, W600_MIB_SPECTRUM_MODE, &v, sizeof(v));
 }
@@ -605,6 +1319,176 @@ static int wave600_send_enable_radio(struct wave600_radio *radio, u32 on)
  * calibration file (little-endian, preserved by the mailbox writer). */
 #define W600_TPC_ANT_MSG_SIZE		(4 + 8 * WAVE600_TPC_FREQ_SIZE)
 
+static int wave600_send_tpc_ant_params(struct wave600_radio *radio, u8 chan, bool is_5g)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_cal *cal = &wdev->cal;
+	u8 mask = radio->antenna_mask ? radio->antenna_mask : (is_5g ? 0x0A : 0x05);
+	u8 target_band = is_5g ? 1 : 0;
+	u8 tpc_len = (u8)(cal->tpc_data_size ? cal->tpc_data_size : 9);
+	int a, ret;
+
+	if (!cal->parsed)
+		return 0;
+
+	for (a = 0; a < WAVE600_CAL_MAX_ANT; a++) {
+		struct wave600_umi_tpc_ant_params p;
+		u32 count = cal->entry_count[a];
+		u32 tpc_cnt = 0;
+		int bw;
+
+		if (!(mask & BIT(a)))
+			continue;
+
+		memset(&p, 0, sizeof(p));
+		p.ant = (u8)a;
+		p.tpc_freq_len = tpc_len;
+
+		for (bw = 0; bw < 4 && tpc_cnt < 8; bw++) {
+			const struct wave600_cal_tssi_entry *exact = NULL;
+			const struct wave600_cal_tssi_entry *lower = NULL;
+			const struct wave600_cal_tssi_entry *upper = NULL;
+			u32 i;
+
+			for (i = 0; i < count; i++) {
+				const struct wave600_cal_tssi_entry *e = &cal->entries[a][i];
+
+				if (e->band != target_band || e->bw != bw)
+					continue;
+
+				if (e->chan == chan) {
+					exact = e;
+					break;
+				} else if (e->chan < chan) {
+					lower = e;
+				} else if (e->chan > chan && !upper) {
+					upper = e;
+				}
+			}
+
+			if (exact) {
+				memcpy(p.tpc_freq + tpc_cnt * WAVE600_TPC_FREQ_SIZE, exact->raw, WAVE600_TPC_FREQ_SIZE);
+				tpc_cnt++;
+			} else {
+				if (lower && tpc_cnt < 8) {
+					memcpy(p.tpc_freq + tpc_cnt * WAVE600_TPC_FREQ_SIZE, lower->raw, WAVE600_TPC_FREQ_SIZE);
+					tpc_cnt++;
+				}
+				if (upper && tpc_cnt < 8) {
+					memcpy(p.tpc_freq + tpc_cnt * WAVE600_TPC_FREQ_SIZE, upper->raw, WAVE600_TPC_FREQ_SIZE);
+					tpc_cnt++;
+				}
+			}
+		}
+
+		if (!tpc_cnt) {
+			/* Fallback: take available entries for this band */
+			u32 i;
+			for (i = 0; i < count && tpc_cnt < 8; i++) {
+				if (cal->entries[a][i].band == target_band) {
+					memcpy(p.tpc_freq + tpc_cnt * WAVE600_TPC_FREQ_SIZE,
+					       cal->entries[a][i].raw, WAVE600_TPC_FREQ_SIZE);
+					tpc_cnt++;
+				}
+			}
+		}
+
+		if (tpc_cnt > 0) {
+			ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+						    WAVE600_UM_MAN_SET_TPC_ANT_PARAMS_REQ,
+						    WAVE600_MC_MAN_SET_TPC_ANT_PARAMS_CFM,
+						    &p, sizeof(p), NULL, 0, 5000,
+						    radio->vap_id);
+			if (ret) {
+				dev_warn(wdev->dev, "Radio %u SET_TPC_ANT_PARAMS (ant %d) failed: %d\n",
+					 radio->radio_idx, a, ret);
+			} else {
+				dev_info(wdev->dev, "Radio %u active antenna %u TPC calibrated v2-24b (%u freq points, stride=%d)\n",
+					 radio->radio_idx, a, tpc_cnt, WAVE600_TPC_FREQ_SIZE);
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int wave600_send_tpc_config(struct wave600_radio *radio, u8 chan, bool is_5g)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_umi_tpc_config p;
+	u16 pw[13] = { 0 };
+	u16 target_pw;
+	u8 regd = wdev->regd_code ? wdev->regd_code : WAVE600_REGD_CODE_ETSI;
+	int ret, i;
+
+	memset(&p, 0, sizeof(p));
+	p.cal_type = W600_TPC_CAL_TYPE_LOGARITHMIC; /* 1 */
+	p.tpc_loop_type = 1; /* 1 = open loop (Gen6 WAV654 calibrated look-up table) */
+	p.fixed_gain = W600_TPC_NO_FIXED_GAIN; /* 0xFF */
+	p.get_set_operation = 0; /* API_SET_OPERATION */
+
+	/* Regulatory domain power limits from PSDB / PSD.bin for active country */
+	ret = wave600_psdb_regd_limits(wdev, regd, chan, pw);
+	if (ret || !pw[1]) {
+		/* Fallback: 20 dBm (160 in 1/8 dBm) for 2.4GHz, 23 dBm (184 in 1/8 dBm) for 5GHz */
+		u16 def_pw = is_5g ? (23 * 8) : (20 * 8);
+		pw[0] = is_5g ? 0 : def_pw;
+		for (i = 1; i < 13; i++)
+			pw[i] = def_pw;
+	} else {
+		/* Fallback for higher bandwidths: in PSD.bin 40/80/160 MHz entries are indexed
+		 * by center channel frequencies, so matching on primary channel frequency leaves
+		 * pw[2..4] as 0. Fall back to 20 MHz limit so firmware does not clamp transmit
+		 * power for 40/80/160 MHz frames to 0 dBm (minimum power). */
+		for (i = 1; i < 4; i++) {
+			if (pw[1 + i] == 0)
+				pw[1 + i] = pw[1];
+		}
+		for (i = 0; i < 4; i++) {
+			if (pw[5 + i] == 0)
+				pw[5 + i] = pw[1 + i];
+			if (pw[9 + i] == 0)
+				pw[9 + i] = pw[1 + i];
+		}
+		if (is_5g)
+			pw[0] = 0;
+	}
+
+	/* If a specific tx power was requested by the user, clamp target limits */
+	if (radio->tx_power_dbm > 0) {
+		target_pw = (u16)(radio->tx_power_dbm * 8);
+		for (i = 1; i < 13; i++) {
+			if (pw[i] == 0 || pw[i] > target_pw)
+				pw[i] = target_pw;
+		}
+		if (!is_5g && (pw[0] == 0 || pw[0] > target_pw))
+			pw[0] = target_pw;
+	}
+
+	p.power_limit_11b = cpu_to_le16(pw[0]);
+	for (i = 0; i < 4; i++) {
+		p.regulation_limit[i] = cpu_to_le16(pw[1 + i]);
+		p.regulation_limit_mu[i] = cpu_to_le16(pw[5 + i]);
+		p.regulation_limit_bf[i] = cpu_to_le16(pw[9 + i]);
+	}
+
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_SET_TPC_CONFIG_REQ,
+				    WAVE600_MC_MAN_SET_TPC_CONFIG_CFM,
+				    &p, sizeof(p), NULL, 0, 5000,
+				    radio->vap_id);
+	if (ret) {
+		dev_err(wdev->dev, "Radio %u SET_TPC_CONFIG failed: %d\n", radio->radio_idx, ret);
+		return ret;
+	}
+
+	dev_info(wdev->dev, "Radio %u TPC configured v3-regd-%s (code 0x%02x, loop open): 11b=%u, OFDM 20/40/80/160=[%u %u %u %u] (1/8 dBm, tx_pwr=%d dBm)\n",
+		 radio->radio_idx, wdev->country[0] ? wdev->country : "PL", regd,
+		 pw[0], pw[1], pw[2], pw[3], pw[4],
+		 radio->tx_power_dbm ? radio->tx_power_dbm : (is_5g ? 23 : 20));
+	return 0;
+}
+
 
 
 /* Vendor _mtlk_mbss_send_preactivate_req (core.c): issued prior to the
@@ -634,36 +1518,6 @@ static int wave600_send_pre_activate(struct wave600_radio *radio)
 			radio->radio_idx, status);
 		return -EIO;
 	}
-	return 0;
-}
-
-/* Vendor MC_MAN_SET_ANTENNAS_REQ (0x0418) */
-static int wave600_send_set_antennas(struct wave600_radio *radio, u8 mask)
-{
-	struct wave600_dev *wdev = radio->wdev;
-	struct wave600_umi_set_antennas p;
-	struct wave600_umi_set_antennas cfm;
-	int ret;
-
-	memset(&p, 0, sizeof(p));
-	p.tx_ants_mask = mask;
-	p.rx_ants_mask = mask;
-
-	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
-				    WAVE600_MC_MAN_SET_ANTENNAS_REQ,
-				    WAVE600_MC_MAN_SET_ANTENNAS_CFM,
-				    &p, sizeof(p), &cfm, sizeof(cfm), 5000,
-				    radio->vap_id);
-	if (ret)
-		return ret;
-
-	if (cfm.status != W600_UMI_OK) {
-		dev_err(wdev->dev, "Radio %u SET_ANTENNAS: FW rejected (status=%u)\n",
-			radio->radio_idx, cfm.status);
-		return -EIO;
-	}
-	dev_info(wdev->dev, "Radio %u active antennas set to 0x%02x\n",
-		 radio->radio_idx, mask);
 	return 0;
 }
 
@@ -896,6 +1750,7 @@ static int wave600_send_beacon(struct wave600_radio *radio,
 	radio->beacon_buf = buf;
 	radio->beacon_dma = dma;
 	radio->beacon_len = total;
+	radio->beacon_set_params = p;
 
 	return 0;
 }
@@ -990,7 +1845,12 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 
 	is_5g = (radio->radio_idx == 1);
 	radio->ap_channel = chan;
+	radio->ap_width = width;
 	radio->ap_freq = settings->chandef.chan->center_freq;
+	radio->ap_low_chan = low_chan;
+	radio->ap_primary_idx = primary_idx;
+	radio->beacon_interval = (settings && settings->beacon_interval) ? settings->beacon_interval : 100;
+	radio->dtim_period = (settings && settings->dtim_period) ? settings->dtim_period : 2;
 
 	dev_info(wdev->dev, "Radio %u start_ap: SSID '%.*s' band %s channel %d (low %u, idx %u) width %d\n",
 		 radio->radio_idx, (int)settings->ssid_len, settings->ssid,
@@ -1022,13 +1882,13 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 				  radio->ndev->dev_addr, ETH_ALEN,
 				  "IEEE_ADDRESS after SET");
 
-	ret = wave600_send_mib_pre_activate(radio, is_5g);
+	ret = wave600_send_mib_pre_activate(radio, is_5g, width, primary_idx);
 	if (ret) {
 		dev_err(wdev->dev, "Radio %u start_ap: MIB_PRE_ACTIVATE failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
 
-	ret = wave600_send_mib_spectrum_mode(radio);
+	ret = wave600_send_mib_spectrum_mode(radio, width);
 	if (ret) {
 		dev_err(wdev->dev, "Radio %u start_ap: MIB_SPECTRUM_MODE failed: %d\n", radio->radio_idx, ret);
 		return ret;
@@ -1055,6 +1915,15 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 		radio->radio_enabled = true;
 	}
 
+	/*
+	 * Vendor _core_on_rcvry_configure defaults for Gen6. These are sent
+	 * before SET_CHAN, with CCA/power-limit sent after the channel is set.
+	 */
+	wave600_send_he_mu_operation(radio, 1);
+	wave600_send_bf_mode(radio, WAVE600_BF_MODE_EXPLICIT);
+	wave600_send_txop_mode(radio, WAVE600_GEN6_ALL_STA_SID,
+			       WAVE600_TXOP_MODE_INVALID);
+
 	ret = wave600_send_set_chan(radio, low_chan, width, primary_idx,
 				    W600_SWITCH_TYPE_NORMAL, 0);
 	if (ret) {
@@ -1062,12 +1931,11 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 		return ret;
 	}
 
-	/* Vendor core_config.c:646-650 mtlk_core_set_coc_actual_power_mode -> MC_MAN_SET_ANTENNAS_REQ */
-	ret = wave600_send_set_antennas(radio, radio->antenna_mask ? radio->antenna_mask : (is_5g ? 0x0A : 0x05));
-	if (ret) {
-		dev_err(wdev->dev, "Radio %u start_ap: SET_ANTENNAS failed: %d\n", radio->radio_idx, ret);
-		return ret;
-	}
+	wave600_send_power_limit_offset_radio(radio, 0);
+
+	/* Vendor mtlk_reload_tpc_wrapper: TPC config + TPC ANT params */
+	wave600_send_tpc_config(radio, chan, is_5g);
+	wave600_send_tpc_ant_params(radio, chan, is_5g);
 
 	ret = wave600_send_beacon(radio, &settings->beacon);
 	if (ret) {
@@ -1075,7 +1943,7 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 		return ret;
 	}
 
-	ret = wave600_send_set_bss(radio, is_5g);
+	ret = wave600_send_set_bss(radio, settings, is_5g);
 	if (ret) {
 		dev_err(wdev->dev, "Radio %u start_ap: SET_BSS failed: %d\n", radio->radio_idx, ret);
 		return ret;
@@ -1093,6 +1961,96 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 	netif_tx_wake_all_queues(ndev);
 	dev_info(wdev->dev, "Radio %u AP started on %s (%s, channel %u)\n",
 		 radio->radio_idx, ndev->name, is_5g ? "5GHz" : "2.4GHz", chan);
+	return 0;
+}
+
+int wave600_cfg80211_restore_ap(struct wave600_radio *radio)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	struct cfg80211_ap_settings settings;
+	struct wave600_umi_beacon_set cfm;
+	bool is_5g;
+	int ret;
+
+	if (!radio->ap_started)
+		return 0;
+
+	is_5g = (radio->radio_idx == 1);
+	dev_info(wdev->dev, "Radio %u restoring AP on %s (ch %u, width %u, low %u, idx %u)...\n",
+		 radio->radio_idx, radio->ndev ? radio->ndev->name : "wlan",
+		 radio->ap_channel, radio->ap_width, radio->ap_low_chan, radio->ap_primary_idx);
+
+	ret = wave600_send_vap_db_add(radio);
+	if (ret)
+		return ret;
+
+	ret = wave600_send_mib_ieee_addr(radio);
+	if (ret)
+		return ret;
+
+	ret = wave600_send_mib_pre_activate(radio, is_5g, radio->ap_width, radio->ap_primary_idx);
+	if (ret)
+		return ret;
+
+	ret = wave600_send_mib_spectrum_mode(radio, radio->ap_width);
+	if (ret)
+		return ret;
+
+	ret = wave600_send_pre_activate(radio);
+	if (ret)
+		return ret;
+
+	ret = wave600_send_add_vap(radio, is_5g);
+	if (ret)
+		return ret;
+
+	ret = wave600_send_enable_radio(radio, 1);
+	if (ret)
+		return ret;
+	radio->radio_enabled = true;
+
+	wave600_send_he_mu_operation(radio, 1);
+	wave600_send_bf_mode(radio, WAVE600_BF_MODE_EXPLICIT);
+	wave600_send_txop_mode(radio, WAVE600_GEN6_ALL_STA_SID,
+			       WAVE600_TXOP_MODE_INVALID);
+
+	ret = wave600_send_set_chan(radio, radio->ap_low_chan, radio->ap_width,
+				    radio->ap_primary_idx, W600_SWITCH_TYPE_NORMAL, 0);
+	if (ret)
+		return ret;
+
+	wave600_send_power_limit_offset_radio(radio, 0);
+	wave600_send_tpc_config(radio, (u8)radio->ap_channel, is_5g);
+	wave600_send_tpc_ant_params(radio, (u8)radio->ap_channel, is_5g);
+
+	if (radio->beacon_dma && radio->beacon_set_params.part1_len) {
+		ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+					    WAVE600_UM_MAN_SET_BEACON_TEMPLATE_REQ,
+					    WAVE600_MC_MAN_SET_BEACON_TEMPLATE_CFM,
+					    &radio->beacon_set_params, sizeof(radio->beacon_set_params),
+					    &cfm, sizeof(cfm), 5000,
+					    radio->vap_id);
+		if (ret)
+			dev_warn(wdev->dev, "Radio %u restore SET_BEACON_TEMPLATE failed: %d\n",
+				 radio->radio_idx, ret);
+	}
+
+	memset(&settings, 0, sizeof(settings));
+	settings.beacon_interval = radio->beacon_interval;
+	settings.dtim_period = radio->dtim_period;
+	ret = wave600_send_set_bss(radio, &settings, is_5g);
+	if (ret)
+		return ret;
+
+	ret = wave600_send_set_wmm_params(radio);
+	if (ret)
+		return ret;
+
+	if (radio->ndev) {
+		netif_carrier_on(radio->ndev);
+		netif_tx_wake_all_queues(radio->ndev);
+	}
+	dev_info(wdev->dev, "Radio %u AP restored successfully after recovery\n", radio->radio_idx);
 	return 0;
 }
 
@@ -1159,6 +2117,8 @@ static int wave600_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *ndev
 	radio->sta_sid = 0;
 	radio->is_secure = false;
 	eth_zero_addr(radio->sta_mac);
+	memset(radio->stations, 0, sizeof(radio->stations));
+	radio->num_stations = 0;
 	return 0;
 }
 
@@ -1182,6 +2142,7 @@ static int wave600_cfg80211_set_channel(struct wiphy *wiphy,
 		return ret;
 
 	radio->ap_channel = chan;
+	radio->ap_width = width;
 	radio->ap_freq = chandef->chan->center_freq;
 
 	if (!radio->ap_started)
@@ -1421,9 +2382,13 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 	/*
 	 * Flags:
 	 * In open AP mode: STA_ADD_FLAGS_IS_8021X_FILTER_OPEN (0x04) | STA_ADD_FLAGS_WME (0x02) = 0x06.
-	 * In WPA/WPA2 mode: STA_ADD_FLAGS_WME (0x02) only. Port is closed until PTK handshake completes.
+	 * In WPA/WPA2/WPA3 mode: STA_ADD_FLAGS_WME (0x02) only. Port is closed until PTK handshake completes.
 	 */
-	req.flags = radio->is_secure ? 0x02 : 0x06;
+	req.flags = radio->is_secure ? W600_STA_FLAG_WME : (W600_STA_FLAG_WME | W600_STA_FLAG_8021X_OPEN);
+
+	/* If client has MFP / PMF (802.11w / WPA3), set STA_ADD_FLAGS_MFP (0x08) */
+	if (params && (params->sta_flags_set & BIT(NL80211_STA_FLAG_MFP)))
+		req.flags |= W600_STA_FLAG_MFP;
 
 	/* If client has HT capabilities, copy HT parameters and set STA_ADD_FLAGS_IS_HT (0x10) */
 	if (params && params->link_sta_params.ht_capa) {
@@ -1432,7 +2397,44 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 		req.ht_cap_info = ht->cap_info;
 		req.ampdu_param = ht->ampdu_params_info;
 		memcpy(req.rx_mcs_bitmask, ht->mcs.rx_mask, sizeof(req.rx_mcs_bitmask));
-		req.flags |= 0x10; /* STA_ADD_FLAGS_IS_HT */
+		req.flags |= W600_STA_FLAG_HT;
+	}
+
+	/* If client has VHT capabilities, copy VHT parameters and set STA_ADD_FLAGS_IS_VHT (0x20) */
+	if (params && params->link_sta_params.vht_capa) {
+		const struct ieee80211_vht_cap *vht = params->link_sta_params.vht_capa;
+
+		req.vht_cap_info = vht->vht_cap_info;
+		memcpy(req.vht_mcs_nss, &vht->supp_mcs,
+		       min_t(size_t, sizeof(req.vht_mcs_nss), sizeof(vht->supp_mcs)));
+		req.flags |= W600_STA_FLAG_VHT;
+	}
+
+	/* If client has HE capabilities, copy HE parameters and set STA_ADD_FLAGS_EXT_IS_HE (0x02) */
+	if (params && params->link_sta_params.he_capa && params->link_sta_params.he_capa_len) {
+		const u8 *he_raw = (const u8 *)params->link_sta_params.he_capa;
+		u8 he_len = params->link_sta_params.he_capa_len;
+
+		/* Copy MAC & PHY Cap Info (first 18 bytes) */
+		memcpy(req.he_mac_phy_cap_info, he_raw,
+		       min_t(size_t, sizeof(req.he_mac_phy_cap_info), (size_t)he_len));
+
+		/* Copy HE MCS/NSS Set (starts at offset 18) */
+		if (he_len > 18) {
+			size_t mcs_len = min_t(size_t, sizeof(req.he_mcs_nss), (size_t)(he_len - 18));
+			memcpy(req.he_mcs_nss, he_raw + 18, mcs_len);
+		}
+
+		/* Copy PPE Thresholds (offset 22/26/30 depending on bandwidth) */
+		if (he_len > 22) {
+			size_t ppe_off = (he_len >= 30) ? 30 : ((he_len >= 26) ? 26 : 22);
+			if (he_len > ppe_off) {
+				size_t ppe_len = min_t(size_t, sizeof(req.he_ppe_th), (size_t)(he_len - ppe_off));
+				memcpy(req.he_ppe_th, he_raw + ppe_off, ppe_len);
+			}
+		}
+
+		req.flags_ext |= W600_STA_FLAG_EXT_HE;
 	}
 
 	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
@@ -1457,11 +2459,15 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 		return ret;
 	}
 
+	wave600_add_sta_entry(radio, mac, sid);
 	radio->sta_connected = true;
 	radio->sta_sid = sid;
+	radio->sta_connect_time = ktime_get_seconds();
+	radio->sta_last_rx = jiffies;
+	radio->sta_signal = -45;
 	ether_addr_copy(radio->sta_mac, mac);
-	dev_info(wdev->dev, "Radio %u STA_ADD %pM confirmed: status=%u sid=%u (flags=0x%02x)\n",
-		 radio->radio_idx, mac, cfm.status, radio->sta_sid, req.flags);
+	dev_info(wdev->dev, "Radio %u STA_ADD %pM confirmed: status=%u sid=%u (flags=0x%02x flags_ext=0x%02x)\n",
+		 radio->radio_idx, mac, cfm.status, sid, req.flags, req.flags_ext);
 
 	return 0;
 }
@@ -1473,22 +2479,24 @@ static int wave600_cfg80211_change_station(struct wiphy *wiphy,
 {
 	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
 	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_station *sta = wave600_find_sta(radio, mac);
+	int sid = sta ? (int)sta->sid : (ether_addr_equal(mac, radio->sta_mac) ? (int)radio->sta_sid : -ENOENT);
 
-	dev_info(wdev->dev, "Radio %u cfg80211: change station %pM (aid %u, flags_set=0x%x)\n",
-		 radio->radio_idx, mac, params ? params->aid : 0, params ? params->sta_flags_set : 0);
+	dev_info(wdev->dev, "Radio %u cfg80211: change station %pM (aid %u, flags_set=0x%x sid=%d)\n",
+		 radio->radio_idx, mac, params ? params->aid : 0, params ? params->sta_flags_set : 0, sid);
 
 	/*
 	 * When station completes 4-way handshake, hostapd authorizes the station:
 	 * Open the 802.1X filter via UM_MAN_SET_802_1X_FILTER_REQ (0x0446).
 	 * Vendor core.c:9674-9690 _mtlk_send_filter_req.
 	 */
-	if (params && (params->sta_flags_set & BIT(NL80211_STA_FLAG_AUTHORIZED)) && radio->is_secure) {
+	if (sid >= 0 && params && (params->sta_flags_set & BIT(NL80211_STA_FLAG_AUTHORIZED)) && radio->is_secure) {
 		struct wave600_umi_802_1x_filter req;
 		struct wave600_umi_802_1x_filter cfm;
 		int ret;
 
 		memset(&req, 0, sizeof(req));
-		req.sid = cpu_to_le16(radio->sta_sid);
+		req.sid = cpu_to_le16((u16)sid);
 		req.is_filter_open = 1;
 
 		ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
@@ -1500,9 +2508,12 @@ static int wave600_cfg80211_change_station(struct wiphy *wiphy,
 		if (ret)
 			dev_warn(wdev->dev, "Radio %u SET_802_1X_FILTER IPC failed: %d\n",
 				 radio->radio_idx, ret);
-		else
+		else {
+			if (sta)
+				sta->is_authorized = true;
 			dev_info(wdev->dev, "Radio %u SET_802_1X_FILTER %pM (sid %u) OPENED\n",
-				 radio->radio_idx, mac, radio->sta_sid);
+				 radio->radio_idx, mac, sid);
+		}
 	}
 
 	return 0;
@@ -1520,18 +2531,32 @@ static int wave600_cfg80211_del_station(struct wiphy *wiphy,
 	struct wave600_umi_sta_remove cfm;
 	struct wave600_umi_remove_sid rreq;
 	struct wave600_umi_remove_sid rcfm;
-	u16 sid;
+	struct wave600_station *sta = NULL;
+	const u8 *del_mac = NULL;
+	u16 sid = 0;
 	int ret;
 
-	if (!radio->ap_started || !radio->sta_connected)
+	if (!radio->ap_started)
 		return 0;
 
-	if (params && params->mac && !ether_addr_equal(params->mac, radio->sta_mac))
+	if (params && params->mac) {
+		del_mac = params->mac;
+		sta = wave600_find_sta(radio, del_mac);
+		if (sta)
+			sid = sta->sid;
+		else if (radio->sta_connected && ether_addr_equal(del_mac, radio->sta_mac))
+			sid = radio->sta_sid;
+		else
+			return 0;
+	} else if (radio->sta_connected) {
+		del_mac = radio->sta_mac;
+		sid = radio->sta_sid;
+	} else {
 		return 0;
+	}
 
-	sid = radio->sta_sid;
 	dev_info(wdev->dev, "Radio %u cfg80211: del station %pM (sid %u)\n",
-		 radio->radio_idx, radio->sta_mac, sid);
+		 radio->radio_idx, del_mac, sid);
 
 	/* Stop traffic queues before removing station to prevent FW assertion 0x03c2 */
 	memset(&sreq, 0, sizeof(sreq));
@@ -1565,9 +2590,16 @@ static int wave600_cfg80211_del_station(struct wiphy *wiphy,
 	if (ret)
 		dev_warn(wdev->dev, "Radio %u REMOVE_SID IPC failed: %d\n", radio->radio_idx, ret);
 
-	radio->sta_connected = false;
-	radio->sta_sid = 0;
-	eth_zero_addr(radio->sta_mac);
+	if (del_mac)
+		wave600_del_sta_entry(radio, del_mac);
+
+	if (radio->num_stations == 0) {
+		radio->sta_connected = false;
+		radio->sta_sid = 0;
+		radio->sta_connect_time = 0;
+		radio->sta_last_rx = 0;
+		eth_zero_addr(radio->sta_mac);
+	}
 	return 0;
 }
 
@@ -1576,7 +2608,110 @@ static int wave600_cfg80211_get_station(struct wiphy *wiphy,
 					const u8 *mac,
 					struct station_info *sinfo)
 {
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	struct wave600_station *sta;
+	u8 bw = RATE_INFO_BW_20;
+
+	if (!radio)
+		return -ENOENT;
+
+	sta = wave600_find_sta(radio, mac);
+	if (!sta && !(radio->sta_connected && ether_addr_equal(mac, radio->sta_mac)))
+		return -ENOENT;
+
+	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_INACTIVE_TIME) |
+			 BIT_ULL(NL80211_STA_INFO_CONNECTED_TIME) |
+			 BIT_ULL(NL80211_STA_INFO_SIGNAL) |
+			 BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG) |
+			 BIT_ULL(NL80211_STA_INFO_RX_BYTES) |
+			 BIT_ULL(NL80211_STA_INFO_TX_BYTES) |
+			 BIT_ULL(NL80211_STA_INFO_RX_PACKETS) |
+			 BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
+			 BIT_ULL(NL80211_STA_INFO_TX_BITRATE) |
+			 BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
+
+	if (sta) {
+		sinfo->inactive_time = jiffies_to_msecs(jiffies - sta->last_rx);
+		sinfo->connected_time = ktime_get_seconds() - sta->connect_time;
+		sinfo->signal = sta->signal ? sta->signal : -45;
+	} else {
+		sinfo->inactive_time = jiffies_to_msecs(jiffies - radio->sta_last_rx);
+		sinfo->connected_time = ktime_get_seconds() - radio->sta_connect_time;
+		sinfo->signal = radio->sta_signal ? radio->sta_signal : -45;
+	}
+	sinfo->signal_avg = sinfo->signal;
+
+	if (radio->ndev) {
+		sinfo->rx_bytes = radio->ndev->stats.rx_bytes;
+		sinfo->tx_bytes = radio->ndev->stats.tx_bytes;
+		sinfo->rx_packets = radio->ndev->stats.rx_packets;
+		sinfo->tx_packets = radio->ndev->stats.tx_packets;
+	}
+
+	if (radio->ap_width == 1)
+		bw = RATE_INFO_BW_40;
+	else if (radio->ap_width == 2)
+		bw = RATE_INFO_BW_80;
+	else if (radio->ap_width == 3)
+		bw = RATE_INFO_BW_160;
+	else if (radio->radio_idx == 1)
+		bw = RATE_INFO_BW_80;
+
+	sinfo->txrate.bw = bw;
+	sinfo->rxrate.bw = bw;
+
+	if (radio->radio_idx == 0) {
+		sinfo->txrate.legacy = (bw == RATE_INFO_BW_40) ? 3000 : 1444;
+		sinfo->txrate.flags = RATE_INFO_FLAGS_MCS | RATE_INFO_FLAGS_SHORT_GI;
+		sinfo->txrate.mcs = 15;
+	} else {
+		if (bw == RATE_INFO_BW_160)
+			sinfo->txrate.legacy = 17333;
+		else if (bw == RATE_INFO_BW_80)
+			sinfo->txrate.legacy = 8667;
+		else
+			sinfo->txrate.legacy = 4000;
+		sinfo->txrate.flags = RATE_INFO_FLAGS_VHT_MCS | RATE_INFO_FLAGS_SHORT_GI;
+		sinfo->txrate.mcs = 9;
+		sinfo->txrate.nss = 2;
+	}
+
+	sinfo->rxrate.legacy = sinfo->txrate.legacy;
+	sinfo->rxrate.flags = sinfo->txrate.flags;
+	sinfo->rxrate.mcs = sinfo->txrate.mcs;
+	sinfo->rxrate.nss = sinfo->txrate.nss;
+
 	return 0;
+}
+
+static int wave600_cfg80211_dump_station(struct wiphy *wiphy,
+					 struct net_device *ndev,
+					 int idx,
+					 u8 *mac,
+					 struct station_info *sinfo)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	int i, count = 0;
+
+	if (!radio)
+		return -ENOENT;
+
+	for (i = 0; i < WAVE600_MAX_STATIONS; i++) {
+		if (radio->stations[i].valid) {
+			if (count == idx) {
+				ether_addr_copy(mac, radio->stations[i].mac);
+				return wave600_cfg80211_get_station(wiphy, ndev, mac, sinfo);
+			}
+			count++;
+		}
+	}
+
+	if (count == 0 && radio->sta_connected && idx == 0) {
+		ether_addr_copy(mac, radio->sta_mac);
+		return wave600_cfg80211_get_station(wiphy, ndev, mac, sinfo);
+	}
+
+	return -ENOENT;
 }
 
 static int wave600_cfg80211_add_key(struct wiphy *wiphy,
@@ -1621,8 +2756,14 @@ static int wave600_cfg80211_add_key(struct wiphy *wiphy,
 		return -EOPNOTSUPP;
 	}
 
-	if (pairwise && mac_addr) {
-		sid = radio->sta_sid;
+	if (params->cipher == WLAN_CIPHER_SUITE_AES_CMAC) {
+		sid = WAVE600_BCAST_DEST_SID;
+		key_type = WAVE600_UMI_RSN_MGMT_GROUP_KEY; /* 2 = IGTK (BIP) */
+		dev_info(wdev->dev, "Radio %u add_key (IGTK/BIP): bcast sid=0x%04x key_idx=%u len=%u\n",
+			 radio->radio_idx, sid, key_index, params->key_len);
+	} else if (pairwise && mac_addr) {
+		int sta_sid = wave600_radio_find_sid(radio, mac_addr);
+		sid = (sta_sid >= 0) ? (u16)sta_sid : radio->sta_sid;
 		key_type = WAVE600_UMI_RSN_PAIRWISE_KEY;
 		dev_info(wdev->dev, "Radio %u add_key (PAIRWISE): STA %pM sid=%u key_idx=%u cipher=0x%04x len=%u\n",
 			 radio->radio_idx, mac_addr, sid, key_index, u16_cipher, params->key_len);
@@ -1721,6 +2862,51 @@ static int wave600_cfg80211_set_default_key(struct wiphy *wiphy,
 	return 0;
 }
 
+static int wave600_cfg80211_get_txpower(struct wiphy *wiphy,
+					struct wireless_dev *wdev,
+					int *dbm)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+
+	if (radio->tx_power_dbm > 0)
+		*dbm = radio->tx_power_dbm;
+	else
+		*dbm = (radio->radio_idx == 0) ? 20 : 23;
+
+	return 0;
+}
+
+static int wave600_cfg80211_set_txpower(struct wiphy *wiphy,
+					struct wireless_dev *wdev,
+					enum nl80211_tx_power_setting type,
+					int mbm)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	int max_dbm = (radio->radio_idx == 0) ? 20 : 23;
+
+	if (type == NL80211_TX_POWER_AUTOMATIC) {
+		radio->tx_power_dbm = max_dbm;
+	} else if (type == NL80211_TX_POWER_LIMITED || type == NL80211_TX_POWER_FIXED) {
+		radio->tx_power_dbm = clamp(mbm / 100, 1, max_dbm);
+	}
+
+	if (radio->ap_started) {
+		/*
+		 * Live path: SET_POWER_LIMIT (0x045F) with offset in dBm —
+		 * the vendor way to change TX power on an active radio.
+		 * SET_TPC_CONFIG on a beaconing radio crashes the LM core,
+		 * so the full TPC reload with the new clamp is deferred to
+		 * the next start_ap.
+		 */
+		u8 off = (radio->tx_power_dbm > 0) ?
+			 (u8)(max_dbm - radio->tx_power_dbm) : 0;
+
+		wave600_send_power_limit_offset_radio(radio, off);
+	}
+
+	return 0;
+}
+
 static const struct ieee80211_txrx_stypes wave600_mgmt_stypes[NUM_NL80211_IFTYPES] = {
 	[NL80211_IFTYPE_AP] = {
 		.tx = 0xffff,
@@ -1749,6 +2935,7 @@ static const struct cfg80211_ops wave600_cfg80211_ops = {
 	.del_station = wave600_cfg80211_del_station,
 	.change_station = wave600_cfg80211_change_station,
 	.get_station = wave600_cfg80211_get_station,
+	.dump_station = wave600_cfg80211_dump_station,
 	.add_key = wave600_cfg80211_add_key,
 	.del_key = wave600_cfg80211_del_key,
 	.set_default_key = wave600_cfg80211_set_default_key,
@@ -1758,11 +2945,111 @@ static const struct cfg80211_ops wave600_cfg80211_ops = {
 	.disassoc = wave600_cfg80211_disassoc,
 	.connect = wave600_cfg80211_connect,
 	.disconnect = wave600_cfg80211_disconnect,
+	.get_tx_power = wave600_cfg80211_get_txpower,
+	.set_tx_power = wave600_cfg80211_set_txpower,
 };
 
 /* ------------------------------------------------------------------ */
-/* Wiphy registration                                                  */
+/* Wiphy registration & 802.11ax (HE) Capabilities                    */
 /* ------------------------------------------------------------------ */
+
+static const struct ieee80211_sband_iftype_data wave600_iftype_data_2g[] = {
+	{
+		.types_mask = BIT(NL80211_IFTYPE_AP),
+		.he_cap = {
+			.has_he = true,
+			.he_cap_elem = {
+				.mac_cap_info = {
+					[0] = IEEE80211_HE_MAC_CAP0_HTC_HE |
+					      IEEE80211_HE_MAC_CAP0_TWT_RES,
+					[2] = IEEE80211_HE_MAC_CAP2_ALL_ACK |
+					      IEEE80211_HE_MAC_CAP2_BSR,
+					[3] = IEEE80211_HE_MAC_CAP3_OMI_CONTROL |
+					      IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_EXT_3,
+					[4] = IEEE80211_HE_MAC_CAP4_AMSDU_IN_AMPDU |
+					      IEEE80211_HE_MAC_CAP4_BQR,
+					[5] = IEEE80211_HE_MAC_CAP5_OM_CTRL_UL_MU_DATA_DIS_RX,
+				},
+				.phy_cap_info = {
+					[0] = IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G,
+					[1] = IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD |
+					      IEEE80211_HE_PHY_CAP1_HE_LTF_AND_GI_FOR_HE_PPDUS_0_8US,
+					[2] = IEEE80211_HE_PHY_CAP2_STBC_TX_UNDER_80MHZ |
+					      IEEE80211_HE_PHY_CAP2_STBC_RX_UNDER_80MHZ,
+					[3] = IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_TX_QPSK |
+					      IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_RX_QPSK |
+					      IEEE80211_HE_PHY_CAP3_SU_BEAMFORMER,
+					[4] = IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE |
+					      IEEE80211_HE_PHY_CAP4_MU_BEAMFORMER,
+					[6] = IEEE80211_HE_PHY_CAP6_PARTIAL_BW_EXT_RANGE,
+					[8] = IEEE80211_HE_PHY_CAP8_20MHZ_IN_40MHZ_HE_PPDU_IN_2G,
+					[9] = IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU |
+					      IEEE80211_HE_PHY_CAP9_RX_1024_QAM_LESS_THAN_242_TONE_RU |
+					      (IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_16US << IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_POS),
+				},
+			},
+			.he_mcs_nss_supp = {
+				.rx_mcs_80 = cpu_to_le16(0xfffa),
+				.tx_mcs_80 = cpu_to_le16(0xfffa),
+				.rx_mcs_160 = cpu_to_le16(0xffff),
+				.tx_mcs_160 = cpu_to_le16(0xffff),
+				.rx_mcs_80p80 = cpu_to_le16(0xffff),
+				.tx_mcs_80p80 = cpu_to_le16(0xffff),
+			},
+		},
+	},
+};
+
+static const struct ieee80211_sband_iftype_data wave600_iftype_data_5g[] = {
+	{
+		.types_mask = BIT(NL80211_IFTYPE_AP),
+		.he_cap = {
+			.has_he = true,
+			.he_cap_elem = {
+				.mac_cap_info = {
+					[0] = IEEE80211_HE_MAC_CAP0_HTC_HE |
+					      IEEE80211_HE_MAC_CAP0_TWT_RES,
+					[2] = IEEE80211_HE_MAC_CAP2_ALL_ACK |
+					      IEEE80211_HE_MAC_CAP2_BSR,
+					[3] = IEEE80211_HE_MAC_CAP3_OMI_CONTROL |
+					      IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_EXT_3,
+					[4] = IEEE80211_HE_MAC_CAP4_AMSDU_IN_AMPDU |
+					      IEEE80211_HE_MAC_CAP4_BQR,
+					[5] = IEEE80211_HE_MAC_CAP5_OM_CTRL_UL_MU_DATA_DIS_RX,
+				},
+				.phy_cap_info = {
+					[0] = IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G |
+					      IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G,
+					[1] = IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD |
+					      IEEE80211_HE_PHY_CAP1_HE_LTF_AND_GI_FOR_HE_PPDUS_0_8US,
+					[2] = IEEE80211_HE_PHY_CAP2_STBC_TX_UNDER_80MHZ |
+					      IEEE80211_HE_PHY_CAP2_STBC_RX_UNDER_80MHZ,
+					[3] = IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_TX_QPSK |
+					      IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_RX_QPSK |
+					      IEEE80211_HE_PHY_CAP3_SU_BEAMFORMER,
+					[4] = IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE |
+					      IEEE80211_HE_PHY_CAP4_MU_BEAMFORMER,
+					[6] = IEEE80211_HE_PHY_CAP6_PARTIAL_BW_EXT_RANGE,
+					[7] = IEEE80211_HE_PHY_CAP7_STBC_TX_ABOVE_80MHZ |
+					      IEEE80211_HE_PHY_CAP7_STBC_RX_ABOVE_80MHZ,
+					[8] = IEEE80211_HE_PHY_CAP8_20MHZ_IN_160MHZ_HE_PPDU |
+					      IEEE80211_HE_PHY_CAP8_80MHZ_IN_160MHZ_HE_PPDU,
+					[9] = IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU |
+					      IEEE80211_HE_PHY_CAP9_RX_1024_QAM_LESS_THAN_242_TONE_RU |
+					      (IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_16US << IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_POS),
+				},
+			},
+			.he_mcs_nss_supp = {
+				.rx_mcs_80 = cpu_to_le16(0xfffa),
+				.tx_mcs_80 = cpu_to_le16(0xfffa),
+				.rx_mcs_160 = cpu_to_le16(0xfffa),
+				.tx_mcs_160 = cpu_to_le16(0xfffa),
+				.rx_mcs_80p80 = cpu_to_le16(0xffff),
+				.tx_mcs_80p80 = cpu_to_le16(0xffff),
+			},
+		},
+	},
+};
 
 static void wave600_setup_band_2g(struct ieee80211_supported_band *band)
 {
@@ -1789,31 +3076,38 @@ static void wave600_setup_band_2g(struct ieee80211_supported_band *band)
 static void wave600_setup_band_5g(struct ieee80211_supported_band *band)
 {
 	static const struct ieee80211_channel channels_5g[] = {
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5180, .hw_value = 36, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5200, .hw_value = 40, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5220, .hw_value = 44, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5240, .hw_value = 48, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5260, .hw_value = 52, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5280, .hw_value = 56, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5300, .hw_value = 60, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5320, .hw_value = 64, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5500, .hw_value = 100, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5520, .hw_value = 104, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5540, .hw_value = 108, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5560, .hw_value = 112, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5580, .hw_value = 116, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5600, .hw_value = 120, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5620, .hw_value = 124, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5640, .hw_value = 128, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5660, .hw_value = 132, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5680, .hw_value = 136, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5700, .hw_value = 140, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5720, .hw_value = 144, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5745, .hw_value = 149, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5765, .hw_value = 153, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5785, .hw_value = 157, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5805, .hw_value = 161, .max_power = 23, .max_antenna_gain = 0 },
-		{ .band = NL80211_BAND_5GHZ, .center_freq = 5825, .hw_value = 165, .max_power = 23, .max_antenna_gain = 0 },
+		/* UNII-1: Non-DFS indoor channels */
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5180, .hw_value = 36, .max_power = 23, .max_antenna_gain = 0, .flags = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5200, .hw_value = 40, .max_power = 23, .max_antenna_gain = 0, .flags = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5220, .hw_value = 44, .max_power = 23, .max_antenna_gain = 0, .flags = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5240, .hw_value = 48, .max_power = 23, .max_antenna_gain = 0, .flags = 0 },
+
+		/* UNII-2A: DFS channels (Radar detection required) */
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5260, .hw_value = 52, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5280, .hw_value = 56, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5300, .hw_value = 60, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5320, .hw_value = 64, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+
+		/* UNII-2C: DFS channels (Radar detection required) */
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5500, .hw_value = 100, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5520, .hw_value = 104, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5540, .hw_value = 108, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5560, .hw_value = 112, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5580, .hw_value = 116, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5600, .hw_value = 120, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5620, .hw_value = 124, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5640, .hw_value = 128, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5660, .hw_value = 132, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5680, .hw_value = 136, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5700, .hw_value = 140, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5720, .hw_value = 144, .max_power = 23, .max_antenna_gain = 0, .flags = IEEE80211_CHAN_RADAR },
+
+		/* UNII-3: Non-DFS channels */
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5745, .hw_value = 149, .max_power = 23, .max_antenna_gain = 0, .flags = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5765, .hw_value = 153, .max_power = 23, .max_antenna_gain = 0, .flags = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5785, .hw_value = 157, .max_power = 23, .max_antenna_gain = 0, .flags = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5805, .hw_value = 161, .max_power = 23, .max_antenna_gain = 0, .flags = 0 },
+		{ .band = NL80211_BAND_5GHZ, .center_freq = 5825, .hw_value = 165, .max_power = 23, .max_antenna_gain = 0, .flags = 0 },
 	};
 
 	memcpy(band->channels, channels_5g, sizeof(channels_5g));
@@ -1893,6 +3187,8 @@ static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 	if (!wiphy)
 		return -ENOMEM;
 
+	set_wiphy_dev(wiphy, wdev->dev);
+
 	/* priv points back at radio */
 	*(struct wave600_radio **)wiphy_priv(wiphy) = radio;
 	radio->wiphy = wiphy;
@@ -1902,7 +3198,8 @@ static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 	wiphy->cipher_suites = wave600_cipher_suites;
 	wiphy->n_cipher_suites = ARRAY_SIZE(wave600_cipher_suites);
 	wiphy->mgmt_stypes = wave600_mgmt_stypes;
-	wiphy->signal_type = CFG80211_SIGNAL_TYPE_UNSPEC;
+	wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
+	wiphy->reg_notifier = wave600_reg_notifier;
 	wiphy->max_scan_ssids = 1;
 	strscpy(wiphy->fw_version, wdev->fw_version, sizeof(wiphy->fw_version));
 
@@ -1944,11 +3241,15 @@ static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 		}
 
 		band->ht_cap.ht_supported = true;
-		band->ht_cap.cap = IEEE80211_HT_CAP_SGI_20 | BIT(8); /* RX STBC 1SS */
+		band->ht_cap.cap = IEEE80211_HT_CAP_SGI_20 | IEEE80211_HT_CAP_SGI_40 |
+				   IEEE80211_HT_CAP_SUP_WIDTH_20_40 | BIT(8); /* RX STBC 1SS */
 		band->ht_cap.ampdu_factor = IEEE80211_HT_MAX_AMPDU_32K;
 		band->ht_cap.ampdu_density = IEEE80211_HT_MPDU_DENSITY_16;
 		memset(&band->ht_cap.mcs, 0, sizeof(band->ht_cap.mcs));
-		band->ht_cap.mcs.rx_mask[0] = 0xff;
+		band->ht_cap.mcs.rx_mask[0] = 0xff; /* MCS 0-7 */
+		band->ht_cap.mcs.rx_mask[1] = 0xff; /* MCS 8-15 (2x2 MIMO) */
+
+		ieee80211_set_sband_iftype_data(band, wave600_iftype_data_2g);
 	} else {
 		/* 5 GHz Band Only */
 		wiphy->bands[NL80211_BAND_5GHZ] =
@@ -2002,6 +3303,8 @@ static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 				    IEEE80211_VHT_CAP_RXSTBC_1;
 		band->vht_cap.vht_mcs.rx_mcs_map = cpu_to_le16(0xfffa);
 		band->vht_cap.vht_mcs.tx_mcs_map = cpu_to_le16(0xfffa);
+
+		ieee80211_set_sband_iftype_data(band, wave600_iftype_data_5g);
 	}
 
 	radio->ndev = alloc_netdev(sizeof(struct wireless_dev),
@@ -2121,6 +3424,10 @@ int wave600_cfg80211_init(struct wave600_dev *wdev)
 	}
 
 	dev_info(wdev->dev, "DBDC Wi-Fi ready: wlan0 (2.4 GHz) and wlan1 (5 GHz) registered\n");
+
+	/* Initial default country: PL / ETSI (AX50 EU retail hardware) */
+	wave600_set_country(wdev, "PL");
+
 	return 0;
 }
 

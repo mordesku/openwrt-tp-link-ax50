@@ -330,6 +330,8 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 			ndev->stats.rx_packets++;
 			ndev->stats.rx_bytes += len;
 		}
+		if (radio)
+			radio->sta_last_rx = jiffies;
 
 recycle_reuse:
 		recycle_hd = *hd;
@@ -464,9 +466,12 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 					napi_gro_receive(&dma->napi, rskb);
 					radio->ndev->stats.rx_packets++;
 					radio->ndev->stats.rx_bytes += len;
+					radio->sta_last_rx = jiffies;
 				}
 			} else if (radio && radio->ap_started && radio->wdev_net) {
-				cfg80211_rx_mgmt(radio->wdev_net, freq, 0,
+				int sig = radio->sta_signal ? radio->sta_signal : -45;
+
+				cfg80211_rx_mgmt(radio->wdev_net, freq, sig,
 						 data, len, 0);
 			}
 
@@ -545,8 +550,12 @@ int wave600_dma_mgmt_tx(struct wave600_radio *radio, const u8 *buf, size_t len)
 
 	if (mcf) {
 		info0_val |= W600_TX_MCF;
-	} else if (radio->sta_connected && len >= 10 && ether_addr_equal(buf + 4, radio->sta_mac)) {
-		info0_val |= FIELD_PREP(W600_TX_STAID, radio->sta_sid);
+	} else if (len >= 10) {
+		int sid = wave600_radio_find_sid(radio, buf + 4);
+		if (sid >= 0)
+			info0_val |= FIELD_PREP(W600_TX_STAID, (u16)sid);
+		else
+			info0_val |= W600_TX_UNKNOWN_SID;
 	} else {
 		info0_val |= W600_TX_UNKNOWN_SID;
 	}
@@ -603,16 +612,22 @@ int wave600_dma_mgmt_tx_eapol(struct wave600_radio *radio, const u8 *buf, size_t
 		    FIELD_PREP(W600_TX_FRAMETYPE, W600_FRAME_TYPE_EAPOL) |
 		    FIELD_PREP(W600_TX_VAPID, radio->vap_id);
 
-	if (radio->sta_connected && len >= ETH_HLEN &&
-	    ether_addr_equal(eth->h_dest, radio->sta_mac)) {
-		info0_val |= FIELD_PREP(W600_TX_STAID, radio->sta_sid);
+	if (len >= ETH_HLEN) {
+		int sid = wave600_radio_find_sid(radio, eth->h_dest);
+		if (sid >= 0) {
+			info0_val |= FIELD_PREP(W600_TX_STAID, (u16)sid);
+		} else {
+			dev_warn_ratelimited(wdev->dev, "Radio %u EAPOL TX dropped: unknown destination %pM\n",
+					     radio->radio_idx, eth->h_dest);
+			return -ENOENT;
+		}
 	} else {
-		info0_val |= W600_TX_UNKNOWN_SID;
+		return -EINVAL;
 	}
 
 	memset(&hd, 0, sizeof(hd));
 	hd.info0 = cpu_to_le32(info0_val);
-	hd.info1 = cpu_to_le32(FIELD_PREP(W600_TX_CLASS, 15) |
+	hd.info1 = cpu_to_le32(FIELD_PREP(W600_TX_CLASS, 7) |
 			       FIELD_PREP(W600_TX_EP, radio->ep));
 	hd.payload_addr = cpu_to_le32((u32)slot_dma);
 	hd.info3 = cpu_to_le32(FIELD_PREP(W600_TX_SOP_EOP, W600_NO_FRAG) |
@@ -743,10 +758,12 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		FIELD_PREP(W600_TX_FRAMETYPE, W600_FRAME_TYPE_ETHERNET);
 	if (is_multicast_ether_addr(skb->data)) {
 		info0 |= W600_TX_MCF;
-	} else if (radio->sta_connected && ether_addr_equal(skb->data, radio->sta_mac)) {
-		info0 |= FIELD_PREP(W600_TX_STAID, radio->sta_sid);
 	} else {
-		info0 |= W600_TX_UNKNOWN_SID;
+		int sid = wave600_radio_find_sid(radio, skb->data);
+		if (sid >= 0)
+			info0 |= FIELD_PREP(W600_TX_STAID, (u16)sid);
+		else
+			info0 |= W600_TX_UNKNOWN_SID;
 	}
 	hd.info0 = cpu_to_le32(info0);
 	hd.info1 = cpu_to_le32(FIELD_PREP(W600_TX_CLASS, skb->priority & 7) |
@@ -877,6 +894,8 @@ const struct net_device_ops wave600_netdev_ops = {
 	.ndo_open = wave600_netdev_open,
 	.ndo_stop = wave600_netdev_stop,
 	.ndo_start_xmit = wave600_dma_start_xmit,
+	.ndo_set_mac_address = eth_mac_addr,
+	.ndo_validate_addr = eth_validate_addr,
 };
 
 /*
@@ -952,6 +971,51 @@ err_arrays:
 	dma->rx_bufs = NULL;
 	dma->mgmt_bufs = NULL;
 	return ret;
+}
+
+void wave600_dma_repost_rx_pool(struct wave600_dev *wdev)
+{
+	struct wave600_dma *dma = &wdev->dma;
+	u32 i;
+
+	if (!dma->pool_posted || !dma->rx_bufs || !dma->mgmt_bufs)
+		return;
+
+	for (i = 0; i < dma->rd_pool_num; i++) {
+		if (dma->rx_bufs[i].skb)
+			rd_pool_set_entry(dma, i, dma->rx_bufs[i].dma, false);
+	}
+
+	for (i = 0; i < dma->rd_mgmt_num; i++) {
+		if (dma->mgmt_bufs[i].skb)
+			rd_pool_set_entry(dma, i, dma->mgmt_bufs[i].dma, true);
+	}
+
+	dev_info(wdev->dev, "RD pool descriptors re-posted to SHRAM after recovery\n");
+}
+
+static void wave600_dma_ring_reset(struct wave600_dev *wdev, struct wave600_dma_ring *r)
+{
+	if (!r || !r->descs)
+		return;
+	memset(r->descs, 0, r->size * sizeof(struct wave600_host_dsc));
+	r->read_ptr = 0;
+	r->write_ptr = 0;
+	if (r->in_cntr)
+		__raw_writel(0, r->in_cntr);
+	if (r->out_cntr)
+		__raw_writel(0, r->out_cntr);
+}
+
+void wave600_dma_reset_rings(struct wave600_dev *wdev)
+{
+	struct wave600_dma *dma = &wdev->dma;
+
+	wave600_dma_ring_reset(wdev, &dma->tx);
+	wave600_dma_ring_reset(wdev, &dma->rx);
+	wave600_dma_ring_reset(wdev, &dma->mgmt_tx);
+	wave600_dma_ring_reset(wdev, &dma->mgmt_rx);
+	dev_info(wdev->dev, "DMA host descriptor rings reset for recovery\n");
 }
 
 static void dc_rings_free(struct wave600_dev *wdev, struct wave600_dma *dma)

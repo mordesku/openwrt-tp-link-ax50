@@ -16,7 +16,7 @@ define Device/tplink_archer-ax50-v1
   KERNEL_ENTRY := 0xa0020000
   KERNEL := kernel-bin | append-dtb | lzma | uImage lzma
   KERNEL_INITRAMFS := kernel-bin | append-dtb | lzma | uImage lzma
-  DEVICE_PACKAGES :=
+  DEVICE_PACKAGES := kmod-wave600-wifi wpad-basic-openssl iw wireless-regdb
   SUPPORTED_DEVICES += tplink,archer-ax50-v1
 endef
 TARGET_DEVICES += tplink_archer-ax50-v1

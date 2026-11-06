@@ -348,11 +348,12 @@ export function assoclist(dev) {
 	let ret = {};
 	
 	for (let station in stations) {
+		let sig = station.sta_info.rx_signal_dbm ?? station.sta_info.signal_avg ?? station.sta_info.signal ?? -45;
 		let sta = {
 			mac: uc(station.mac),
-			signal: station.sta_info.signal_avg,
+			signal: sig,
 			noise: ifaces[dev].noise,
-			snr: station.sta_info.signal_avg - ifaces[dev].noise,
+			snr: sig - ifaces[dev].noise,
 			inactive_time: station.sta_info.inactive_time,
 			rx: {
 				bitrate: format_rate(station.sta_info.rx_bitrate?.bitrate ?? 0),

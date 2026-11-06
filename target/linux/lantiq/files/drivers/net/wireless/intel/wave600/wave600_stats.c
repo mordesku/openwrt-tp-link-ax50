@@ -10,16 +10,11 @@
  * Buffer geometry comes from the CHI vector area extension 7
  * (statistics manager, vendor shram.h VECTOR_AREA_STATISTICS_MANAGER).
  *
- * Endianness: the mailbox request fields (DDR buffer address, length)
- * are MAC-endian (little-endian), exactly like the vendor HOST_TO_MAC32/16
- * coding for every mailbox field. The descriptor table and the counter
- * database are DMA data written by the ARC firmware into host DDR.
- * Their field endianness is NOT guaranteed by the vendor headers (vendor
- * hw_mmb.c applies MAC_TO_HOST16/32, i.e. LE interpretation, while
- * DATA_PATH_INIT told the firmware about a big-endian host via
- * hostEndianessMode). The dump therefore detects the table offset
- * endianness by plausibility and prints every counter in both
- * interpretations plus raw bytes, so a single read is decisive evidence.
+ * Endianness: the mailbox request fields (DDR buffer address, length) and
+ * the descriptor-table u16 fields are MAC-endian (little-endian), exactly
+ * like vendor MAC_TO_HOST16/32. The FW writes the table and counter
+ * database into host DDR; the table entry u16 offset/dimension fields must
+ * not be byte-swapped as BE.
  *
  * The request confirmation may race the firmware DMA (the cfm can arrive
  * before the DMA write lands), so the dump sleeps briefly after each
@@ -43,15 +38,25 @@
 /* vendor mhi_statistics_manager_enums.h StatisticType_e (subset) */
 #define WAVE600_STAT_TYPE_HOSTIF_COUNTERS	0
 #define WAVE600_STAT_TYPE_BAA_COUNTERS		2
+#define WAVE600_STAT_TYPE_LINK_ADAPTATION	7
 #define WAVE600_STAT_TYPE_GENERAL_STATS		14
+
+/* vendor LinkAdaptationStats_e subtypes carrying actual FW TX power.
+ * unitSize=1 byte per entry, STAT_PW_PER_DBM=2 -> byte value / 2 = dBm.
+ * Block layout: num_radios x PHY_STAT_RATE_CBW_NUM(4) bytes (per 20/40/80/160). */
+#define W600_LA_POWER_DATA	6
+#define W600_LA_POWER_MANAGEMENT 7
+#define W600_LA_MIN_POWER	21
+#define W600_LA_MAX_POWER	22
+#define W600_STAT_PW_PER_DBM	2	/* vendor mtlk_coreui.h */
 
 /*
  * vendor mhi_statistics_manager_defines.h StatsEntryDecoded_t (8 bytes).
  * Byte 0 bitfield (same physical layout for BE and LE bitfield code):
  *   [reserved:1][unitSize:3][type:4]
  * Byte 1 bitfield:
- *   [numOfDimensions:2][subtype:6] (subtype is implicit by position)
- * The u16 fields (offset, dimension1) are read in both endiannesses.
+ *   [numOfDimensions:2][subtype:6]
+ * The u16 fields (offset, dimension1) are little-endian.
  */
 struct wave600_stats_entry {
 	u8 flags;
@@ -99,11 +104,6 @@ static u16 stat_le16(const u8 *p)
 	return (u16)(p[0] | (p[1] << 8));
 }
 
-static u16 stat_be16(const u8 *p)
-{
-	return (u16)((p[0] << 8) | p[1]);
-}
-
 static u8 stat_entry_type(const struct wave600_stats_entry *e)
 {
 	return e->flags & 0x0f;
@@ -114,26 +114,46 @@ static u8 stat_entry_unit(const struct wave600_stats_entry *e)
 	return (e->flags >> 4) & 0x07;
 }
 
-static u16 stat_entry_offset(const struct wave600_stats_entry *e, bool le)
+static u8 stat_entry_subtype(const struct wave600_stats_entry *e)
 {
-	return le ? stat_le16(e->offset_raw) : stat_be16(e->offset_raw);
+	return e->dim_flags & 0x3f;
 }
 
-static u16 stat_entry_dim1(const struct wave600_stats_entry *e, bool le)
+static u8 stat_entry_dims(const struct wave600_stats_entry *e)
 {
-	return le ? stat_le16(e->dim1_raw) : stat_be16(e->dim1_raw);
+	return (e->dim_flags >> 6) & 3;
+}
+
+static u16 stat_entry_offset(const struct wave600_stats_entry *e)
+{
+	return stat_le16(e->offset_raw);
+}
+
+static u16 stat_entry_dim1(const struct wave600_stats_entry *e)
+{
+	return stat_le16(e->dim1_raw);
+}
+
+static u32 stat_entry_bytes(const struct wave600_stats_entry *e)
+{
+	return (u32)stat_entry_unit(e) * stat_entry_dim1(e) * e->dimension2;
+}
+
+static bool stat_entry_fits(const struct wave600_stats_entry *e, u32 db_size)
+{
+	u64 end = (u64)stat_entry_offset(e) + stat_entry_bytes(e);
+
+	return end <= db_size;
 }
 
 /*
  * Find the first table entry index of a statistics type. The CHI
  * type_table_list[] holds byte offsets from the start of the descriptor
- * table (vendor _mtlk_hw_mhi_parse_table compares entry byte offsets).
- * The entry's own type field is verified; if it does not match under the
- * BE bitfield layout, the LE layout is tried and reported.
+ * table, exactly like vendor _mtlk_hw_mhi_parse_table.
  */
 static int stat_find_type(const struct wave600_stats_entry *tab, u32 tab_num,
 			  const struct wave600_chi_stats_mgr_ext *ext,
-			  unsigned int type, bool *le_layout)
+			  unsigned int type)
 {
 	u32 start;
 	int i;
@@ -152,80 +172,29 @@ static int stat_find_type(const struct wave600_stats_entry *tab, u32 tab_num,
 	if (stat_entry_type(&tab[i]) == type)
 		return i;
 
-	/* LE bitfield layout fallback: type in the high nibble */
-	if ((tab[i].flags >> 4) == type) {
-		*le_layout = true;
-		return i;
-	}
-
 	return -1;
 }
 
-static u8 stat_entry_type_auto(const struct wave600_stats_entry *e, bool le_layout)
+/* Counter value zero-extended per little-endian unit size */
+static void stat_counter_le(const u8 *db, u32 db_size,
+			    const struct wave600_stats_entry *e,
+			    u32 *value, u8 raw[4])
 {
-	return le_layout ? (e->flags >> 4) : stat_entry_type(e);
-}
-
-/*
- * Count the entries of the GENERAL_STATS block whose
- * offset + unitSize*dim1*dim2 stays inside the counter database.
- * Used to pick the endianness of the u16 offset/dimension fields.
- */
-static int stat_count_valid(const struct wave600_stats_entry *tab, u32 tab_num,
-			    int start, u32 db_size, bool le, bool le_layout)
-{
-	const struct wave600_stats_entry *e;
-	u32 dim1, dim2, size;
-	int i, valid = 0;
-
-	for (i = 0; start >= 0 && start + (int)i < (int)tab_num; i++) {
-		e = &tab[start + i];
-
-		if (stat_entry_type_auto(e, le_layout) !=
-		    WAVE600_STAT_TYPE_GENERAL_STATS)
-			break;
-
-		dim1 = stat_entry_dim1(e, le);
-		dim2 = e->dimension2;
-		size = (u32)stat_entry_unit(e) *
-		       (dim1 ? dim1 : 1) * (dim2 ? dim2 : 1);
-
-		if ((u32)stat_entry_offset(e, le) + size <= db_size)
-			valid++;
-		else
-			break;
-	}
-
-	return valid;
-}
-
-/* Counter value in both interpretations, zero-extended per unit size */
-static void stat_counter_both(const u8 *db, u32 db_size,
-			      const struct wave600_stats_entry *e, bool le_offs,
-			      u32 *le_value, u32 *be_value, u8 raw[4])
-{
-	u32 offset = stat_entry_offset(e, le_offs);
+	u32 offset = stat_entry_offset(e);
 	u32 unit = stat_entry_unit(e);
 	u32 v = 0;
 	int i;
 
 	memset(raw, 0, 4);
-	*le_value = 0;
-	*be_value = 0;
+	*value = 0;
 
 	if (unit == 0 || unit > 4 || offset + unit > db_size)
 		return;
 
+	memcpy(raw, db + offset, unit);
 	for (i = unit - 1; i >= 0; i--)
 		v = (v << 8) | db[offset + i];
-	*le_value = v;
-
-	v = 0;
-	for (i = 0; i < unit; i++)
-		v = (v << 8) | db[offset + i];
-	*be_value = v;
-
-	memcpy(raw, db + offset, 4);
+	*value = v;
 }
 
 static int wave600_stats_send(struct wave600_dev *wdev, u16 req_id, u16 cfm_id,
@@ -290,7 +259,6 @@ int wave600_stats_init(struct wave600_dev *wdev)
 	u32 db_size, tab_size, alloc_size;
 	dma_addr_t dma;
 	u8 *mem;
-	bool le_layout = false;
 	int ret;
 
 	db_size = ext->stats_data_size;
@@ -339,14 +307,13 @@ int wave600_stats_init(struct wave600_dev *wdev)
 
 	tab = (struct wave600_stats_entry *)stats->table;
 	stats->gen_start = stat_find_type(tab, tab_size / sizeof(*tab), ext,
-					   WAVE600_STAT_TYPE_GENERAL_STATS,
-					   &le_layout);
+					   WAVE600_STAT_TYPE_GENERAL_STATS);
 	stats->baa_start = stat_find_type(tab, tab_size / sizeof(*tab), ext,
-					   WAVE600_STAT_TYPE_BAA_COUNTERS,
-					   &le_layout);
+					   WAVE600_STAT_TYPE_BAA_COUNTERS);
 	stats->hostif_start = stat_find_type(tab, tab_size / sizeof(*tab), ext,
-						 WAVE600_STAT_TYPE_HOSTIF_COUNTERS,
-						 &le_layout);
+						 WAVE600_STAT_TYPE_HOSTIF_COUNTERS);
+	stats->la_start = stat_find_type(tab, tab_size / sizeof(*tab), ext,
+					  WAVE600_STAT_TYPE_LINK_ADAPTATION);
 	stats->table_valid = true;
 
 	/*
@@ -374,9 +341,9 @@ int wave600_stats_init(struct wave600_dev *wdev)
 	if (stats->gen_start < 0)
 		dev_info(wdev->dev, "fw_stats init: GENERAL_STATS type not found in table (raw dump available via sysfs)\n");
 	else
-		dev_info(wdev->dev, "fw_stats init: statistics table captured (entries=%u gen_start=%d baa_start=%d)\n",
+		dev_info(wdev->dev, "fw_stats init: statistics table captured (entries=%u gen_start=%d baa_start=%d la_start=%d)\n",
 			 tab_size / sizeof(*tab), stats->gen_start,
-			 stats->baa_start);
+			 stats->baa_start, stats->la_start);
 
 	return 0;
 }
@@ -405,11 +372,9 @@ static int wave600_fw_stats_dump(struct wave600_dev *wdev, char *out,
 	u32 db_size, tab_size, alloc_size;
 	dma_addr_t dma;
 	u8 *mem;
-	bool le_layout = false;
-	bool le_offs;
+	u8 *runtime_tab = NULL;
 	bool temp_mem = false;
-	int gen_start, baa_start, hostif_start;
-	int valid_le, valid_be;
+	int gen_start, baa_start, hostif_start, la_start;
 	int ret;
 	int n = 0;
 	int i;
@@ -471,32 +436,32 @@ static int wave600_fw_stats_dump(struct wave600_dev *wdev, char *out,
 		 */
 		msleep(1000);
 
-		tab = (struct wave600_stats_entry *)mem;
+		runtime_tab = kmalloc(tab_size, GFP_KERNEL);
+		if (!runtime_tab) {
+			ret = -ENOMEM;
+			goto out_free;
+		}
+		memcpy(runtime_tab, mem, tab_size);
+		tab = (struct wave600_stats_entry *)runtime_tab;
 	}
 
 	gen_start = stat_find_type(tab, tab_size / sizeof(*tab), ext,
-				   WAVE600_STAT_TYPE_GENERAL_STATS, &le_layout);
+				   WAVE600_STAT_TYPE_GENERAL_STATS);
 	baa_start = stat_find_type(tab, tab_size / sizeof(*tab), ext,
-				   WAVE600_STAT_TYPE_BAA_COUNTERS, &le_layout);
+				   WAVE600_STAT_TYPE_BAA_COUNTERS);
 	hostif_start = stat_find_type(tab, tab_size / sizeof(*tab), ext,
-				      WAVE600_STAT_TYPE_HOSTIF_COUNTERS,
-				      &le_layout);
-	/* Pick the offset-field endianness by entry plausibility */
-	valid_le = stat_count_valid(tab, tab_size / sizeof(*tab), gen_start,
-				    db_size, true, le_layout);
-	valid_be = stat_count_valid(tab, tab_size / sizeof(*tab), gen_start,
-				    db_size, false, le_layout);
-	le_offs = valid_le > valid_be;
+				      WAVE600_STAT_TYPE_HOSTIF_COUNTERS);
+	la_start = stat_find_type(tab, tab_size / sizeof(*tab), ext,
+				  WAVE600_STAT_TYPE_LINK_ADAPTATION);
 
 	n += scnprintf(out + n, out_len - n,
 		       "fw_stats: db_size=%u tab_size=%u dma=0x%08x ext_id=%u table=%s\n",
 		       db_size, tab_size, (u32)dma, ext->header.id,
 		       stats->table_valid ? "init" : "runtime");
 	n += scnprintf(out + n, out_len - n,
-		       "fw_stats: entries=%u gen_start=%d baa_start=%d hostif_start=%d bitfield=%s offs=%s (valid le=%d be=%d)\n",
+		       "fw_stats: entries=%u gen_start=%d baa_start=%d hostif_start=%d la_start=%d offsets/dims=LE\n",
 		       tab_size / sizeof(*tab), gen_start, baa_start,
-		       hostif_start, le_layout ? "LE" : "BE",
-		       le_offs ? "LE" : "BE", valid_le, valid_be);
+		       hostif_start, la_start);
 
 	if (out_len - n >= 96) {
 		n += scnprintf(out + n, out_len - n, "fw_stats type_table_list:");
@@ -507,7 +472,7 @@ static int wave600_fw_stats_dump(struct wave600_dev *wdev, char *out,
 	}
 
 	n += scnprintf(out + n, out_len - n, "fw_stats table raw head:\n");
-	n = stat_hexdump(out, out_len, n, stats->table_valid ? stats->table : mem,
+	n = stat_hexdump(out, out_len, n, (const u8 *)tab,
 			 min((u32)128, tab_size), 0);
 
 	/*
@@ -523,8 +488,31 @@ static int wave600_fw_stats_dump(struct wave600_dev *wdev, char *out,
 				       "fw_stats table raw at GENERAL_STATS offset 0x%04x:\n",
 				       gen_off);
 			n = stat_hexdump(out, out_len, n,
-					 stats->table_valid ? stats->table : mem,
+					 (const u8 *)tab + gen_off,
 					 min((u32)32, tab_size - gen_off), gen_off);
+		}
+	}
+
+	if (la_start >= 0) {
+		n += scnprintf(out + n, out_len - n,
+			       "fw_stats LINK_ADAPTATION table entries:\n");
+		for (i = 0; la_start + i < (int)(tab_size / sizeof(*tab)) &&
+			     i < 32; i++) {
+			const struct wave600_stats_entry *e = &tab[la_start + i];
+
+			if (stat_entry_type(e) != WAVE600_STAT_TYPE_LINK_ADAPTATION)
+				break;
+			if (out_len - n < 96)
+				break;
+
+			n += scnprintf(out + n, out_len - n,
+				       "la_entry[%02d] raw_sub=%02u pos_sub=%02u unit=%u dims=%u dim1=%u dim2=%u off=%u size=%u next=%u fits=%d\n",
+				       i, stat_entry_subtype(e), i,
+				       stat_entry_unit(e), stat_entry_dims(e),
+				       stat_entry_dim1(e), e->dimension2,
+				       stat_entry_offset(e), stat_entry_bytes(e),
+				       e->next_idx_offset,
+				       stat_entry_fits(e, db_size));
 		}
 	}
 
@@ -556,22 +544,20 @@ static int wave600_fw_stats_dump(struct wave600_dev *wdev, char *out,
 		const char *name = i < (int)ARRAY_SIZE(stat_general_names) ?
 				   stat_general_names[i] : "?";
 		u8 raw[4];
-		u32 le_value, be_value;
+		u32 value;
 
 		if (out_len - n < 96)
 			break;
 
-		if (stat_entry_type_auto(e, le_layout) !=
-		    WAVE600_STAT_TYPE_GENERAL_STATS)
+		if (stat_entry_type(e) != WAVE600_STAT_TYPE_GENERAL_STATS)
 			break;
 
-		stat_counter_both(mem, db_size, e, le_offs,
-				  &le_value, &be_value, raw);
+		stat_counter_le(mem, db_size, e, &value, raw);
 		n += scnprintf(out + n, out_len - n,
-			       "general[%02d] %-22s off=%-5u raw=%02x%02x%02x%02x le=%-10u be=%u\n",
-			       i, name, stat_entry_offset(e, le_offs),
-			       raw[0], raw[1], raw[2], raw[3],
-			       le_value, be_value);
+			       "general[%02d] %-22s raw_sub=%02u off=%-5u unit=%u raw=%02x%02x%02x%02x value=%u\n",
+			       i, name, stat_entry_subtype(e),
+			       stat_entry_offset(e), stat_entry_unit(e),
+			       raw[0], raw[1], raw[2], raw[3], value);
 	}
 
 	/* Selected HOSTIF counters (host -> firmware data path) */
@@ -581,22 +567,20 @@ static int wave600_fw_stats_dump(struct wave600_dev *wdev, char *out,
 				&tab[hostif_start + i];
 			const char *name = stat_hostif_names[i];
 			u8 raw[4];
-			u32 le_value, be_value;
+			u32 value;
 
 			if (out_len - n < 96)
 				break;
 
-			if (stat_entry_type_auto(e, le_layout) !=
-			    WAVE600_STAT_TYPE_HOSTIF_COUNTERS)
+			if (stat_entry_type(e) != WAVE600_STAT_TYPE_HOSTIF_COUNTERS)
 				break;
 
-			stat_counter_both(mem, db_size, e, le_offs,
-					  &le_value, &be_value, raw);
+			stat_counter_le(mem, db_size, e, &value, raw);
 			n += scnprintf(out + n, out_len - n,
-				       "hostif[%02d] %-22s off=%-5u raw=%02x%02x%02x%02x le=%-10u be=%u\n",
-				       i, name, stat_entry_offset(e, le_offs),
-				       raw[0], raw[1], raw[2], raw[3],
-				       le_value, be_value);
+				       "hostif[%02d] %-22s raw_sub=%02u off=%-5u unit=%u raw=%02x%02x%02x%02x value=%u\n",
+				       i, name, stat_entry_subtype(e),
+				       stat_entry_offset(e), stat_entry_unit(e),
+				       raw[0], raw[1], raw[2], raw[3], value);
 		}
 	}
 
@@ -607,23 +591,95 @@ static int wave600_fw_stats_dump(struct wave600_dev *wdev, char *out,
 			const struct wave600_stats_entry *e =
 				&tab[baa_start + subtype];
 			u8 raw[4];
-			u32 le_value, be_value;
+			u32 value;
 
 			if (out_len - n < 96)
 				continue;
 
-			if (stat_entry_type_auto(e, le_layout) !=
-			    WAVE600_STAT_TYPE_BAA_COUNTERS)
+			if (stat_entry_type(e) != WAVE600_STAT_TYPE_BAA_COUNTERS)
 				continue;
 
-			stat_counter_both(mem, db_size, e, le_offs,
-					  &le_value, &be_value, raw);
+			stat_counter_le(mem, db_size, e, &value, raw);
 			n += scnprintf(out + n, out_len - n,
-				       "baa[%02d]  %-22s off=%-5u raw=%02x%02x%02x%02x le=%-10u be=%u\n",
+				       "baa[%02d]  %-22s raw_sub=%02u off=%-5u unit=%u raw=%02x%02x%02x%02x value=%u\n",
 				       subtype, stat_baa_named[i].name,
-				       stat_entry_offset(e, le_offs),
-				       raw[0], raw[1], raw[2], raw[3],
-				       le_value, be_value);
+				       stat_entry_subtype(e),
+				       stat_entry_offset(e), stat_entry_unit(e),
+				       raw[0], raw[1], raw[2], raw[3], value);
+		}
+	}
+
+	/*
+	 * LINK_ADAPTATION power fields: the actual TX power the firmware
+	 * uses, per radio (2) x per channel bandwidth (20/40/80/160 = 4).
+	 * Vendor hw_mmb.c _mtlk_hw_mhi_update_hw_stats reads these as
+	 * uint8 values with STAT_PW_PER_DBM=2 units per dBm, block layout
+	 * [radio][cbw], so dBm = byte/2. Subtypes: 6=POWER_DATA,
+	 * 7=POWER_MANAGEMENT, 21=MIN_POWER, 22=MAX_POWER.
+	 */
+	if (la_start >= 0) {
+		static const struct {
+			unsigned int subtype;
+			const char *name;
+		} la_pw_fields[] = {
+			{ W600_LA_POWER_DATA,	 "power_data" },
+			{ W600_LA_POWER_MANAGEMENT, "power_mgmt" },
+			{ W600_LA_MIN_POWER,	 "min_power" },
+			{ W600_LA_MAX_POWER,	 "max_power" },
+		};
+
+		for (i = 0; i < (int)ARRAY_SIZE(la_pw_fields); i++) {
+			const struct wave600_stats_entry *e =
+				&tab[la_start + la_pw_fields[i].subtype];
+			u32 offset, block, unit, cbw, radio;
+			int j;
+
+			if (out_len - n < 96)
+				break;
+
+			if (stat_entry_type(e) != WAVE600_STAT_TYPE_LINK_ADAPTATION)
+				continue;
+			if (!stat_entry_fits(e, db_size)) {
+				n += scnprintf(out + n, out_len - n,
+					       "link_adapt[%02d] %-11s invalid entry off=%u size=%u db=%u\n",
+					       la_pw_fields[i].subtype,
+					       la_pw_fields[i].name,
+					       stat_entry_offset(e),
+					       stat_entry_bytes(e), db_size);
+				continue;
+			}
+
+			offset = stat_entry_offset(e);
+			unit = stat_entry_unit(e);
+			block = stat_entry_bytes(e);
+			n += scnprintf(out + n, out_len - n,
+				       "link_adapt[%02d] %-11s off=%-5u unit=%u dims=%u dim1=%u dim2=%u size=%u bytes:",
+				       la_pw_fields[i].subtype,
+				       la_pw_fields[i].name, offset, unit,
+				       stat_entry_dims(e), stat_entry_dim1(e),
+				       e->dimension2, block);
+			for (j = 0; j < (int)block && offset + j < db_size; j++) {
+				if (out_len - n < 8)
+					break;
+				n += scnprintf(out + n, out_len - n, " %02x",
+					       mem[offset + j]);
+			}
+			n += scnprintf(out + n, out_len - n, "  (dBm:");
+			for (radio = 0; radio < 2; radio++) {
+				for (cbw = 0; cbw < 4; cbw++) {
+					u32 idx = radio * 4 + cbw;
+
+					if (idx >= block || offset + idx >= db_size)
+						continue;
+					if (out_len - n < 8)
+						break;
+					n += scnprintf(out + n, out_len - n, " %d",
+						       (mem[offset + idx] +
+							(W600_STAT_PW_PER_DBM / 2)) /
+						       W600_STAT_PW_PER_DBM);
+				}
+			}
+			n += scnprintf(out + n, out_len - n, ")  [r0:20/40/80/160 r1:20/40/80/160]\n");
 		}
 	}
 
@@ -635,6 +691,7 @@ static int wave600_fw_stats_dump(struct wave600_dev *wdev, char *out,
 	ret = n;
 
 out_free:
+	kfree(runtime_tab);
 	if (temp_mem)
 		dma_free_coherent(wdev->dev, alloc_size, mem, dma);
 unlock:
@@ -655,12 +712,141 @@ static ssize_t fw_stats_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(fw_stats);
 
+/*
+ * Read-only diagnostic dump of the RF TX power state:
+ *  1. the calibration cache (cal_buf) that the firmware filled during
+ *     UM_MAN_CALIBRATE_REQ — shows what TX calibration results FW stored;
+ *  2. the PHY TX TPC registers per band/antenna (vendor HwMemoryMap.h
+ *     HYP_TD_ANTENNA_x_TPC_POUT/TSSI/GAIN) — the actual output power /
+ *     gain the PHY applies. Vendor bases are chip-physical 0xA0xxxxxx;
+ *     BAR0 aliases 0xA0000000, so B0_PHY_TX = 0xBC0000, B1 = 0xFC0000.
+ * Antenna stride 0x4000, register deltas: POUT +0x000, TSSI +0x200, GAIN +0x400.
+ * Each 0x200-byte register table is scanned fully and summarized with the
+ * first four words, the count of non-zero non-mask words and the first
+ * meaningful byte offset.
+ */
+#define W600_B0_PHY_TX_OFF	0x00BC0000
+#define W600_B1_PHY_TX_OFF	0x00FC0000
+
+static int wave600_cal_dump(struct wave600_dev *wdev, char *out, size_t out_len)
+{
+	static const struct {
+		u32 base;
+		const char *band;
+	} bands[] = {
+		{ W600_B0_PHY_TX_OFF, "B0" },
+		{ W600_B1_PHY_TX_OFF, "B1" },
+	};
+	static const struct {
+		u32 delta;
+		const char *name;
+	} tpc_regs[] = {
+		{ 0x000, "TPC_POUT" },
+		{ 0x200, "TPC_TSSI" },
+		{ 0x400, "TPC_GAIN" },
+	};
+	int n = 0;
+	u32 nz = 0, first_nz = wdev->cal_buf_size;
+	int i, bi, ant, ri;
+
+	n += scnprintf(out + n, out_len - n,
+		       "cal_dump: cal_buf=%p size=%zu dma=0x%08x\n",
+		       wdev->cal_buf, wdev->cal_buf_size, (u32)wdev->cal_dma_addr);
+
+	if (wdev->cal_buf && wdev->cal_buf_size) {
+		const u8 *b = wdev->cal_buf;
+
+		for (i = 0; i < (int)wdev->cal_buf_size; i++) {
+			if (b[i]) {
+				nz++;
+				if (first_nz == wdev->cal_buf_size)
+					first_nz = (u32)i;
+			}
+		}
+		n += scnprintf(out + n, out_len - n,
+			       "cal_dump: nonzero bytes=%u / %zu (first at 0x%x)\n",
+			       nz, wdev->cal_buf_size, first_nz);
+		n += scnprintf(out + n, out_len - n, "cal_dump head (128 B):\n");
+		n = stat_hexdump(out, out_len, n, b,
+				 min_t(u32, 128, (u32)wdev->cal_buf_size), 0);
+		if (nz && first_nz + 32 <= wdev->cal_buf_size) {
+			n += scnprintf(out + n, out_len - n,
+				       "cal_dump at first nonzero 0x%x (32 B):\n",
+				       first_nz);
+			n = stat_hexdump(out, out_len, n, b + first_nz, 32,
+					 first_nz);
+		}
+	} else {
+		n += scnprintf(out + n, out_len - n,
+			       "cal_dump: cal_buf not allocated\n");
+	}
+
+	for (bi = 0; bi < (int)ARRAY_SIZE(bands); bi++) {
+		for (ant = 0; ant < 4; ant++) {
+			u32 ant_base = 0x22000 + (u32)ant * 0x4000;
+
+			for (ri = 0; ri < (int)ARRAY_SIZE(tpc_regs); ri++) {
+				u32 addr = bands[bi].base + ant_base + tpc_regs[ri].delta;
+				u32 words[4] = { 0, 0, 0, 0 };
+				u32 meaningful = 0;
+				bool all_ff = true;
+				int first = -1;
+
+				for (i = 0; i < 128; i++) {
+					u32 w = wave600_read32(wdev, addr + i * 4);
+
+					if (w != 0xffffffff)
+						all_ff = false;
+					if (w && w != 0xffffffff) {
+						meaningful++;
+						if (first < 0)
+							first = i * 4;
+					}
+					if (i < 4)
+						words[i] = w;
+				}
+
+				if (out_len - (size_t)n < 144)
+					goto done;
+				n += scnprintf(out + n, out_len - n,
+					       "cal_dump %s ant%u %-9s @bar0+0x%06x: %08x %08x %08x %08x nz=%u first=%d%s\n",
+					       bands[bi].band, ant,
+					       tpc_regs[ri].name, addr,
+					       words[0], words[1], words[2], words[3],
+					       meaningful, first,
+					       all_ff ? " [all ff]" : "");
+			}
+		}
+	}
+done:
+	return n;
+}
+
+static ssize_t cal_dump_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct wave600_dev *wdev = pci_get_drvdata(pdev);
+
+	if (!wdev)
+		return -ENODEV;
+
+	return wave600_cal_dump(wdev, buf, PAGE_SIZE);
+}
+static DEVICE_ATTR_RO(cal_dump);
+
 int wave600_stats_sysfs_create(struct wave600_dev *wdev)
 {
-	return device_create_file(wdev->dev, &dev_attr_fw_stats);
+	int ret;
+
+	ret = device_create_file(wdev->dev, &dev_attr_fw_stats);
+	if (ret)
+		return ret;
+	return device_create_file(wdev->dev, &dev_attr_cal_dump);
 }
 
 void wave600_stats_sysfs_remove(struct wave600_dev *wdev)
 {
 	device_remove_file(wdev->dev, &dev_attr_fw_stats);
+	device_remove_file(wdev->dev, &dev_attr_cal_dump);
 }

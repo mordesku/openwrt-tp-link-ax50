@@ -44,7 +44,7 @@
  * sorted by channel number (vendor _tpc_gen5_list_sort).
  */
 static int wave600_cal_add_tssi(struct wave600_dev *wdev, u8 ant, u8 band,
-				u8 chan, u8 bw, const u8 *raw22)
+				u8 chan, u8 bw, const u8 *raw)
 {
 	struct wave600_cal *cal = &wdev->cal;
 	struct wave600_cal_tssi_entry *entries = cal->entries[ant];
@@ -61,7 +61,7 @@ static int wave600_cal_add_tssi(struct wave600_dev *wdev, u8 ant, u8 band,
 	entries[i].band = band;
 	entries[i].chan = chan;
 	entries[i].bw = bw;
-	memcpy(entries[i].raw, raw22, WAVE600_TPC_FREQ_SIZE);
+	memcpy(entries[i].raw, raw, WAVE600_TPC_FREQ_SIZE);
 	cal->entry_count[ant]++;
 	return 0;
 }
@@ -697,25 +697,50 @@ int wave600_cal_init(struct wave600_dev *wdev)
 		return ret;
 	}
 
-	memset(&cal, 0, sizeof(cal));
-	cal.chan_nums[0] = 1;
-	cal.chan_nums[1] = 6;
-	cal.chan_nums[2] = 11;
-	cal.num_chans = 3;
-	cal.chan_width = 0; /* 20 MHz */
+	{
+		static const u8 ch_20[] = {
+			1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
+		};
+		static const u8 ch_40[] = {
+			1, 2, 3, 4, 5, 6, 7, 8, 9
+		};
 
-	dev_info(wdev->dev, "initiating Radio 0 RF calibration for channels 1, 6, 11 (20 MHz)...\n");
-	ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_CALIBRATE_REQ,
-			      WAVE600_MC_MAN_CALIBRATE_CFM,
-			      &cal, sizeof(cal), &cal, sizeof(cal), 30000);
-	if (ret) {
-		dev_err(wdev->dev, "Radio 0 CALIBRATE_REQ failed: %d\n", ret);
-		wave600_cal_dummy_vap_del(wdev);
-		return ret;
+		/* 20 MHz channels */
+		memset(&cal, 0, sizeof(cal));
+		memcpy(cal.chan_nums, ch_20, sizeof(ch_20));
+		cal.num_chans = sizeof(ch_20);
+		cal.chan_width = 0; /* CW_20 */
+		dev_info(wdev->dev, "initiating Radio 0 RF calibration for 20 MHz channels (count %zu)...\n",
+			 sizeof(ch_20));
+		ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_CALIBRATE_REQ,
+				      WAVE600_MC_MAN_CALIBRATE_CFM,
+				      &cal, sizeof(cal), &cal, sizeof(cal), 30000);
+		if (ret) {
+			dev_err(wdev->dev, "Radio 0 20 MHz CALIBRATE_REQ failed: %d\n", ret);
+			wave600_cal_dummy_vap_del(wdev);
+			return ret;
+		}
+		dev_info(wdev->dev, "Radio 0 20 MHz RF calibration verified (status: 0x%08x)\n",
+			 le32_to_cpu(cal.status));
+
+		/* 40 MHz channels */
+		memset(&cal, 0, sizeof(cal));
+		memcpy(cal.chan_nums, ch_40, sizeof(ch_40));
+		cal.num_chans = sizeof(ch_40);
+		cal.chan_width = 1; /* CW_40 */
+		dev_info(wdev->dev, "initiating Radio 0 RF calibration for 40 MHz channels (count %zu)...\n",
+			 sizeof(ch_40));
+		ret = wave600_ipc_cmd(wdev, WAVE600_UM_MAN_CALIBRATE_REQ,
+				      WAVE600_MC_MAN_CALIBRATE_CFM,
+				      &cal, sizeof(cal), &cal, sizeof(cal), 30000);
+		if (ret) {
+			dev_err(wdev->dev, "Radio 0 40 MHz CALIBRATE_REQ failed: %d\n", ret);
+			wave600_cal_dummy_vap_del(wdev);
+			return ret;
+		}
+		dev_info(wdev->dev, "Radio 0 40 MHz RF calibration verified (status: 0x%08x)\n",
+			 le32_to_cpu(cal.status));
 	}
-
-	dev_info(wdev->dev, "Radio 0 RF calibration verified (status: 0x%08x)\n",
-		 le32_to_cpu(cal.status));
 
 	ret = wave600_cal_dummy_vap_del(wdev);
 	if (ret) {

@@ -15,6 +15,7 @@
 #include "wave600_chi.h"
 #include "wave600_ipc.h"
 #include "wave600_dma.h"
+#include "wave600_recovery.h"
 
 /*
  * DBG CFM fallback poll (verified live 2026-10-31):
@@ -315,6 +316,12 @@ static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 						le32_to_cpu(ev->group_id),
 						le32_to_cpu(ev->origin_id),
 						le32_to_cpu(ev->fw_interface));
+
+					if (le32_to_cpu(ev->event_id) == 4 ||
+					    le32_to_cpu(ev->status_reg) == 0x01065404) {
+						dev_warn(wdev->dev, "fatal firmware assertion detected - triggering hardware recovery\n");
+						wave600_recovery_trigger(wdev, "FW MAC_EVENT_IND APP_FATAL");
+					}
 				}
 			} else if (le16_to_cpu(ind_hdr->msg_id) == WAVE600_MC_MAN_CLASS3_ERROR_IND) {
 				size_t plen = bounce_len - sizeof(*ind_hdr);
@@ -734,10 +741,18 @@ int wave600_ipc_cmd_radio(struct wave600_dev *wdev, u8 radio_idx, u16 req_id, u1
 		u32 irq_vec = wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC);
 		u32 wdt_stat = wave600_read32(wdev, WAVE600_SOC_PCIE_AMBA_ORDR_WDT);
 
-		dev_err(wdev->dev, "IPC cmd 0x%04x timed out after %lu ms (slot %u, IRQ_STATUS=0x%08x, INTR_VEC=0x%08x, AMBA_ORDR_WDT_INT=0x%08x)\n",
-			req_id, timeout_ms, slot, irq_stat, irq_vec, wdt_stat);
+		ipc->consecutive_timeouts++;
+		dev_err(wdev->dev, "IPC cmd 0x%04x timed out after %lu ms (consecutive %u, slot %u, IRQ_STATUS=0x%08x, INTR_VEC=0x%08x, AMBA_ORDR_WDT_INT=0x%08x)\n",
+			req_id, timeout_ms, ipc->consecutive_timeouts, slot, irq_stat, irq_vec, wdt_stat);
 		ret = -ETIMEDOUT;
+
+		/* Only trigger recovery after 2 consecutive timeouts (user directive) */
+		if (ipc->consecutive_timeouts >= 2) {
+			dev_warn(wdev->dev, "2 consecutive IPC timeouts reached - triggering hardware recovery\n");
+			wave600_recovery_trigger(wdev, "2 consecutive IPC timeouts");
+		}
 	} else {
+		ipc->consecutive_timeouts = 0;
 		ret = cmd->status;
 	}
 
@@ -1151,6 +1166,19 @@ int wave600_ipc_fw_logger_init(struct wave600_dev *wdev)
 	dev_info(wdev->dev,
 		 "CHI LoggerExt: desc_loc=0x%08x num_descs=%u, LM bufs=%u x %u B, UM bufs=%u x %u B\n",
 		 desc_loc, num_descs, lm_count, lm_size, um_count, um_size);
+
+	if (ipc->fw_log_bufs) {
+		/* Already allocated in coherent DMA: re-post descriptor addresses to SHRAM */
+		for (i = 0; i < ipc->fw_log_bufs_num; i++) {
+			wave600_write32(wdev, WAVE600_SHARED_RAM_BASE + desc_loc +
+					(i * sizeof(u32)),
+					(u32)ipc->fw_log_bufs[i].dma);
+		}
+		mmiowb();
+		dev_info(wdev->dev, "FW logger buffers re-posted to SHRAM after recovery: %u\n",
+			 ipc->fw_log_bufs_num);
+		return 0;
+	}
 
 	if (lm_count + um_count && lm_count + um_count != num_descs) {
 		dev_err(wdev->dev,

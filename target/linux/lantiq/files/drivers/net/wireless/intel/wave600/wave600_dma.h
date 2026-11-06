@@ -139,6 +139,8 @@ struct wave600_dma {
 };
 
 int wave600_dma_post_rx_pool(struct wave600_dev *wdev);
+void wave600_dma_repost_rx_pool(struct wave600_dev *wdev);
+void wave600_dma_reset_rings(struct wave600_dev *wdev);
 int wave600_dma_init(struct wave600_dev *wdev);
 int wave600_dma_data_path_start(struct wave600_dev *wdev);
 void wave600_dma_attach(struct wave600_dev *wdev);
