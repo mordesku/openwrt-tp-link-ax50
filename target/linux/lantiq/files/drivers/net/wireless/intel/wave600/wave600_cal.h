@@ -27,9 +27,10 @@ struct wave600_antenna_params {
  * One TPC_FREQ entry taken from the calibration file gen6 TX TSSI section.
  * Kept byte-exact (little-endian) exactly as stored in the file; the
  * firmware reads it in MAC (little) endian, the mailbox writer preserves
- * the byte order. WAVE600_TPC_FREQ_SIZE = sizeof(TPC_FREQ_3_REGION) = 22.
+ * the byte order. In ARC firmware, tpcAntParams_t contains an array of
+ * union _TPC_FREQ, where WAVE600_TPC_FREQ_SIZE = sizeof(TPC_FREQ) = 24.
  */
-#define WAVE600_TPC_FREQ_SIZE		22
+#define WAVE600_TPC_FREQ_SIZE		24
 #define WAVE600_CAL_MAX_TSSI_ENTRIES	64
 #define WAVE600_CAL_MAX_ANT		4
 
@@ -85,6 +86,8 @@ struct wave600_psdb {
 	u32 ntab;
 	struct wave600_antenna_params ant[2];
 	u32 regd_off;		/* REGD table byte offset in PSD.bin, 0 = none */
+	s8 cca_th[2][5];
+	bool cca_valid[2];
 };
 
 /*

@@ -59,9 +59,13 @@ define KernelPackage/wave600-wifi
   SUBMENU:=$(WIRELESS_MENU)
   TITLE:=Intel/MaxLinear Wave600 (WAV654) Wi-Fi 6 driver
   DEPENDS:=@TARGET_lantiq_xrx500
-  KCONFIG:=CONFIG_WAVE600_WIFI
-  FILES:=$(LINUX_DIR)/drivers/net/wireless/intel/wave600/wave600_wifi.ko
-  AUTOLOAD:=$(call AutoLoad,60,wave600_wifi)
+  KCONFIG:= \
+    CONFIG_WAVE600_WIFI \
+    CONFIG_CFG80211
+  FILES:= \
+    $(LINUX_DIR)/net/wireless/cfg80211.ko \
+    $(LINUX_DIR)/drivers/net/wireless/intel/wave600/wave600_wifi.ko
+  AUTOLOAD:=$(call AutoLoad,60,cfg80211 wave600_wifi)
 endef
 
 define KernelPackage/wave600-wifi/description

@@ -23,12 +23,16 @@ preinit_set_mac_address() {
 		if [ -n "$label_mac" ]; then
 			lan_mac="$label_mac"
 			wan_mac=$(macaddr_add "$label_mac" 1)
+			wlan0_mac=$(macaddr_add "$label_mac" 2)
+			wlan1_mac=$(macaddr_add "$label_mac" 3)
 
 			ip link set dev eth0 address "$wan_mac" 2>/dev/null
 			ip link set dev eth1 address "$lan_mac" 2>/dev/null
 			ip link set dev eth2 address "$lan_mac" 2>/dev/null
 			ip link set dev eth3 address "$lan_mac" 2>/dev/null
 			ip link set dev eth4 address "$lan_mac" 2>/dev/null
+			[ -d /sys/class/net/wlan0 ] && ip link set dev wlan0 address "$wlan0_mac" 2>/dev/null
+			[ -d /sys/class/net/wlan1 ] && ip link set dev wlan1 address "$wlan1_mac" 2>/dev/null
 		fi
 		;;
 	esac

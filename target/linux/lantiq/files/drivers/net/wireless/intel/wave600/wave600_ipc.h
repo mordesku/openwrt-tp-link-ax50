@@ -107,6 +107,9 @@ struct wave600_umi_logger_set_severity {
 #define WAVE600_MC_MAN_SET_TPC_CONFIG_CFM  WAVE600_UMI_MSG_MAN_CFM(0x4F) /* 0x144F */
 #define WAVE600_UM_MAN_SET_TPC_ANT_PARAMS_REQ WAVE600_UMI_MSG_MAN_REQ(0x4E) /* 0x044E */
 #define WAVE600_MC_MAN_SET_TPC_ANT_PARAMS_CFM WAVE600_UMI_MSG_MAN_CFM(0x4E) /* 0x144E */
+/* UM_MAN_SET_POWER_LIMIT (0x045F): UMI_TX_POWER_LIMIT get/set powerLimitOffset */
+#define WAVE600_UM_MAN_SET_POWER_LIMIT_REQ   WAVE600_UMI_MSG_MAN_REQ(0x5F) /* 0x045F */
+#define WAVE600_MC_MAN_SET_POWER_LIMIT_CFM   WAVE600_UMI_MSG_MAN_CFM(0x5F) /* 0x145F */
 #define WAVE600_UM_MAN_ENABLE_RADIO_REQ    WAVE600_UMI_MSG_MAN_REQ(0x5C) /* 0x045C */
 #define WAVE600_MC_MAN_ENABLE_RADIO_CFM    WAVE600_UMI_MSG_MAN_CFM(0x5C) /* 0x145C */
 #define WAVE600_UM_MAN_SET_BEACON_INTERVAL_REQ WAVE600_UMI_MSG_MAN_REQ(0x76) /* 0x0476 */
@@ -133,6 +136,20 @@ struct wave600_umi_logger_set_severity {
 #define WAVE600_MC_MAN_SET_KEY_CFM            WAVE600_UMI_MSG_MAN_CFM(0x05) /* 0x1405 */
 #define WAVE600_UM_MAN_SET_BEACON_TEMPLATE_REQ  WAVE600_UMI_MSG_MAN_REQ(0x3D) /* 0x043D */
 #define WAVE600_MC_MAN_SET_BEACON_TEMPLATE_CFM  WAVE600_UMI_MSG_MAN_CFM(0x3D) /* 0x143D */
+#define WAVE600_UM_MAN_SET_REG_DOMAIN_CONFIG_REQ WAVE600_UMI_MSG_MAN_REQ(0x8B) /* 0x048B */
+#define WAVE600_MC_MAN_SET_REG_DOMAIN_CONFIG_CFM WAVE600_UMI_MSG_MAN_CFM(0x8B) /* 0x148B */
+
+/* Vendor recovery/default radio configuration messages */
+#define WAVE600_UM_MAN_MU_OPERATION_CONFIG_REQ  WAVE600_UMI_MSG_MAN_REQ(0x67) /* 0x0467 */
+#define WAVE600_MC_MAN_MU_OPERATION_CONFIG_CFM  WAVE600_UMI_MSG_MAN_CFM(0x67) /* 0x1467 */
+#define WAVE600_UM_MAN_CCA_TH_REQ               WAVE600_UMI_MSG_MAN_REQ(0x68) /* 0x0468 */
+#define WAVE600_MC_MAN_CCA_TH_CFM               WAVE600_UMI_MSG_MAN_CFM(0x68) /* 0x1468 */
+#define WAVE600_UM_MAN_BF_MODE_CONFIG_REQ       WAVE600_UMI_MSG_MAN_REQ(0x6C) /* 0x046C */
+#define WAVE600_MC_MAN_BF_MODE_CONFIG_CFM       WAVE600_UMI_MSG_MAN_CFM(0x6C) /* 0x146C */
+#define WAVE600_UM_MAN_SET_TXOP_CONFIG_REQ      WAVE600_UMI_MSG_MAN_REQ(0x75) /* 0x0475 */
+#define WAVE600_MC_MAN_SET_TXOP_CONFIG_CFM      WAVE600_UMI_MSG_MAN_CFM(0x75) /* 0x1475 */
+#define WAVE600_UM_MAN_HE_MU_OPERATION_CONFIG_REQ WAVE600_UMI_MSG_MAN_REQ(0x7A) /* 0x047A */
+#define WAVE600_MC_MAN_HE_MU_OPERATION_CONFIG_CFM WAVE600_UMI_MSG_MAN_CFM(0x7A) /* 0x147A */
 
 /* Firmware-initiated events (UMI_MSG_MAN_IND(type, dir=IND, num)) */
 #define WAVE600_MC_MAN_CLASS3_ERROR_IND      WAVE600_UMI_MSG(WAVE600_MSG_IND, WAVE600_MSG_TYPE_MAN_IND, 0x04) /* 0x3304 */
@@ -204,6 +221,66 @@ struct wave600_umi_set_wmm_params {
 	u8 vap_id;
 	u8 status;
 	struct wave600_umi_ac_wmm_params ac[4];
+} __packed;
+
+/* UMI_TX_POWER_LIMIT (vendor mhi_umi.h:1652, message 0x045F) */
+#define W600_API_SET_OPERATION	0
+#define W600_API_GET_OPERATION	1
+struct wave600_umi_tx_power_limit {
+	u8 get_set_operation;	/* API_GET_OPERATION=1 / API_SET_OPERATION=0 */
+	u8 power_limit_offset;
+	u8 reserved[2];
+} __packed;
+
+/* UMI_CCA_TH_t (vendor mhi_umi.h:3219, message 0x0468) */
+#define WAVE600_CCA_TH_PARAMS_LEN 5
+struct wave600_umi_cca_th {
+	s8 primary_ch_cca;
+	s8 secondary_ch_cca;
+	s8 mid_pkt_primary_cca;
+	s8 mid_pkt_secondary_20_cca;
+	s8 mid_pkt_secondary_40_cca;
+	s8 reserved[3];
+} __packed;
+
+/* UMI_MU_OPERATION_CONFIG / UMI_HE_MU_OPERATION_CONFIG (vendor mhi_umi.h:2534) */
+struct wave600_umi_mu_operation_config {
+	u8 get_set_operation;
+	u8 enable_mu_operation;
+	u8 reserved[2];
+} __packed;
+
+struct wave600_umi_he_mu_operation_config {
+	u8 enable_he_mu_operation;
+	u8 get_set_operation;
+	u8 reserved[2];
+} __packed;
+
+/* UMI_BF_MODE_CONFIG (vendor mhi_umi.h:2580) */
+#define WAVE600_BF_MODE_EXPLICIT	0
+#define WAVE600_BF_MODE_IMPLICIT	1
+#define WAVE600_BF_MODE_STBC_1X2	2
+#define WAVE600_BF_MODE_STBC_2X4	3
+#define WAVE600_BF_MODE_NON_BF		4
+#define WAVE600_BF_MODE_AUTO		0xFF
+
+struct wave600_umi_bf_mode_config {
+	u8 bf_mode;
+	u8 reserved[3];
+} __packed;
+
+/* UMI_SET_TXOP_CONFIG_t (vendor mhi_umi.h:3311) */
+#define WAVE600_TXOP_MODE_DISABLED	0
+#define WAVE600_TXOP_MODE_FORCED	1
+#define WAVE600_TXOP_MODE_DYNAMIC	2
+#define WAVE600_TXOP_MODE_INVALID	0xFF
+#define WAVE600_GEN6_ALL_STA_SID	0x1FF
+
+struct wave600_umi_txop_config {
+	__le32 sta_id;
+	u8 mode;
+	u8 get_set_operation;
+	u8 reserved[2];
 } __packed;
 
 /* Vendor UMI_STA_ADD (0x043B) */
@@ -491,6 +568,57 @@ struct wave600_umi_calibrate_params {
 } __packed;
 
 /*
+ * Regulatory Domain Configuration (UM_MAN_SET_REG_DOMAIN_CONFIG_REQ)
+ * Vendor mhi_umi.h: UMI_REG_DOMAIN_CONFIG
+ */
+#define WAVE600_REG_DOMAIN_FCC		0
+#define WAVE600_REG_DOMAIN_ETSI		1
+#define WAVE600_REG_DOMAIN_JAPAN	2
+#define WAVE600_REG_DOMAIN_KOREA	3
+#define WAVE600_REG_DOMAIN_CHINA	4
+#define WAVE600_REG_DOMAIN_DEFAULT	0xFF
+
+#define WAVE600_REGD_CODE_UNKNOWN	0x00
+#define WAVE600_REGD_CODE_FCC		0x10
+#define WAVE600_REGD_CODE_DOC		0x20
+#define WAVE600_REGD_CODE_ETSI		0x30
+#define WAVE600_REGD_CODE_SPAIN		0x31
+#define WAVE600_REGD_CODE_FRANCE	0x32
+#define WAVE600_REGD_CODE_UAE		0x33
+#define WAVE600_REGD_CODE_GERMANY	0x34
+#define WAVE600_REGD_CODE_MKK		0x40
+#define WAVE600_REGD_CODE_ISRAEL	0x41
+#define WAVE600_REGD_CODE_SINGAPORE	0x42
+#define WAVE600_REGD_CODE_AUSTRALIA	0x44
+#define WAVE600_REGD_CODE_BRAZIL	0x45
+#define WAVE600_REGD_CODE_CHINA		0x46
+#define WAVE600_REGD_CODE_KOREA		0x47
+#define WAVE600_REGD_CODE_APAC		0x50
+#define WAVE600_REGD_CODE_JAPAN		0x51
+
+struct wave600_umi_reg_domain_config {
+	u8 reg_domain_config;
+	u8 get_set_operation; /* 0 = SET */
+	u8 reserved[2];
+} __packed;
+
+/*
+ * Beacon Template Configuration (UM_BSS_SET_BEACON_REQ)
+ */
+struct wave600_umi_beacon_set {
+	u32 host_address;	/* DMA address of the template buffer */
+	u16 part1_len;
+	u16 part2_len;
+	u16 part3_len;
+	u16 part4_len;
+	u16 part5_len;
+	u8 vap_index;
+	u8 status;
+	u8 add_bss_load_ie;
+	u8 reserved;
+} __packed;
+
+/*
  * Mailbox IPC Pending Command Tracker
  */
 struct wave600_ipc_cmd {
@@ -575,6 +703,7 @@ struct wave600_ipc {
 	u32 empty_runs;
 	bool storm_latched;
 	u32 irq_status;		/* status snapshot for the tasklet */
+	u32 consecutive_timeouts;
 
 	bool irq_enabled;
 };

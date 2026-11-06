@@ -21,6 +21,25 @@
 
 #define DRV_NAME "wave600_wifi"
 
+enum wave600_state {
+	W600_STATE_IDLE = 0,
+	W600_STATE_RUNNING,
+	W600_STATE_FAULT,
+	W600_STATE_RECOVERY,
+};
+
+#define WAVE600_MAX_STATIONS 32
+
+struct wave600_station {
+	bool valid;
+	u8 mac[ETH_ALEN];
+	u16 sid;
+	u32 connect_time;
+	unsigned long last_rx;
+	s8 signal;
+	bool is_authorized;
+};
+
 /*
  * FW statistics context. The vendor fetches the counter layout descriptor
  * table exactly once during card finalize (hw_mmb.c hw_mmb_card_fin step
@@ -39,6 +58,7 @@ struct wave600_stats {
 	int gen_start;
 	int baa_start;
 	int hostif_start;
+	int la_start;			/* LINK_ADAPTATION_STATS block (TX power) */
 };
 
 struct wave600_efuse_afe {
@@ -68,7 +88,9 @@ struct wave600_radio {
 	bool ap_started;
 	bool radio_enabled;
 	u16 ap_channel;
+	u8 ap_width;
 	u32 ap_freq;
+	int tx_power_dbm;
 	u64 mgmt_tx_cookie;
 
 	/* Station tracking */
@@ -76,11 +98,23 @@ struct wave600_radio {
 	bool is_secure;
 	u8 sta_mac[ETH_ALEN];
 	u16 sta_sid;
+	u32 sta_connect_time;
+	unsigned long sta_last_rx;
+	s8 sta_signal;
+	struct wave600_station stations[WAVE600_MAX_STATIONS];
+	u16 num_stations;
 
 	/* Persistent AP beacon template buffer (DMA-mapped for ARC MAC beaconing) */
 	void *beacon_buf;
 	dma_addr_t beacon_dma;
 	size_t beacon_len;
+
+	/* AP parameters preserved across recovery */
+	u8 ap_low_chan;
+	u8 ap_primary_idx;
+	u16 beacon_interval;
+	u16 dtim_period;
+	struct wave600_umi_beacon_set beacon_set_params;
 };
 
 struct wave600_dev {
@@ -88,6 +122,11 @@ struct wave600_dev {
 	struct device *dev;
 	void __iomem *bar0;
 	resource_size_t bar0_len;
+
+	/* Device state and recovery */
+	enum wave600_state state;
+	struct work_struct recovery_work;
+	atomic_t in_recovery;
 
 	u32 chip_id;
 	u32 chip_rev;
@@ -122,9 +161,17 @@ struct wave600_dev {
 	/* FW statistics (vendor HW_MHI_STATISTIC init step) */
 	struct wave600_stats stats;
 
+	/* Regulatory domain configured from userspace via cfg80211 */
+	char country[3];
+	u8 regd_code;
+	u8 reg_domain_region;
+
 	/* Delayed second FW state snapshot (diagnostic, 10 s after probe) */
 	struct delayed_work diag_work;
 };
+
+int wave600_set_country(struct wave600_dev *wdev, const char *alpha2);
+int wave600_send_reg_domain_config(struct wave600_dev *wdev, u8 region);
 
 static inline struct wave600_radio *wave600_wiphy_to_radio(struct wiphy *wiphy)
 {
@@ -138,10 +185,12 @@ static inline struct wave600_radio *wave600_ndev_to_radio(struct net_device *nde
 	return wave600_wiphy_to_radio(ndev->ieee80211_ptr->wiphy);
 }
 
+int wave600_radio_find_sid(struct wave600_radio *radio, const u8 *mac);
 int wave600_cal_init(struct wave600_dev *wdev);
 void wave600_cal_cleanup(struct wave600_dev *wdev);
 int wave600_cfg80211_init(struct wave600_dev *wdev);
 void wave600_cfg80211_cleanup(struct wave600_dev *wdev);
+int wave600_cfg80211_restore_ap(struct wave600_radio *radio);
 void wave600_diag_handlers_probe(struct wave600_dev *wdev);
 int wave600_stats_init(struct wave600_dev *wdev);
 void wave600_stats_cleanup(struct wave600_dev *wdev);

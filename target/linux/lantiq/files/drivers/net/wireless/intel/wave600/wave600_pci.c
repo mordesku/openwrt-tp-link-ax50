@@ -10,7 +10,7 @@
 #include "wave600_fw.h"
 #include "wave600_dma.h"
 #include "wave600_cfg80211.h"
-#include "wave600_cfg80211.h"
+#include "wave600_recovery.h"
 
 static const struct pci_device_id wave600_pci_ids[] = {
 	{ PCI_DEVICE(0x8086, 0x09d0) }, /* Intel WAV654 802.11ax */
@@ -75,6 +75,7 @@ static int wave600_pci_probe(struct pci_dev *pdev, const struct pci_device_id *i
 	wdev->bar0_len = pci_resource_len(pdev, 0);
 
 	pci_set_drvdata(pdev, wdev);
+	wave600_recovery_init(wdev);
 
 	/* Read chip system information (bits 0..15: Chip ID, bits 16..31: BootMode & CPU ID) */
 	sys_info = wave600_read32(wdev, WAVE600_SYS_IF_SYSTEM_INFO);
@@ -242,6 +243,10 @@ static int wave600_pci_probe(struct pci_dev *pdev, const struct pci_device_id *i
 	if (ret)
 		dev_err(&pdev->dev, "failed to create fw_stats sysfs attribute: %d\n", ret);
 
+	ret = wave600_recovery_sysfs_create(wdev);
+	if (ret)
+		dev_err(&pdev->dev, "failed to create recovery_trigger sysfs attribute: %d\n", ret);
+
 	/*
 	 * AP stack: the cfg80211 layer creates the AP netdev (it owns the
 	 * netdev lifecycle), then the DMA layer attaches NAPI and the
@@ -293,6 +298,7 @@ err_rf:
 	wave600_dma_stop_netdev(wdev);
 	wave600_cfg80211_cleanup(wdev);
 err_dma:
+	wave600_recovery_sysfs_remove(wdev);
 	wave600_stats_cleanup(wdev);
 	wave600_dma_cleanup(wdev);
 	wave600_ipc_fw_logger_cleanup(wdev);
@@ -301,6 +307,7 @@ err_dma:
 	wave600_hw_reset(wdev);
 	return ret;
 err_ipc:
+	wave600_recovery_cleanup(wdev);
 	wave600_ipc_cleanup(wdev);
 	wave600_hw_reset(wdev);
 	return ret;
@@ -317,6 +324,8 @@ static void wave600_pci_remove(struct pci_dev *pdev)
 			return;
 		}
 		dev_info(&pdev->dev, "removing WAV654 driver\n");
+		wave600_recovery_sysfs_remove(wdev);
+		wave600_recovery_cleanup(wdev);
 		cancel_delayed_work_sync(&wdev->diag_work);
 		wave600_stats_sysfs_remove(wdev);
 		wave600_stats_cleanup(wdev);

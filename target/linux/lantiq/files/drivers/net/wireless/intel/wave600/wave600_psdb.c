@@ -174,8 +174,8 @@ int wave600_psdb_parse(struct wave600_dev *wdev)
 	size_t size, words;
 	u32 fda = 0, nrows, ncols, nfld = 0;
 	u32 card_tx_mask = 0;
-	const u8 *cdb_tab = NULL, *ampc_tab = NULL;
-	size_t cdb_tab_size = 0, ampc_tab_size = 0;
+	const u8 *cdb_tab = NULL, *ampc_tab = NULL, *cca_tab = NULL;
+	size_t cdb_tab_size = 0, ampc_tab_size = 0, cca_tab_size = 0;
 	u32 i, k;
 	int ret;
 
@@ -275,8 +275,16 @@ int wave600_psdb_parse(struct wave600_dev *wdev)
 				psdb->regd_off = off;
 				continue; /* host-only table */
 			}
-			if (id == WAVE600_PSDB_FIELD_CCA_TH_CFG)
+			if (id == WAVE600_PSDB_FIELD_CCA_TH_CFG) {
+				if (off + 52 <= size &&
+				    psdb_rd32(buf + off) == WAVE600_PSDB_TABLE_MARKER &&
+				    psdb_rd32(buf + off + 4) == WAVE600_CCA_TH_PARAMS_LEN &&
+				    psdb_rd32(buf + off + 8) == 2) {
+					cca_tab = buf + off;
+					cca_tab_size = size - off;
+				}
 				continue; /* host-only table */
+			}
 			if (psdb->ntab >= WAVE600_PSDB_MAX_TABLES) {
 				dev_err(wdev->dev, "PSDB: too many tables\n");
 				ret = -EINVAL;
@@ -350,6 +358,22 @@ int wave600_psdb_parse(struct wave600_dev *wdev)
 		dev_info(wdev->dev, "PSDB: radio segment %u (cdb_cfg=%u): tx=0x%02x rx=0x%02x sel=0x%02x\n",
 			 k, cdb_cfg, seg->tx_ant_mask, seg->rx_ant_mask,
 			 seg->tx_ant_sel_mask);
+
+		if (lower_chan && cca_tab && 12 + 40 <= cca_tab_size) {
+			int col = (lower_chan >= 36) ? 1 : 0;
+
+			for (i = 0; i < WAVE600_CCA_TH_PARAMS_LEN; i++)
+				psdb->cca_th[k][i] =
+					(s8)psdb_rd32(cca_tab + 12 + i * 8 + col * 4);
+			psdb->cca_valid[k] = true;
+
+			dev_info(wdev->dev,
+				 "PSDB: radio segment %u CCA_TH: %d %d %d %d %d\n",
+				 k,
+				 psdb->cca_th[k][0], psdb->cca_th[k][1],
+				 psdb->cca_th[k][2], psdb->cca_th[k][3],
+				 psdb->cca_th[k][4]);
+		}
 	}
 
 	psdb->fw = fw;
@@ -570,6 +594,13 @@ int wave600_psdb_regd_limits(struct wave600_dev *wdev, u8 regd_code, u8 chan_num
 	for (i = 0; i < 13; i++) {
 		if (pw[i])
 			pw[i] += factor;
+	}
+
+	/* Fallback: if 40/80/160 MHz entries are 0 (frequency mismatch with center channel),
+	 * fall back to 20 MHz OFDM limit */
+	for (i = 1; i < 4; i++) {
+		if (pw[1 + i] == 0)
+			pw[1 + i] = pw[1];
 	}
 
 	/* If the MU/BF values are not configured, use the OFDM values */

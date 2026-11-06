@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 config WAVE600_WIFI
 	tristate "Intel/MaxLinear Wave600 / WAV654 Wi-Fi 6 support"
-	depends on PCI
+	depends on PCI && CFG80211
 	help
 	  Clean modern driver for Intel / MaxLinear Wave600 (WAV654) 802.11ax
 	  wireless chipsets found on TP-Link Archer AX50 v1 and related boards.
