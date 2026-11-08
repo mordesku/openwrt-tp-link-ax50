@@ -1423,7 +1423,7 @@ static int wave600_send_tpc_config(struct wave600_radio *radio, u8 chan, bool is
 
 	memset(&p, 0, sizeof(p));
 	p.cal_type = W600_TPC_CAL_TYPE_LOGARITHMIC; /* 1 */
-	p.tpc_loop_type = 1; /* 1 = open loop (Gen6 WAV654 calibrated look-up table) */
+	p.tpc_loop_type = 0; /* 0 = closed loop (TPC_CLOSED_LOOP, vendor Gen6 default in radio_pdb_def.h:219) */
 	p.fixed_gain = W600_TPC_NO_FIXED_GAIN; /* 0xFF */
 	p.get_set_operation = 0; /* API_SET_OPERATION */
 
@@ -1482,7 +1482,7 @@ static int wave600_send_tpc_config(struct wave600_radio *radio, u8 chan, bool is
 		return ret;
 	}
 
-	dev_info(wdev->dev, "Radio %u TPC configured v3-regd-%s (code 0x%02x, loop open): 11b=%u, OFDM 20/40/80/160=[%u %u %u %u] (1/8 dBm, tx_pwr=%d dBm)\n",
+	dev_info(wdev->dev, "Radio %u TPC configured v3-regd-%s (code 0x%02x, loop closed): 11b=%u, OFDM 20/40/80/160=[%u %u %u %u] (1/8 dBm, tx_pwr=%d dBm)\n",
 		 radio->radio_idx, wdev->country[0] ? wdev->country : "PL", regd,
 		 pw[0], pw[1], pw[2], pw[3], pw[4],
 		 radio->tx_power_dbm ? radio->tx_power_dbm : (is_5g ? 23 : 20));
@@ -1717,9 +1717,9 @@ static int wave600_send_beacon(struct wave600_radio *radio,
 	p.part5_len = cpu_to_le16((u16)part5_len);
 	p.vap_index = radio->vap_id;
 
-	dev_info(wdev->dev, "Radio %u beacon template: total %zu = %u/%u/%u/%u/%u (dma %pad)\n",
-		 radio->radio_idx, total, part1_len, part2_len, part3_len, part4_len, part5_len,
-		 &dma);
+	dev_dbg(wdev->dev, "Radio %u beacon template: total %zu = %u/%u/%u/%u/%u (dma %pad)\n",
+		radio->radio_idx, total, part1_len, part2_len, part3_len, part4_len, part5_len,
+		&dma);
 
 	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
 				    WAVE600_UM_MAN_SET_BEACON_TEMPLATE_REQ,
@@ -1917,12 +1917,20 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 
 	/*
 	 * Vendor _core_on_rcvry_configure defaults for Gen6. These are sent
-	 * before SET_CHAN, with CCA/power-limit sent after the channel is set.
+	 * before SET_CHAN.
 	 */
 	wave600_send_he_mu_operation(radio, 1);
 	wave600_send_bf_mode(radio, WAVE600_BF_MODE_EXPLICIT);
 	wave600_send_txop_mode(radio, WAVE600_GEN6_ALL_STA_SID,
 			       WAVE600_TXOP_MODE_INVALID);
+
+	/*
+	 * Vendor core_config.c:866-869: TPC config + TPC ANT params MUST be
+	 * sent BEFORE SET_CHAN so the firmware initializes RF synthesizer
+	 * and Front-End Module (FEM PA/LNA) bias to calibrated output levels.
+	 */
+	wave600_send_tpc_config(radio, chan, is_5g);
+	wave600_send_tpc_ant_params(radio, chan, is_5g);
 
 	ret = wave600_send_set_chan(radio, low_chan, width, primary_idx,
 				    W600_SWITCH_TYPE_NORMAL, 0);
@@ -1930,12 +1938,6 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 		dev_err(wdev->dev, "Radio %u start_ap: SET_CHAN failed: %d\n", radio->radio_idx, ret);
 		return ret;
 	}
-
-	wave600_send_power_limit_offset_radio(radio, 0);
-
-	/* Vendor mtlk_reload_tpc_wrapper: TPC config + TPC ANT params */
-	wave600_send_tpc_config(radio, chan, is_5g);
-	wave600_send_tpc_ant_params(radio, chan, is_5g);
 
 	ret = wave600_send_beacon(radio, &settings->beacon);
 	if (ret) {
@@ -2014,14 +2016,18 @@ int wave600_cfg80211_restore_ap(struct wave600_radio *radio)
 	wave600_send_txop_mode(radio, WAVE600_GEN6_ALL_STA_SID,
 			       WAVE600_TXOP_MODE_INVALID);
 
+	/*
+	 * Vendor core_config.c:866-869: TPC config + TPC ANT params MUST be
+	 * sent BEFORE SET_CHAN so the firmware initializes RF synthesizer
+	 * and Front-End Module (FEM PA/LNA) bias to calibrated output levels.
+	 */
+	wave600_send_tpc_config(radio, (u8)radio->ap_channel, is_5g);
+	wave600_send_tpc_ant_params(radio, (u8)radio->ap_channel, is_5g);
+
 	ret = wave600_send_set_chan(radio, radio->ap_low_chan, radio->ap_width,
 				    radio->ap_primary_idx, W600_SWITCH_TYPE_NORMAL, 0);
 	if (ret)
 		return ret;
-
-	wave600_send_power_limit_offset_radio(radio, 0);
-	wave600_send_tpc_config(radio, (u8)radio->ap_channel, is_5g);
-	wave600_send_tpc_ant_params(radio, (u8)radio->ap_channel, is_5g);
 
 	if (radio->beacon_dma && radio->beacon_set_params.part1_len) {
 		ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
@@ -2337,8 +2343,8 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 	if (!radio->ap_started)
 		return -ENETDOWN;
 
-	dev_info(wdev->dev, "Radio %u cfg80211: add station %pM (aid %u)\n",
-		 radio->radio_idx, mac, params ? params->aid : 0);
+	dev_dbg(wdev->dev, "Radio %u cfg80211: add station %pM (aid %u)\n",
+		radio->radio_idx, mac, params ? params->aid : 0);
 
 	/*
 	 * Step 1: Request a Station ID (SID) from FullMAC firmware.
@@ -2365,8 +2371,8 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 	}
 
 	sid = le16_to_cpu(sid_cfm.sid);
-	dev_info(wdev->dev, "Radio %u REQUEST_SID %pM confirmed: sid=%u\n",
-		 radio->radio_idx, mac, sid);
+	dev_dbg(wdev->dev, "Radio %u REQUEST_SID %pM confirmed: sid=%u\n",
+		radio->radio_idx, mac, sid);
 
 	/*
 	 * Step 2: Configure station capabilities via UM_MAN_STA_ADD_REQ (0x043B).
@@ -2466,8 +2472,8 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 	radio->sta_last_rx = jiffies;
 	radio->sta_signal = -45;
 	ether_addr_copy(radio->sta_mac, mac);
-	dev_info(wdev->dev, "Radio %u STA_ADD %pM confirmed: status=%u sid=%u (flags=0x%02x flags_ext=0x%02x)\n",
-		 radio->radio_idx, mac, cfm.status, sid, req.flags, req.flags_ext);
+	dev_dbg(wdev->dev, "Radio %u STA_ADD %pM confirmed: status=%u sid=%u (flags=0x%02x flags_ext=0x%02x)\n",
+		radio->radio_idx, mac, cfm.status, sid, req.flags, req.flags_ext);
 
 	return 0;
 }
@@ -2482,8 +2488,8 @@ static int wave600_cfg80211_change_station(struct wiphy *wiphy,
 	struct wave600_station *sta = wave600_find_sta(radio, mac);
 	int sid = sta ? (int)sta->sid : (ether_addr_equal(mac, radio->sta_mac) ? (int)radio->sta_sid : -ENOENT);
 
-	dev_info(wdev->dev, "Radio %u cfg80211: change station %pM (aid %u, flags_set=0x%x sid=%d)\n",
-		 radio->radio_idx, mac, params ? params->aid : 0, params ? params->sta_flags_set : 0, sid);
+	dev_dbg(wdev->dev, "Radio %u cfg80211: change station %pM (aid %u, flags_set=0x%x sid=%d)\n",
+		radio->radio_idx, mac, params ? params->aid : 0, params ? params->sta_flags_set : 0, sid);
 
 	/*
 	 * When station completes 4-way handshake, hostapd authorizes the station:
@@ -2511,8 +2517,8 @@ static int wave600_cfg80211_change_station(struct wiphy *wiphy,
 		else {
 			if (sta)
 				sta->is_authorized = true;
-			dev_info(wdev->dev, "Radio %u SET_802_1X_FILTER %pM (sid %u) OPENED\n",
-				 radio->radio_idx, mac, sid);
+			dev_dbg(wdev->dev, "Radio %u SET_802_1X_FILTER %pM (sid %u) OPENED\n",
+				radio->radio_idx, mac, sid);
 		}
 	}
 
@@ -2555,8 +2561,8 @@ static int wave600_cfg80211_del_station(struct wiphy *wiphy,
 		return 0;
 	}
 
-	dev_info(wdev->dev, "Radio %u cfg80211: del station %pM (sid %u)\n",
-		 radio->radio_idx, del_mac, sid);
+	dev_dbg(wdev->dev, "Radio %u cfg80211: del station %pM (sid %u)\n",
+		radio->radio_idx, del_mac, sid);
 
 	/* Stop traffic queues before removing station to prevent FW assertion 0x03c2 */
 	memset(&sreq, 0, sizeof(sreq));
@@ -2759,20 +2765,20 @@ static int wave600_cfg80211_add_key(struct wiphy *wiphy,
 	if (params->cipher == WLAN_CIPHER_SUITE_AES_CMAC) {
 		sid = WAVE600_BCAST_DEST_SID;
 		key_type = WAVE600_UMI_RSN_MGMT_GROUP_KEY; /* 2 = IGTK (BIP) */
-		dev_info(wdev->dev, "Radio %u add_key (IGTK/BIP): bcast sid=0x%04x key_idx=%u len=%u\n",
-			 radio->radio_idx, sid, key_index, params->key_len);
+		dev_dbg(wdev->dev, "Radio %u add_key (IGTK/BIP): bcast sid=0x%04x key_idx=%u len=%u\n",
+			radio->radio_idx, sid, key_index, params->key_len);
 	} else if (pairwise && mac_addr) {
 		int sta_sid = wave600_radio_find_sid(radio, mac_addr);
 		sid = (sta_sid >= 0) ? (u16)sta_sid : radio->sta_sid;
 		key_type = WAVE600_UMI_RSN_PAIRWISE_KEY;
-		dev_info(wdev->dev, "Radio %u add_key (PAIRWISE): STA %pM sid=%u key_idx=%u cipher=0x%04x len=%u\n",
-			 radio->radio_idx, mac_addr, sid, key_index, u16_cipher, params->key_len);
+		dev_dbg(wdev->dev, "Radio %u add_key (PAIRWISE): STA %pM sid=%u key_idx=%u cipher=0x%04x len=%u\n",
+			radio->radio_idx, mac_addr, sid, key_index, u16_cipher, params->key_len);
 	} else {
 		sid = WAVE600_BCAST_DEST_SID;
 		key_type = WAVE600_UMI_RSN_GROUP_KEY;
 		radio->is_secure = true;
-		dev_info(wdev->dev, "Radio %u add_key (GROUP): bcast sid=0x%04x key_idx=%u cipher=0x%04x len=%u\n",
-			 radio->radio_idx, sid, key_index, u16_cipher, params->key_len);
+		dev_dbg(wdev->dev, "Radio %u add_key (GROUP): bcast sid=0x%04x key_idx=%u cipher=0x%04x len=%u\n",
+			radio->radio_idx, sid, key_index, u16_cipher, params->key_len);
 	}
 
 	memset(&req, 0, sizeof(req));
@@ -2807,8 +2813,8 @@ static int wave600_cfg80211_add_key(struct wiphy *wiphy,
 		return -EIO;
 	}
 
-	dev_info(wdev->dev, "Radio %u SET_KEY confirmed: sid=0x%04x key_type=%u key_idx=%u\n",
-		 radio->radio_idx, sid, key_type, key_index);
+	dev_dbg(wdev->dev, "Radio %u SET_KEY confirmed: sid=0x%04x key_type=%u key_idx=%u\n",
+		radio->radio_idx, sid, key_type, key_index);
 
 	return 0;
 }
@@ -2840,8 +2846,8 @@ static int wave600_cfg80211_set_default_key(struct wiphy *wiphy,
 	struct wave600_umi_default_key_index cfm;
 	int ret;
 
-	dev_info(wdev->dev, "Radio %u set_default_key: key_idx=%u unicast=%d multicast=%d\n",
-		 radio->radio_idx, key_index, unicast, multicast);
+	dev_dbg(wdev->dev, "Radio %u set_default_key: key_idx=%u unicast=%d multicast=%d\n",
+		radio->radio_idx, key_index, unicast, multicast);
 
 	memset(&req, 0, sizeof(req));
 	req.sid = cpu_to_le16(WAVE600_BCAST_DEST_SID);
