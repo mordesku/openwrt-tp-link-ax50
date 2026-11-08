@@ -269,6 +269,9 @@ static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 			} else if (msg_id == WAVE600_MC_MAN_BEACON_TEMPLATE_WAS_SET_IND) {
 				dev_dbg(wdev->dev, "beacon template set ind (0x333e) on radio %u vap %u (slot %u)\n",
 					radio, vap, idx);
+			} else if (msg_id == WAVE600_MC_MAN_CLASS3_ERROR_IND) {
+				dev_dbg(wdev->dev, "class 3 error ind (0x3304) on radio %u vap %u (slot %u)\n",
+					radio, vap, idx);
 			} else {
 				dev_info_ratelimited(wdev->dev, "asynchronous indication 0x%04x on radio %u vap %u (slot %u)\n",
 						     msg_id, radio, vap, idx);
@@ -326,7 +329,7 @@ static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 						u8 r_idx = (radio < 2) ? radio : 0;
 						struct net_device *ndev = wdev->radios[r_idx].ndev;
 
-						dev_warn_ratelimited(wdev->dev,
+						dev_dbg(wdev->dev,
 							"Class 3 Error: vap=%u addr=%pM\n",
 							err->entries[i].vap_id,
 							err->entries[i].addr);

@@ -3175,6 +3175,13 @@ static const u32 wave600_cipher_suites[] = {
 	WLAN_CIPHER_SUITE_AES_CMAC,
 };
 
+static const u8 wave600_ext_capa_ap[] = {
+	[0] = WLAN_EXT_CAPA1_EXT_CHANNEL_SWITCHING,
+	[7] = WLAN_EXT_CAPA8_OPMODE_NOTIF,
+	[9] = WLAN_EXT_CAPA10_TWT_RESPONDER_SUPPORT |
+	      WLAN_EXT_CAPA10_OBSS_NARROW_BW_RU_TOLERANCE_SUPPORT,
+};
+
 static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 {
 	struct wave600_radio *radio = &wdev->radios[radio_idx];
@@ -3201,6 +3208,10 @@ static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_AP);
 	wiphy->flags |= WIPHY_FLAG_REPORTS_OBSS;
+	wiphy->features |= NL80211_FEATURE_AP_MODE_CHAN_WIDTH_CHANGE | NL80211_FEATURE_SAE;
+	wiphy->extended_capabilities = wave600_ext_capa_ap;
+	wiphy->extended_capabilities_mask = wave600_ext_capa_ap;
+	wiphy->extended_capabilities_len = sizeof(wave600_ext_capa_ap);
 	wiphy->cipher_suites = wave600_cipher_suites;
 	wiphy->n_cipher_suites = ARRAY_SIZE(wave600_cipher_suites);
 	wiphy->mgmt_stypes = wave600_mgmt_stypes;
@@ -3300,7 +3311,8 @@ static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 		band->ht_cap.ampdu_factor = IEEE80211_HT_MAX_AMPDU_32K;
 		band->ht_cap.ampdu_density = IEEE80211_HT_MPDU_DENSITY_16;
 		memset(&band->ht_cap.mcs, 0, sizeof(band->ht_cap.mcs));
-		band->ht_cap.mcs.rx_mask[0] = 0xff;
+		band->ht_cap.mcs.rx_mask[0] = 0xff; /* MCS 0-7 */
+		band->ht_cap.mcs.rx_mask[1] = 0xff; /* MCS 8-15 (2x2 MIMO) */
 
 		band->vht_cap.vht_supported = true;
 		band->vht_cap.cap = IEEE80211_VHT_CAP_SHORT_GI_80 |
