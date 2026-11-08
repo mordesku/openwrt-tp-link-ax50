@@ -147,29 +147,10 @@ static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 					 * MAC_TO_HOST32): print both the raw
 					 * word and the decoded value.
 					 */
-					dev_info(wdev->dev, "ipc cfm 0x%04x: word0=0x%08x word1=0x%08x (le: 0x%08x 0x%08x)\n",
-						 le16_to_cpu(hdr.msg_id), shadow[0], shadow[1],
-						 le32_to_cpu(shadow[0]),
-						 le32_to_cpu(shadow[1]));
-
-				/*
-				 * Raw evidence dump: the first 64 B of the
-				 * slot exactly as the firmware left them
-				 * (UMI header + payload). Resolves the
-				 * mirror-echo-vs-real-content question and
-				 * any 2-byte layout shift between our
-				 * payload structures and the firmware's.
-				 */
-				{
-					u8 raw[64];
-					size_t raw_len = min(sizeof(raw),
-							     (size_t)ipc->man_req_slot_size);
-
-					wave600_pas_get(raw, slot_addr, raw_len);
-					print_hex_dump(KERN_INFO, "cfm-hex ",
-						       DUMP_PREFIX_OFFSET, 16, 4,
-						       raw, raw_len, false);
-				}
+					dev_dbg(wdev->dev, "ipc cfm 0x%04x: word0=0x%08x word1=0x%08x (le: 0x%08x 0x%08x)\n",
+						le16_to_cpu(hdr.msg_id), shadow[0], shadow[1],
+						le32_to_cpu(shadow[0]),
+						le32_to_cpu(shadow[1]));
 				}
 
 				/* The gen6 firmware writes its own
@@ -280,8 +261,18 @@ static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 			/* Copy the full IOM out of the slot (vendor _mtlk_mmb_handle_cm_ind) */
 			wave600_pas_get(bounce, ind_slot, bounce_len);
 			/* u16MsgId is MAC-endian (LE) on the wire */
-			dev_info_ratelimited(wdev->dev, "asynchronous indication 0x%04x on radio %u vap %u (slot %u)\n",
-					    le16_to_cpu(ind_hdr->msg_id), radio, vap, idx);
+			u16 msg_id = le16_to_cpu(ind_hdr->msg_id);
+
+			if (msg_id == WAVE600_MC_MAN_CONTINUOUS_INTERFERER_IND) {
+				dev_dbg(wdev->dev, "continuous interferer ind (0x332a) on radio %u vap %u (slot %u)\n",
+					radio, vap, idx);
+			} else if (msg_id == WAVE600_MC_MAN_BEACON_TEMPLATE_WAS_SET_IND) {
+				dev_dbg(wdev->dev, "beacon template set ind (0x333e) on radio %u vap %u (slot %u)\n",
+					radio, vap, idx);
+			} else {
+				dev_info_ratelimited(wdev->dev, "asynchronous indication 0x%04x on radio %u vap %u (slot %u)\n",
+						     msg_id, radio, vap, idx);
+			}
 
 			/*
 			 * NETWORK_EVENT (0x3326): AP station connect/disconnect.

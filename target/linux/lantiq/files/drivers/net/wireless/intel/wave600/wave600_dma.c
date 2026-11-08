@@ -453,12 +453,10 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 			if (is_eapol && radio && radio->ndev) {
 				struct sk_buff *rskb = napi_alloc_skb(&dma->napi, len);
 
-				dev_info_ratelimited(wdev->dev,
-						     "Radio %u RX EAPOL frame len=%u src=%pM dst=%pM proto=0x%04x\n",
-						     radio->radio_idx, len, eth->h_source, eth->h_dest,
-						     ntohs(eth->h_proto));
-				print_hex_dump(KERN_INFO, "rx-eapol: ", DUMP_PREFIX_OFFSET,
-					       16, 1, data, min_t(u32, len, 64), false);
+				dev_dbg(wdev->dev,
+					"Radio %u RX EAPOL frame len=%u src=%pM dst=%pM proto=0x%04x\n",
+					radio->radio_idx, len, eth->h_source, eth->h_dest,
+					ntohs(eth->h_proto));
 				if (rskb) {
 					skb_put_data(rskb, data, len);
 					rskb->protocol = eth_type_trans(rskb, radio->ndev);
@@ -713,8 +711,8 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	    ((struct ethhdr *)skb->data)->h_proto == htons(ETH_P_PAE)) {
 		int ret;
 
-		dev_info_ratelimited(wdev->dev, "Radio %u TX EAPOL frame len=%u dst=%pM\n",
-				     radio->radio_idx, skb->len, ((struct ethhdr *)skb->data)->h_dest);
+		dev_dbg(wdev->dev, "Radio %u TX EAPOL frame len=%u dst=%pM\n",
+			radio->radio_idx, skb->len, ((struct ethhdr *)skb->data)->h_dest);
 		ret = wave600_dma_mgmt_tx_eapol(radio, skb->data, skb->len);
 		if (ret == 0) {
 			dma->tx_packets++;
