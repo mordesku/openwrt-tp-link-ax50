@@ -37,7 +37,36 @@ struct wave600_station {
 	u32 connect_time;
 	unsigned long last_rx;
 	s8 signal;
+	s8 signal_avg;
 	bool is_authorized;
+
+	/* Protocol and capability flags */
+	bool is_he;
+	bool is_vht;
+	bool is_ht;
+	u8 nss;
+	u8 bw;
+
+	/* Per-station counters */
+	u64 rx_bytes;
+	u64 tx_bytes;
+	u32 rx_packets;
+	u32 tx_packets;
+
+	/* Dynamic rate tracking */
+	u32 tx_bitrate;		/* in 100 kbps units (e.g. 12010 = 1201.0 Mbps) */
+	u32 rx_bitrate;		/* in 100 kbps units */
+	u8 tx_mcs;
+	u8 rx_mcs;
+	u8 tx_nss;
+	u8 rx_nss;
+	u8 tx_bw;
+	u8 rx_bw;
+	u8 tx_flags;
+	u8 rx_flags;
+	u8 tx_gi;
+	u8 rx_gi;
+	u8 rx_dcm;
 };
 
 /*
@@ -59,6 +88,16 @@ struct wave600_stats {
 	int baa_start;
 	int hostif_start;
 	int la_start;			/* LINK_ADAPTATION_STATS block (TX power) */
+
+	/* Dynamic station telemetry */
+	void *phy_db;			/* coherent wholePhyRxStatusDb_t buffer */
+	dma_addr_t phy_db_dma;
+	u32 phy_db_size;
+	int la_bw_off;
+	int la_mode_off;
+	int la_mcs_off;
+	int la_nss_off;
+	int la_scp_off;
 };
 
 struct wave600_efuse_afe {
@@ -168,6 +207,9 @@ struct wave600_dev {
 
 	/* Delayed second FW state snapshot (diagnostic, 10 s after probe) */
 	struct delayed_work diag_work;
+
+	/* Dynamic station telemetry work (1 s period while stations connected) */
+	struct delayed_work telemetry_work;
 };
 
 int wave600_set_country(struct wave600_dev *wdev, const char *alpha2);
@@ -194,6 +236,7 @@ int wave600_cfg80211_restore_ap(struct wave600_radio *radio);
 void wave600_diag_handlers_probe(struct wave600_dev *wdev);
 int wave600_stats_init(struct wave600_dev *wdev);
 void wave600_stats_cleanup(struct wave600_dev *wdev);
+void wave600_stats_update_telemetry(struct wave600_dev *wdev);
 int wave600_stats_sysfs_create(struct wave600_dev *wdev);
 void wave600_stats_sysfs_remove(struct wave600_dev *wdev);
 
@@ -278,5 +321,6 @@ int wave600_hw_init_pll(struct wave600_dev *wdev);
 int wave600_hw_send_dep_cfg(struct wave600_dev *wdev);
 int wave600_fcsi_write(struct wave600_dev *wdev, u8 addr, u16 data);
 void wave600_hw_set_cpu_clock(struct wave600_dev *wdev, u32 clk_sel);
+struct wave600_station *wave600_find_sta(struct wave600_radio *radio, const u8 *mac);
 
 #endif /* __WAVE600_H__ */

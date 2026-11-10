@@ -953,7 +953,7 @@ int wave600_radio_find_sid(struct wave600_radio *radio, const u8 *mac)
 	return -ENOENT;
 }
 
-static struct wave600_station *wave600_find_sta(struct wave600_radio *radio, const u8 *mac)
+struct wave600_station *wave600_find_sta(struct wave600_radio *radio, const u8 *mac)
 {
 	int i;
 
@@ -980,12 +980,16 @@ static struct wave600_station *wave600_add_sta_entry(struct wave600_radio *radio
 	for (i = 0; i < WAVE600_MAX_STATIONS; i++) {
 		if (!radio->stations[i].valid) {
 			sta = &radio->stations[i];
+			memset(sta, 0, sizeof(*sta));
 			sta->valid = true;
 			ether_addr_copy(sta->mac, mac);
 			sta->sid = sid;
 			sta->connect_time = ktime_get_seconds();
 			sta->last_rx = jiffies;
-			sta->signal = -45;
+			if (radio->sta_signal < 0) {
+				sta->signal = radio->sta_signal;
+				sta->signal_avg = radio->sta_signal;
+			}
 			sta->is_authorized = false;
 			radio->num_stations++;
 			return sta;
@@ -1920,7 +1924,7 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 	 * before SET_CHAN.
 	 */
 	wave600_send_he_mu_operation(radio, 1);
-	wave600_send_bf_mode(radio, WAVE600_BF_MODE_EXPLICIT);
+	wave600_send_bf_mode(radio, WAVE600_BF_MODE_NON_BF);
 	wave600_send_txop_mode(radio, WAVE600_GEN6_ALL_STA_SID,
 			       WAVE600_TXOP_MODE_INVALID);
 
@@ -2012,7 +2016,7 @@ int wave600_cfg80211_restore_ap(struct wave600_radio *radio)
 	radio->radio_enabled = true;
 
 	wave600_send_he_mu_operation(radio, 1);
-	wave600_send_bf_mode(radio, WAVE600_BF_MODE_EXPLICIT);
+	wave600_send_bf_mode(radio, WAVE600_BF_MODE_NON_BF);
 	wave600_send_txop_mode(radio, WAVE600_GEN6_ALL_STA_SID,
 			       WAVE600_TXOP_MODE_INVALID);
 
@@ -2337,6 +2341,7 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 	struct wave600_umi_sta_add cfm;
 	const u8 *rates = (radio->radio_idx == 1) ? wave600_rates_5g : wave600_rates_2g;
 	u8 rates_len = (radio->radio_idx == 1) ? sizeof(wave600_rates_5g) : sizeof(wave600_rates_2g);
+	struct wave600_station *sta;
 	u16 sid;
 	int ret;
 
@@ -2420,25 +2425,36 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 	if (params && params->link_sta_params.he_capa && params->link_sta_params.he_capa_len) {
 		const u8 *he_raw = (const u8 *)params->link_sta_params.he_capa;
 		u8 he_len = params->link_sta_params.he_capa_len;
+		size_t mcs_size;
 
-		/* Copy MAC & PHY Cap Info (first 18 bytes) */
-		memcpy(req.he_mac_phy_cap_info, he_raw,
-		       min_t(size_t, sizeof(req.he_mac_phy_cap_info), (size_t)he_len));
+		/*
+		 * In Linux cfg80211, he_capa points to struct ieee80211_he_cap_elem
+		 * (6 bytes MAC Cap + 11 bytes PHY Cap = 17 bytes) without the Element ID.
+		 * In vendor UMI_STA_ADD, u8HE_Mac_Phy_Cap_Info[18] requires byte 0 to be
+		 * the Extension Element ID (35 / WLAN_EID_EXT_HE_CAPABILITY) followed by
+		 * the 17 bytes MAC & PHY Cap Info.
+		 */
+		req.he_mac_phy_cap_info[0] = 35;
+		memcpy(&req.he_mac_phy_cap_info[1], he_raw,
+		       min_t(size_t, 17, (size_t)he_len));
 
-		/* Copy HE MCS/NSS Set (starts at offset 18) */
-		if (he_len > 18) {
-			size_t mcs_len = min_t(size_t, sizeof(req.he_mcs_nss), (size_t)(he_len - 18));
-			memcpy(req.he_mcs_nss, he_raw + 18, mcs_len);
+		/* In Linux cfg80211, HE MCS/NSS Set starts at offset 17 (after 6 MAC + 11 PHY bytes) */
+		mcs_size = ieee80211_he_mcs_nss_size((const struct ieee80211_he_cap_elem *)he_raw);
+		if (he_len > 17) {
+			size_t mcs_copy = min_t(size_t, sizeof(req.he_mcs_nss), (size_t)(he_len - 17));
+			mcs_copy = min_t(size_t, mcs_copy, mcs_size);
+			memcpy(req.he_mcs_nss, he_raw + 17, mcs_copy);
 		}
 
-		/* Copy PPE Thresholds (offset 22/26/30 depending on bandwidth) */
-		if (he_len > 22) {
-			size_t ppe_off = (he_len >= 30) ? 30 : ((he_len >= 26) ? 26 : 22);
-			if (he_len > ppe_off) {
-				size_t ppe_len = min_t(size_t, sizeof(req.he_ppe_th), (size_t)(he_len - ppe_off));
-				memcpy(req.he_ppe_th, he_raw + ppe_off, ppe_len);
-			}
-		}
+		/*
+		 * PPE Thresholds (req.he_ppe_th):
+		 * Left zeroed (vendor driver default in stadb.c / wave_radio.c).
+		 * The WAV654 firmware was compiled against early 802.11ax Draft 2.0 (2017).
+		 * Modern Wi-Fi 6/7 clients (like Samsung S24) transmit 802.11ax-2021 Final
+		 * PPE Threshold bitfields, which Draft 2.0 firmware misinterprets as an
+		 * extreme PPET restriction, artificially capping transmissions to ~715 bytes.
+		 * Keeping he_ppe_th zeroed disables artificial packet size clamping.
+		 */
 
 		req.flags_ext |= W600_STA_FLAG_EXT_HE;
 	}
@@ -2465,15 +2481,107 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 		return ret;
 	}
 
-	wave600_add_sta_entry(radio, mac, sid);
+	sta = wave600_add_sta_entry(radio, mac, sid);
+	if (sta) {
+		sta->is_he = !!(req.flags_ext & W600_STA_FLAG_EXT_HE);
+		sta->is_vht = !!(req.flags & W600_STA_FLAG_VHT);
+		sta->is_ht = !!(req.flags & W600_STA_FLAG_HT);
+		sta->nss = 2;
+		sta->bw = radio->ap_width;
+		if (radio->sta_signal) {
+			sta->signal = radio->sta_signal;
+			sta->signal_avg = radio->sta_signal;
+		}
+
+		/* Initialize negotiated connection bitrate based on capabilities and AP bandwidth */
+		if (sta->is_he) {
+			sta->tx_flags = RATE_INFO_FLAGS_HE_MCS;
+			sta->rx_flags = RATE_INFO_FLAGS_HE_MCS;
+			sta->tx_nss = 2;
+			sta->rx_nss = 2;
+			sta->tx_mcs = 11;
+			sta->rx_mcs = 11;
+			sta->tx_gi = NL80211_RATE_INFO_HE_GI_0_8;
+			sta->rx_gi = NL80211_RATE_INFO_HE_GI_0_8;
+
+			if (radio->ap_width == NL80211_CHAN_WIDTH_80) {
+				sta->tx_bw = RATE_INFO_BW_80;
+				sta->rx_bw = RATE_INFO_BW_80;
+				sta->tx_bitrate = 12010; /* 1201.0 Mbps (HE80 MCS11 2x2 0.8us GI) */
+				sta->rx_bitrate = 12010;
+			} else if (radio->ap_width == NL80211_CHAN_WIDTH_40) {
+				sta->tx_bw = RATE_INFO_BW_40;
+				sta->rx_bw = RATE_INFO_BW_40;
+				sta->tx_bitrate = 5735;  /* 573.5 Mbps (HE40 MCS11 2x2 0.8us GI) */
+				sta->rx_bitrate = 5735;
+			} else {
+				sta->tx_bw = RATE_INFO_BW_20;
+				sta->rx_bw = RATE_INFO_BW_20;
+				sta->tx_bitrate = 2868;  /* 286.8 Mbps (HE20 MCS11 2x2 0.8us GI) */
+				sta->rx_bitrate = 2868;
+			}
+		} else if (sta->is_vht) {
+			sta->tx_flags = RATE_INFO_FLAGS_VHT_MCS | RATE_INFO_FLAGS_SHORT_GI;
+			sta->rx_flags = RATE_INFO_FLAGS_VHT_MCS | RATE_INFO_FLAGS_SHORT_GI;
+			sta->tx_nss = 2;
+			sta->rx_nss = 2;
+			sta->tx_mcs = 9;
+			sta->rx_mcs = 9;
+
+			if (radio->ap_width == NL80211_CHAN_WIDTH_80) {
+				sta->tx_bw = RATE_INFO_BW_80;
+				sta->rx_bw = RATE_INFO_BW_80;
+				sta->tx_bitrate = 8667; /* 866.7 Mbps (VHT80 MCS9 2x2 SGI) */
+				sta->rx_bitrate = 8667;
+			} else if (radio->ap_width == NL80211_CHAN_WIDTH_40) {
+				sta->tx_bw = RATE_INFO_BW_40;
+				sta->rx_bw = RATE_INFO_BW_40;
+				sta->tx_bitrate = 4000; /* 400.0 Mbps (VHT40 MCS9 2x2 SGI) */
+				sta->rx_bitrate = 4000;
+			} else {
+				sta->tx_bw = RATE_INFO_BW_20;
+				sta->rx_bw = RATE_INFO_BW_20;
+				sta->tx_mcs = 8;
+				sta->rx_mcs = 8;
+				sta->tx_bitrate = 1733; /* 173.3 Mbps (VHT20 MCS8 2x2 SGI) */
+				sta->rx_bitrate = 1733;
+			}
+		} else if (sta->is_ht) {
+			sta->tx_flags = RATE_INFO_FLAGS_MCS | RATE_INFO_FLAGS_SHORT_GI;
+			sta->rx_flags = RATE_INFO_FLAGS_MCS | RATE_INFO_FLAGS_SHORT_GI;
+			sta->tx_nss = 2;
+			sta->rx_nss = 2;
+			sta->tx_mcs = 15;
+			sta->rx_mcs = 15;
+
+			if (radio->ap_width == NL80211_CHAN_WIDTH_40) {
+				sta->tx_bw = RATE_INFO_BW_40;
+				sta->rx_bw = RATE_INFO_BW_40;
+				sta->tx_bitrate = 3000; /* 300.0 Mbps (HT40 MCS15 2x2 SGI) */
+				sta->rx_bitrate = 3000;
+			} else {
+				sta->tx_bw = RATE_INFO_BW_20;
+				sta->rx_bw = RATE_INFO_BW_20;
+				sta->tx_bitrate = 1444; /* 144.4 Mbps (HT20 MCS15 2x2 SGI) */
+				sta->rx_bitrate = 1444;
+			}
+		} else {
+			sta->tx_bitrate = 540; /* 54.0 Mbps legacy */
+			sta->rx_bitrate = 540;
+			sta->tx_bw = RATE_INFO_BW_20;
+			sta->rx_bw = RATE_INFO_BW_20;
+			sta->tx_nss = 1;
+			sta->rx_nss = 1;
+		}
+	}
 	radio->sta_connected = true;
 	radio->sta_sid = sid;
 	radio->sta_connect_time = ktime_get_seconds();
 	radio->sta_last_rx = jiffies;
-	radio->sta_signal = -45;
 	ether_addr_copy(radio->sta_mac, mac);
-	dev_dbg(wdev->dev, "Radio %u STA_ADD %pM confirmed: status=%u sid=%u (flags=0x%02x flags_ext=0x%02x)\n",
-		radio->radio_idx, mac, cfm.status, sid, req.flags, req.flags_ext);
+	dev_dbg(wdev->dev, "Radio %u STA_ADD %pM confirmed: status=%u sid=%u (flags=0x%02x flags_ext=0x%02x HE=%d VHT=%d HT=%d)\n",
+		radio->radio_idx, mac, cfm.status, sid, req.flags, req.flags_ext,
+		sta ? sta->is_he : 0, sta ? sta->is_vht : 0, sta ? sta->is_ht : 0);
 
 	return 0;
 }
@@ -2616,7 +2724,6 @@ static int wave600_cfg80211_get_station(struct wiphy *wiphy,
 {
 	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
 	struct wave600_station *sta;
-	u8 bw = RATE_INFO_BW_20;
 
 	if (!radio)
 		return -ENOENT;
@@ -2627,8 +2734,6 @@ static int wave600_cfg80211_get_station(struct wiphy *wiphy,
 
 	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_INACTIVE_TIME) |
 			 BIT_ULL(NL80211_STA_INFO_CONNECTED_TIME) |
-			 BIT_ULL(NL80211_STA_INFO_SIGNAL) |
-			 BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG) |
 			 BIT_ULL(NL80211_STA_INFO_RX_BYTES) |
 			 BIT_ULL(NL80211_STA_INFO_TX_BYTES) |
 			 BIT_ULL(NL80211_STA_INFO_RX_PACKETS) |
@@ -2639,53 +2744,70 @@ static int wave600_cfg80211_get_station(struct wiphy *wiphy,
 	if (sta) {
 		sinfo->inactive_time = jiffies_to_msecs(jiffies - sta->last_rx);
 		sinfo->connected_time = ktime_get_seconds() - sta->connect_time;
-		sinfo->signal = sta->signal ? sta->signal : -45;
+		if (sta->signal < 0 && sta->signal >= -100) {
+			sinfo->signal = sta->signal;
+			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+		}
+		if (sta->signal_avg < 0 && sta->signal_avg >= -100) {
+			sinfo->signal_avg = sta->signal_avg;
+			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG);
+		}
+		sinfo->rx_bytes = sta->rx_bytes;
+		sinfo->tx_bytes = sta->tx_bytes;
+		sinfo->rx_packets = sta->rx_packets;
+		sinfo->tx_packets = sta->tx_packets;
+
+		/* Dynamic TX Rate */
+		sinfo->txrate.legacy = sta->tx_bitrate;
+		sinfo->txrate.bw = sta->tx_bw;
+		sinfo->txrate.nss = sta->tx_nss;
+		sinfo->txrate.mcs = sta->tx_mcs;
+		sinfo->txrate.flags = sta->tx_flags;
+		sinfo->txrate.he_gi = sta->tx_gi;
+
+		/* Dynamic RX Rate */
+		sinfo->rxrate.legacy = sta->rx_bitrate ? sta->rx_bitrate : sta->tx_bitrate;
+		sinfo->rxrate.bw = sta->rx_bw;
+		sinfo->rxrate.nss = sta->rx_nss;
+		sinfo->rxrate.mcs = sta->rx_mcs;
+		sinfo->rxrate.flags = sta->rx_flags;
+		sinfo->rxrate.he_gi = sta->rx_gi;
+		sinfo->rxrate.he_dcm = sta->rx_dcm;
 	} else {
 		sinfo->inactive_time = jiffies_to_msecs(jiffies - radio->sta_last_rx);
 		sinfo->connected_time = ktime_get_seconds() - radio->sta_connect_time;
-		sinfo->signal = radio->sta_signal ? radio->sta_signal : -45;
-	}
-	sinfo->signal_avg = sinfo->signal;
+		if (radio->sta_signal < 0 && radio->sta_signal >= -100) {
+			sinfo->signal = radio->sta_signal;
+			sinfo->signal_avg = radio->sta_signal;
+			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL) |
+					 BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG);
+		}
+		if (radio->ndev) {
+			sinfo->rx_bytes = radio->ndev->stats.rx_bytes;
+			sinfo->tx_bytes = radio->ndev->stats.tx_bytes;
+			sinfo->rx_packets = radio->ndev->stats.rx_packets;
+			sinfo->tx_packets = radio->ndev->stats.tx_packets;
+		}
 
-	if (radio->ndev) {
-		sinfo->rx_bytes = radio->ndev->stats.rx_bytes;
-		sinfo->tx_bytes = radio->ndev->stats.tx_bytes;
-		sinfo->rx_packets = radio->ndev->stats.rx_packets;
-		sinfo->tx_packets = radio->ndev->stats.tx_packets;
-	}
-
-	if (radio->ap_width == 1)
-		bw = RATE_INFO_BW_40;
-	else if (radio->ap_width == 2)
-		bw = RATE_INFO_BW_80;
-	else if (radio->ap_width == 3)
-		bw = RATE_INFO_BW_160;
-	else if (radio->radio_idx == 1)
-		bw = RATE_INFO_BW_80;
-
-	sinfo->txrate.bw = bw;
-	sinfo->rxrate.bw = bw;
-
-	if (radio->radio_idx == 0) {
-		sinfo->txrate.legacy = (bw == RATE_INFO_BW_40) ? 3000 : 1444;
-		sinfo->txrate.flags = RATE_INFO_FLAGS_MCS | RATE_INFO_FLAGS_SHORT_GI;
-		sinfo->txrate.mcs = 15;
-	} else {
-		if (bw == RATE_INFO_BW_160)
-			sinfo->txrate.legacy = 17333;
-		else if (bw == RATE_INFO_BW_80)
-			sinfo->txrate.legacy = 8667;
-		else
-			sinfo->txrate.legacy = 4000;
-		sinfo->txrate.flags = RATE_INFO_FLAGS_VHT_MCS | RATE_INFO_FLAGS_SHORT_GI;
-		sinfo->txrate.mcs = 9;
+		/* Radio fallback rate based on operating bandwidth */
+		if (radio->ap_width == NL80211_CHAN_WIDTH_80) {
+			sinfo->txrate.legacy = 12010;
+			sinfo->txrate.bw = RATE_INFO_BW_80;
+			sinfo->txrate.flags = RATE_INFO_FLAGS_HE_MCS;
+		} else if (radio->ap_width == NL80211_CHAN_WIDTH_40) {
+			sinfo->txrate.legacy = 5735;
+			sinfo->txrate.bw = RATE_INFO_BW_40;
+			sinfo->txrate.flags = RATE_INFO_FLAGS_HE_MCS;
+		} else {
+			sinfo->txrate.legacy = 2868;
+			sinfo->txrate.bw = RATE_INFO_BW_20;
+			sinfo->txrate.flags = RATE_INFO_FLAGS_HE_MCS;
+		}
 		sinfo->txrate.nss = 2;
+		sinfo->txrate.mcs = 11;
+		sinfo->txrate.he_gi = NL80211_RATE_INFO_HE_GI_0_8;
+		sinfo->rxrate = sinfo->txrate;
 	}
-
-	sinfo->rxrate.legacy = sinfo->txrate.legacy;
-	sinfo->rxrate.flags = sinfo->txrate.flags;
-	sinfo->rxrate.mcs = sinfo->txrate.mcs;
-	sinfo->rxrate.nss = sinfo->txrate.nss;
 
 	return 0;
 }
@@ -2966,32 +3088,14 @@ static const struct ieee80211_sband_iftype_data wave600_iftype_data_2g[] = {
 			.has_he = true,
 			.he_cap_elem = {
 				.mac_cap_info = {
-					[0] = IEEE80211_HE_MAC_CAP0_HTC_HE |
-					      IEEE80211_HE_MAC_CAP0_TWT_RES,
-					[2] = IEEE80211_HE_MAC_CAP2_ALL_ACK |
-					      IEEE80211_HE_MAC_CAP2_BSR,
-					[3] = IEEE80211_HE_MAC_CAP3_OMI_CONTROL |
-					      IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_EXT_3,
-					[4] = IEEE80211_HE_MAC_CAP4_AMSDU_IN_AMPDU |
-					      IEEE80211_HE_MAC_CAP4_BQR,
-					[5] = IEEE80211_HE_MAC_CAP5_OM_CTRL_UL_MU_DATA_DIS_RX,
+					[0] = IEEE80211_HE_MAC_CAP0_HTC_HE,
+					[2] = IEEE80211_HE_MAC_CAP2_BSR,
 				},
 				.phy_cap_info = {
 					[0] = IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G,
 					[1] = IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD |
 					      IEEE80211_HE_PHY_CAP1_HE_LTF_AND_GI_FOR_HE_PPDUS_0_8US,
-					[2] = IEEE80211_HE_PHY_CAP2_STBC_TX_UNDER_80MHZ |
-					      IEEE80211_HE_PHY_CAP2_STBC_RX_UNDER_80MHZ,
-					[3] = IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_TX_QPSK |
-					      IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_RX_QPSK |
-					      IEEE80211_HE_PHY_CAP3_SU_BEAMFORMER,
-					[4] = IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE |
-					      IEEE80211_HE_PHY_CAP4_MU_BEAMFORMER,
 					[6] = IEEE80211_HE_PHY_CAP6_PARTIAL_BW_EXT_RANGE,
-					[8] = IEEE80211_HE_PHY_CAP8_20MHZ_IN_40MHZ_HE_PPDU_IN_2G,
-					[9] = IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU |
-					      IEEE80211_HE_PHY_CAP9_RX_1024_QAM_LESS_THAN_242_TONE_RU |
-					      (IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_16US << IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_POS),
 				},
 			},
 			.he_mcs_nss_supp = {
@@ -3013,36 +3117,14 @@ static const struct ieee80211_sband_iftype_data wave600_iftype_data_5g[] = {
 			.has_he = true,
 			.he_cap_elem = {
 				.mac_cap_info = {
-					[0] = IEEE80211_HE_MAC_CAP0_HTC_HE |
-					      IEEE80211_HE_MAC_CAP0_TWT_RES,
-					[2] = IEEE80211_HE_MAC_CAP2_ALL_ACK |
-					      IEEE80211_HE_MAC_CAP2_BSR,
-					[3] = IEEE80211_HE_MAC_CAP3_OMI_CONTROL |
-					      IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_EXT_3,
-					[4] = IEEE80211_HE_MAC_CAP4_AMSDU_IN_AMPDU |
-					      IEEE80211_HE_MAC_CAP4_BQR,
-					[5] = IEEE80211_HE_MAC_CAP5_OM_CTRL_UL_MU_DATA_DIS_RX,
+					[0] = IEEE80211_HE_MAC_CAP0_HTC_HE,
+					[2] = IEEE80211_HE_MAC_CAP2_BSR,
 				},
 				.phy_cap_info = {
-					[0] = IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G |
-					      IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G,
+					[0] = IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G,
 					[1] = IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD |
 					      IEEE80211_HE_PHY_CAP1_HE_LTF_AND_GI_FOR_HE_PPDUS_0_8US,
-					[2] = IEEE80211_HE_PHY_CAP2_STBC_TX_UNDER_80MHZ |
-					      IEEE80211_HE_PHY_CAP2_STBC_RX_UNDER_80MHZ,
-					[3] = IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_TX_QPSK |
-					      IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_RX_QPSK |
-					      IEEE80211_HE_PHY_CAP3_SU_BEAMFORMER,
-					[4] = IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE |
-					      IEEE80211_HE_PHY_CAP4_MU_BEAMFORMER,
 					[6] = IEEE80211_HE_PHY_CAP6_PARTIAL_BW_EXT_RANGE,
-					[7] = IEEE80211_HE_PHY_CAP7_STBC_TX_ABOVE_80MHZ |
-					      IEEE80211_HE_PHY_CAP7_STBC_RX_ABOVE_80MHZ,
-					[8] = IEEE80211_HE_PHY_CAP8_20MHZ_IN_160MHZ_HE_PPDU |
-					      IEEE80211_HE_PHY_CAP8_80MHZ_IN_160MHZ_HE_PPDU,
-					[9] = IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU |
-					      IEEE80211_HE_PHY_CAP9_RX_1024_QAM_LESS_THAN_242_TONE_RU |
-					      (IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_16US << IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_POS),
 				},
 			},
 			.he_mcs_nss_supp = {

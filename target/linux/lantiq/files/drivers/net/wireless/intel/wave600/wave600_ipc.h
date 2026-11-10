@@ -429,6 +429,49 @@ struct wave600_umi_get_statistics {
 } __packed;
 
 /*
+ * Dynamic PHY Status (vendor hw_mmb.c hw_phy_rx_status_get, mhi_umi.h):
+ * Firmware populates wholePhyRxStatusDb_t in DDR containing per-station
+ * RSSI for all 4 antennas and 17-bit hardware PHY reception rate.
+ */
+#define WAVE600_UM_MAN_PHY_STATUS_REQ              WAVE600_UMI_MSG_MAN_REQ(0x0F) /* 0x040F */
+#define WAVE600_MC_MAN_PHY_STATUS_CFM              WAVE600_UMI_MSG_MAN_CFM(0x0F) /* 0x140F */
+
+struct wave600_umi_phy_status_req {
+	u32 ddr_buffer_address;
+	u32 ddr_buffer_size;
+} __packed;
+
+#define WAVE600_PHY_STATISTICS_MAX_RX_ANT 4
+#define WAVE600_GEN6_NUM_OF_BANDS 2
+#define WAVE600_GEN6_MAX_SID 256
+
+struct wave600_station_phy_rx_status {
+	s8 rssi[WAVE600_PHY_STATISTICS_MAX_RX_ANT];
+	__le32 phy_rate;
+	__le32 irad;
+	__le32 last_tsf;
+	__le32 per_client_rx_time_usage;
+	s8 max_rssi;
+	u8 reserved[3];
+} __packed;
+
+struct wave600_device_phy_rx_status {
+	u8 noise[WAVE600_PHY_STATISTICS_MAX_RX_ANT];
+	u8 rf_gain[WAVE600_PHY_STATISTICS_MAX_RX_ANT];
+	__le32 irad;
+	__le32 tsf;
+	u8 channel_load;
+	u8 total_channel_utilization;
+	u8 rate_field_type;
+	u8 reserved;
+} __packed;
+
+struct wave600_whole_phy_rx_status_db {
+	struct wave600_device_phy_rx_status dev_status[WAVE600_GEN6_NUM_OF_BANDS];
+	struct wave600_station_phy_rx_status sta_status[WAVE600_GEN6_MAX_SID];
+} __packed;
+
+/*
  * Calibration data upload (vendor hw_mmb.c mtlk_efuse_eeprom_load_to_hw,
  * sent for the EEPROM new format between the ProgModel download and the
  * HDK config / PSDB steps):

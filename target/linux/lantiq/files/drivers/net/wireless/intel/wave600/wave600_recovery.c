@@ -147,6 +147,7 @@ static void wave600_recovery_work_fn(struct work_struct *work)
 	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, 0);
 	mmiowb();
 
+	cancel_delayed_work(&wdev->telemetry_work);
 	wave600_dma_stop_netdev(wdev);
 
 	for (i = 0; i < 2; i++) {
@@ -289,6 +290,8 @@ static void wave600_recovery_work_fn(struct work_struct *work)
 
 	wdev->state = W600_STATE_RUNNING;
 	atomic_set(&wdev->in_recovery, 0);
+
+	schedule_delayed_work(&wdev->telemetry_work, msecs_to_jiffies(1000));
 
 	dev_info(wdev->dev, "=== WAV654 HARDWARE FAULT RECOVERY COMPLETED SUCCESSFULLY ===\n");
 	return;
