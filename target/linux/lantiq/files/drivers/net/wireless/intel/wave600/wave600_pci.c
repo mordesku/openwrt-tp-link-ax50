@@ -27,6 +27,17 @@ static void wave600_pci_diag_work(struct work_struct *work)
 	wave600_ipc_diag_fw_state(wdev, "10s-after-init");
 }
 
+static void wave600_pci_telemetry_work(struct work_struct *work)
+{
+	struct wave600_dev *wdev =
+		container_of(work, struct wave600_dev, telemetry_work.work);
+
+	wave600_stats_update_telemetry(wdev);
+
+	if (wdev->state == W600_STATE_RUNNING)
+		schedule_delayed_work(&wdev->telemetry_work, msecs_to_jiffies(1000));
+}
+
 static int wave600_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct wave600_dev *wdev;
@@ -292,6 +303,9 @@ static int wave600_pci_probe(struct pci_dev *pdev, const struct pci_device_id *i
 	INIT_DELAYED_WORK(&wdev->diag_work, wave600_pci_diag_work);
 	schedule_delayed_work(&wdev->diag_work, msecs_to_jiffies(10000));
 
+	INIT_DELAYED_WORK(&wdev->telemetry_work, wave600_pci_telemetry_work);
+	schedule_delayed_work(&wdev->telemetry_work, msecs_to_jiffies(1000));
+
 	return 0;
 
 err_rf:
@@ -327,6 +341,7 @@ static void wave600_pci_remove(struct pci_dev *pdev)
 		wave600_recovery_sysfs_remove(wdev);
 		wave600_recovery_cleanup(wdev);
 		cancel_delayed_work_sync(&wdev->diag_work);
+		cancel_delayed_work_sync(&wdev->telemetry_work);
 		wave600_stats_sysfs_remove(wdev);
 		wave600_stats_cleanup(wdev);
 		wave600_dma_stop_netdev(wdev);

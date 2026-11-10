@@ -317,6 +317,9 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 			goto recycle_reuse;
 		}
 
+		const struct ethhdr *eth = (const struct ethhdr *)(buf->skb->data + offset);
+		const u8 *src_mac = eth->h_source;
+
 		skb_put_data(skb, buf->skb->data + offset, len);
 		dma_sync_single_for_device(wdev->dev, buf->dma, buf->size,
 					   DMA_FROM_DEVICE);
@@ -330,8 +333,18 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 			ndev->stats.rx_packets++;
 			ndev->stats.rx_bytes += len;
 		}
-		if (radio)
+		if (radio) {
+			if (!is_multicast_ether_addr(src_mac)) {
+				struct wave600_station *sta = wave600_find_sta(radio, src_mac);
+
+				if (sta) {
+					sta->rx_packets++;
+					sta->rx_bytes += len;
+					sta->last_rx = jiffies;
+				}
+			}
 			radio->sta_last_rx = jiffies;
+		}
 
 recycle_reuse:
 		recycle_hd = *hd;
@@ -443,9 +456,33 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 			int freq = (radio && radio->ap_freq) ? radio->ap_freq :
 				   ((radio_idx == 1) ? 5180 : 2437);
 			bool is_eapol;
+			u32 sync_len = offset + len;
+			u32 metrics_off = offset + len + 16 - ((offset + len) & 15);
+			s8 measured_rssi = 0;
+
+			if (metrics_off + 80 <= WAVE600_DMA_MGMT_BUF_SIZE)
+				sync_len = metrics_off + 80;
 
 			dma_sync_single_for_cpu(wdev->dev, (dma_addr_t)payload_addr,
-						offset + len, DMA_FROM_DEVICE);
+						sync_len, DMA_FROM_DEVICE);
+
+			if (metrics_off + 80 <= WAVE600_DMA_MGMT_BUF_SIZE) {
+				u32 *status0 = (u32 *)phys_to_virt(payload_addr + metrics_off + 48);
+				u32 word0 = le32_to_cpu(*status0);
+
+				if ((word0 >> 1) & 1) { /* G6_COMMON_POST_PPDU_PHY_STAT0_0_PRE_METRICS_VALID */
+					s8 *fdrssi = (s8 *)phys_to_virt(payload_addr + metrics_off + 72);
+					s8 r0 = fdrssi[0];
+					s8 r1 = fdrssi[1];
+					s8 mr = max(r0, r1);
+
+					if (mr >= -100 && mr <= -10)
+						measured_rssi = mr;
+				}
+			}
+
+			if (radio && measured_rssi != 0)
+				radio->sta_signal = measured_rssi;
 
 			is_eapol = (frame_type == W600_FRAME_TYPE_EAPOL && type == 2) ||
 				   (len >= ETH_HLEN && eth->h_proto == htons(ETH_P_PAE));
@@ -465,16 +502,77 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 					radio->ndev->stats.rx_packets++;
 					radio->ndev->stats.rx_bytes += len;
 					radio->sta_last_rx = jiffies;
+					if (!is_multicast_ether_addr(eth->h_source)) {
+						struct wave600_station *sta = wave600_find_sta(radio, eth->h_source);
+						if (sta) {
+							sta->rx_packets++;
+							sta->rx_bytes += len;
+							sta->last_rx = jiffies;
+							if (measured_rssi != 0) {
+								sta->signal = measured_rssi;
+								if (sta->signal_avg == 0 || sta->signal_avg <= -99)
+									sta->signal_avg = measured_rssi;
+								else
+									sta->signal_avg = (s8)(((int)sta->signal_avg * 7 + measured_rssi) / 8);
+							}
+						}
+					}
 				}
 			} else if (radio && radio->ap_started && radio->wdev_net) {
-				int sig = radio->sta_signal ? radio->sta_signal : -45;
+				int sig = (measured_rssi != 0) ? measured_rssi :
+					  (radio->sta_signal ? radio->sta_signal : 0);
+
+				if (len >= 24 && !is_multicast_ether_addr(data + 10)) {
+					struct wave600_station *sta = wave600_find_sta(radio, data + 10);
+					if (sta) {
+						if (measured_rssi != 0) {
+							sta->signal = measured_rssi;
+							if (sta->signal_avg == 0 || sta->signal_avg <= -99)
+								sta->signal_avg = measured_rssi;
+							else
+								sta->signal_avg = (s8)(((int)sta->signal_avg * 7 + measured_rssi) / 8);
+						}
+						if (metrics_off + 80 <= WAVE600_DMA_MGMT_BUF_SIZE) {
+							u32 *s0 = (u32 *)phys_to_virt(payload_addr + metrics_off + 48);
+							u32 w0 = le32_to_cpu(*s0);
+
+							if ((w0 >> 1) & 1) {
+								u32 w0_u = le32_to_cpu(*(u32 *)phys_to_virt(payload_addr + metrics_off + 64));
+								u32 w1_u = le32_to_cpu(*(u32 *)phys_to_virt(payload_addr + metrics_off + 68));
+								u32 hw_r = (w1_u >> 4) & 0x1FFFF;
+
+								if (hw_r > 0 && hw_r < 0x1FFFF) {
+									u32 c0 = le32_to_cpu(*(u32 *)phys_to_virt(payload_addr + metrics_off + 0));
+									u8 pmode = (c0 >> 17) & 0x07;
+
+									sta->rx_bitrate = hw_r;
+									if (pmode == 4) {
+										sta->rx_flags = RATE_INFO_FLAGS_HE_MCS;
+										sta->rx_mcs = (w0_u >> 24) & 0x0F;
+										sta->rx_nss = ((w0_u >> 28) & 0x07) + 1;
+										sta->rx_dcm = (w0_u >> 31) & 0x01;
+									} else if (pmode == 3) {
+										sta->rx_flags = RATE_INFO_FLAGS_VHT_MCS | RATE_INFO_FLAGS_SHORT_GI;
+										sta->rx_mcs = (w0_u >> 28) & 0x07;
+										sta->rx_nss = ((w0_u >> 24) & 0x0F) + 1;
+									} else if (pmode == 2) {
+										sta->rx_flags = RATE_INFO_FLAGS_MCS | RATE_INFO_FLAGS_SHORT_GI;
+										sta->rx_mcs = (w0_u >> 24) & 0x3F;
+										sta->rx_nss = (sta->rx_mcs / 8) + 1;
+									}
+								}
+							}
+						}
+						sta->last_rx = jiffies;
+					}
+				}
 
 				cfg80211_rx_mgmt(radio->wdev_net, freq, sig,
 						 data, len, 0);
 			}
 
 			dma_sync_single_for_device(wdev->dev, (dma_addr_t)payload_addr,
-						   offset + len, DMA_FROM_DEVICE);
+						   sync_len, DMA_FROM_DEVICE);
 		}
 
 		recycle_hd = *hd;
@@ -715,6 +813,13 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 			radio->radio_idx, skb->len, ((struct ethhdr *)skb->data)->h_dest);
 		ret = wave600_dma_mgmt_tx_eapol(radio, skb->data, skb->len);
 		if (ret == 0) {
+			const struct ethhdr *eth = (const struct ethhdr *)skb->data;
+			struct wave600_station *sta = wave600_find_sta(radio, eth->h_dest);
+
+			if (sta) {
+				sta->tx_packets++;
+				sta->tx_bytes += skb->len;
+			}
 			dma->tx_packets++;
 			ndev->stats.tx_packets++;
 			ndev->stats.tx_bytes += skb->len;
@@ -774,6 +879,14 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	hd.bd_index = cpu_to_le32(FIELD_PREP(W600_TX_BD_INDEX, bd));
 
 	wave600_dma_ring_push(dma, &dma->tx, &hd);
+	if (!is_multicast_ether_addr(skb->data)) {
+		struct wave600_station *sta = wave600_find_sta(radio, skb->data);
+
+		if (sta) {
+			sta->tx_packets++;
+			sta->tx_bytes += skb->len;
+		}
+	}
 	dma->tx_packets++;
 	ndev->stats.tx_packets++;
 	ndev->stats.tx_bytes += skb->len;
