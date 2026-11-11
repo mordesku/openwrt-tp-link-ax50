@@ -122,4 +122,55 @@ void wave600_psdb_cleanup(struct wave600_dev *wdev);
 int wave600_psdb_regd_limits(struct wave600_dev *wdev, u8 regd_code, u8 chan_num,
 			     u16 pw[13]);
 
+/* Subband center channel helper for bonded bandwidths (40, 80, 160 MHz) */
+static inline u8 wave600_chan_to_subband_center_chan(u8 chan, u8 width)
+{
+	u8 low;
+
+	if (chan <= 14)
+		return chan; /* 2.4 GHz */
+
+	switch (width) {
+	case 1: /* 40 MHz */
+		if (chan >= 36 && chan <= 64)
+			low = 36 + ((chan - 36) / 8) * 8;
+		else if (chan >= 100 && chan <= 144)
+			low = 100 + ((chan - 100) / 8) * 8;
+		else if (chan >= 149 && chan <= 165)
+			low = 149 + ((chan - 149) / 8) * 8;
+		else
+			return chan;
+		return low + 2;
+	case 2: /* 80 MHz */
+		if (chan >= 36 && chan <= 64)
+			low = 36 + ((chan - 36) / 16) * 16;
+		else if (chan >= 100 && chan <= 144)
+			low = 100 + ((chan - 100) / 16) * 16;
+		else if (chan >= 149 && chan <= 165)
+			low = 149 + ((chan - 149) / 16) * 16;
+		else
+			return chan;
+		return low + 6;
+	case 3: /* 160 MHz */
+		if (chan >= 36 && chan <= 64)
+			return 50; /* 5250 MHz */
+		else if (chan >= 100 && chan <= 128)
+			return 114; /* 5570 MHz */
+		else
+			return chan;
+	default:
+		return chan;
+	}
+}
+
+static inline u16 wave600_chan_to_subband_cf(u8 chan, u8 width)
+{
+	u8 c_chan = wave600_chan_to_subband_center_chan(chan, width);
+
+	if (c_chan <= 14)
+		return (u16)(2407 + 5 * c_chan);
+
+	return (u16)(5000 + 5 * c_chan);
+}
+
 #endif /* __WAVE600_CAL_H__ */
