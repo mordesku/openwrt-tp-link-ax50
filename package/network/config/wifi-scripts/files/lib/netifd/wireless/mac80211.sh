@@ -454,7 +454,8 @@ mac80211_hostapd_setup_base() {
 			he_spr_psr_enabled:0 \
 			he_spr_non_srg_obss_pd_max_offset:0 \
 			he_bss_color:128 \
-			he_bss_color_enabled:1
+			he_bss_color_enabled:1 \
+			he_rts_threshold:-1
 
 		he_phy_cap=$(iw phy "$phy" info | sed -n '/HE Iftypes: .*AP/,$p' | awk -F "[()]" '/HE PHY Capabilities/ { print $2 }' | head -1)
 		he_phy_cap=${he_phy_cap:2}
@@ -488,7 +489,7 @@ mac80211_hostapd_setup_base() {
 
 
 		append base_cfg "he_default_pe_duration=4" "$N"
-		append base_cfg "he_rts_threshold=1023" "$N"
+		[ "$he_rts_threshold" != "-1" ] && append base_cfg "he_rts_threshold=$he_rts_threshold" "$N"
 		append base_cfg "he_mu_edca_qos_info_param_count=0" "$N"
 		append base_cfg "he_mu_edca_qos_info_q_ack=0" "$N"
 		append base_cfg "he_mu_edca_qos_info_queue_request=0" "$N"
