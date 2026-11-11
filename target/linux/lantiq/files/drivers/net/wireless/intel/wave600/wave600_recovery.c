@@ -154,6 +154,8 @@ static void wave600_recovery_work_fn(struct work_struct *work)
 		struct wave600_radio *r = &wdev->radios[i];
 		r->radio_enabled = false;
 		r->vap_added = false;
+		memset(r->stations, 0, sizeof(r->stations));
+		r->num_stations = 0;
 		if (r->ndev) {
 			netif_carrier_off(r->ndev);
 			netif_tx_stop_all_queues(r->ndev);

@@ -343,7 +343,6 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 					sta->last_rx = jiffies;
 				}
 			}
-			radio->sta_last_rx = jiffies;
 		}
 
 recycle_reuse:
@@ -501,7 +500,6 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 					napi_gro_receive(&dma->napi, rskb);
 					radio->ndev->stats.rx_packets++;
 					radio->ndev->stats.rx_bytes += len;
-					radio->sta_last_rx = jiffies;
 					if (!is_multicast_ether_addr(eth->h_source)) {
 						struct wave600_station *sta = wave600_find_sta(radio, eth->h_source);
 						if (sta) {
