@@ -98,6 +98,8 @@ struct wave600_stats {
 	int la_mcs_off;
 	int la_nss_off;
 	int la_scp_off;
+	atomic_t telemetry_busy;
+	unsigned long last_telemetry_jiffies;
 };
 
 struct wave600_efuse_afe {
@@ -135,12 +137,7 @@ struct wave600_radio {
 	u64 mgmt_tx_cookie;
 
 	/* Station tracking */
-	bool sta_connected;
 	bool is_secure;
-	u8 sta_mac[ETH_ALEN];
-	u16 sta_sid;
-	u32 sta_connect_time;
-	unsigned long sta_last_rx;
 	s8 sta_signal;
 	struct wave600_station stations[WAVE600_MAX_STATIONS];
 	u16 num_stations;

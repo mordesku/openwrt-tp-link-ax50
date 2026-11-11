@@ -582,8 +582,16 @@ void wave600_stats_update_telemetry(struct wave600_dev *wdev)
 	if (wdev->state != W600_STATE_RUNNING || atomic_read(&wdev->in_recovery))
 		return;
 
-	if (!wdev->radios[0].sta_connected && !wdev->radios[1].sta_connected &&
-	    !wdev->radios[0].num_stations && !wdev->radios[1].num_stations)
+	if (atomic_cmpxchg(&stats->telemetry_busy, 0, 1) != 0)
+		return;
+
+	if (stats->last_telemetry_jiffies &&
+	    time_before(jiffies, stats->last_telemetry_jiffies + msecs_to_jiffies(500)))
+		goto out;
+
+	stats->last_telemetry_jiffies = jiffies;
+
+	if (!wdev->radios[0].num_stations && !wdev->radios[1].num_stations)
 		return;
 
 	/* 1. Fetch PHY Status via UMI 0x040F */
@@ -720,6 +728,9 @@ void wave600_stats_update_telemetry(struct wave600_dev *wdev)
 			}
 		}
 	}
+
+out:
+	atomic_set(&stats->telemetry_busy, 0);
 }
 
 static int wave600_fw_stats_dump(struct wave600_dev *wdev, char *out,

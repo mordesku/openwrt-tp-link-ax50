@@ -996,8 +996,6 @@ int wave600_radio_find_sid(struct wave600_radio *radio, const u8 *mac)
 		if (radio->stations[i].valid && ether_addr_equal(radio->stations[i].mac, mac))
 			return (int)radio->stations[i].sid;
 	}
-	if (radio->sta_connected && ether_addr_equal(radio->sta_mac, mac))
-		return (int)radio->sta_sid;
 	return -ENOENT;
 }
 
@@ -1055,6 +1053,80 @@ static void wave600_del_sta_entry(struct wave600_radio *radio, const u8 *mac)
 		if (radio->num_stations > 0)
 			radio->num_stations--;
 	}
+}
+
+static void wave600_teardown_station(struct wave600_radio *radio, struct wave600_station *sta)
+{
+	struct wave600_dev *wdev = radio->wdev;
+	struct wave600_umi_stop_traffic sreq, scfm;
+	struct wave600_umi_sta_remove req, cfm;
+	struct wave600_umi_remove_sid rreq, rcfm;
+	u8 del_mac[ETH_ALEN];
+	u16 sid;
+	int ret;
+
+	if (!sta || !sta->valid)
+		return;
+
+	sid = sta->sid;
+	ether_addr_copy(del_mac, sta->mac);
+
+	dev_dbg(wdev->dev, "Radio %u teardown station %pM (sid %u)\n",
+		radio->radio_idx, del_mac, sid);
+
+	/* 1. Stop traffic queues before removing station (vendor core_ap_stop_traffic) */
+	memset(&sreq, 0, sizeof(sreq));
+	sreq.sid = cpu_to_le16(sid);
+	sreq.status = 0;
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_STOP_TRAFFIC_REQ,
+				    WAVE600_MC_MAN_STOP_TRAFFIC_CFM,
+				    &sreq, sizeof(sreq), &scfm, sizeof(scfm), 2000,
+				    radio->vap_id);
+	if (ret)
+		dev_warn(wdev->dev, "Radio %u STOP_TRAFFIC IPC failed: %d\n", radio->radio_idx, ret);
+	else if (scfm.status)
+		dev_warn(wdev->dev, "Radio %u STOP_TRAFFIC rejected by FW: status=%u\n",
+			 radio->radio_idx, scfm.status);
+
+	/* Allow Lower MAC ARC to finish draining and confirming queues */
+	usleep_range(2000, 4000);
+
+	/* 2. Remove station from Upper MAC ARC firmware (vendor core_ap_remove_sta) */
+	memset(&req, 0, sizeof(req));
+	req.sid = cpu_to_le16(sid);
+	req.status = 0;
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_STA_REMOVE_REQ,
+				    WAVE600_MC_MAN_STA_REMOVE_CFM,
+				    &req, sizeof(req), &cfm, sizeof(cfm), 2000,
+				    radio->vap_id);
+	if (ret)
+		dev_warn(wdev->dev, "Radio %u STA_REMOVE IPC failed: %d\n", radio->radio_idx, ret);
+	else if (cfm.status)
+		dev_warn(wdev->dev, "Radio %u STA_REMOVE rejected by FW: status=%u\n",
+			 radio->radio_idx, cfm.status);
+
+	/* Allow Upper MAC ARC to finalize STA close confirmation before releasing hardware SID */
+	usleep_range(2000, 4000);
+
+	/* 3. Release SID in ARC firmware hardware table (vendor core.c:14879 UM_MAN_REMOVE_SID_REQ) */
+	memset(&rreq, 0, sizeof(rreq));
+	rreq.sid = cpu_to_le16(sid);
+	rreq.status = 0;
+	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
+				    WAVE600_UM_MAN_REMOVE_SID_REQ,
+				    WAVE600_MC_MAN_REMOVE_SID_CFM,
+				    &rreq, sizeof(rreq), &rcfm, sizeof(rcfm), 2000,
+				    radio->vap_id);
+	if (ret)
+		dev_warn(wdev->dev, "Radio %u REMOVE_SID IPC failed: %d\n", radio->radio_idx, ret);
+	else if (rcfm.status)
+		dev_warn(wdev->dev, "Radio %u REMOVE_SID rejected by FW: status=%u\n",
+			 radio->radio_idx, rcfm.status);
+
+	/* 4. Delete entry from local driver table */
+	wave600_del_sta_entry(radio, del_mac);
 }
 
 static int wave600_send_set_bss(struct wave600_radio *radio,
@@ -2182,6 +2254,15 @@ static int wave600_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *ndev
 	if (!radio->ap_started && !radio->vap_added)
 		return 0;
 
+	if (wdev->state != W600_STATE_RUNNING || atomic_read(&wdev->in_recovery)) {
+		netif_tx_stop_all_queues(ndev);
+		netif_carrier_off(ndev);
+		radio->vap_added = false;
+		radio->radio_enabled = false;
+		radio->ap_started = false;
+		return 0;
+	}
+
 	netif_tx_stop_all_queues(ndev);
 	netif_carrier_off(ndev);
 
@@ -2228,10 +2309,7 @@ static int wave600_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *ndev
 
 	radio->ap_started = false;
 	memset(&radio->chandef, 0, sizeof(radio->chandef));
-	radio->sta_connected = false;
-	radio->sta_sid = 0;
 	radio->is_secure = false;
-	eth_zero_addr(radio->sta_mac);
 	memset(radio->stations, 0, sizeof(radio->stations));
 	radio->num_stations = 0;
 	return 0;
@@ -2596,6 +2674,19 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 		radio->radio_idx, mac, params ? params->aid : 0);
 
 	/*
+	 * If this MAC already has a stale entry (e.g. reconnection without prior deauth),
+	 * perform complete 3-step teardown first so ARC state machine resets cleanly.
+	 */
+	{
+		struct wave600_station *old_sta = wave600_find_sta(radio, mac);
+		if (old_sta) {
+			dev_dbg(wdev->dev, "Radio %u add_station: tearing down stale station %pM (sid %u)\n",
+				radio->radio_idx, mac, old_sta->sid);
+			wave600_teardown_station(radio, old_sta);
+		}
+	}
+
+	/*
 	 * Step 1: Request a Station ID (SID) from FullMAC firmware.
 	 * Vendor core_config.c:1036-1080 core_cfg_internal_request_sid sends
 	 * UM_MAN_REQUEST_SID_REQ (0x0442) so the ARC hardware receiver table
@@ -2765,15 +2856,7 @@ static int wave600_cfg80211_add_station(struct wiphy *wiphy,
 			sta->signal = radio->sta_signal;
 			sta->signal_avg = radio->sta_signal;
 		}
-
-		/* Fetch initial live telemetry from FullMAC firmware */
-		wave600_stats_update_telemetry(radio->wdev);
 	}
-	radio->sta_connected = true;
-	radio->sta_sid = sid;
-	radio->sta_connect_time = ktime_get_seconds();
-	radio->sta_last_rx = jiffies;
-	ether_addr_copy(radio->sta_mac, mac);
 	dev_dbg(wdev->dev, "Radio %u STA_ADD %pM confirmed: status=%u sid=%u (flags=0x%02x flags_ext=0x%02x HE=%d VHT=%d HT=%d)\n",
 		radio->radio_idx, mac, cfm.status, sid, req.flags, req.flags_ext,
 		sta ? sta->is_he : 0, sta ? sta->is_vht : 0, sta ? sta->is_ht : 0);
@@ -2789,7 +2872,7 @@ static int wave600_cfg80211_change_station(struct wiphy *wiphy,
 	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
 	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_station *sta = wave600_find_sta(radio, mac);
-	int sid = sta ? (int)sta->sid : (ether_addr_equal(mac, radio->sta_mac) ? (int)radio->sta_sid : -ENOENT);
+	int sid = sta ? (int)sta->sid : -ENOENT;
 
 	dev_dbg(wdev->dev, "Radio %u cfg80211: change station %pM (aid %u, flags_set=0x%x sid=%d)\n",
 		radio->radio_idx, mac, params ? params->aid : 0, params ? params->sta_flags_set : 0, sid);
@@ -2817,6 +2900,9 @@ static int wave600_cfg80211_change_station(struct wiphy *wiphy,
 		if (ret)
 			dev_warn(wdev->dev, "Radio %u SET_802_1X_FILTER IPC failed: %d\n",
 				 radio->radio_idx, ret);
+		else if (cfm.status)
+			dev_warn(wdev->dev, "Radio %u SET_802_1X_FILTER rejected by FW: status=%u\n",
+				 radio->radio_idx, le16_to_cpu(cfm.status));
 		else {
 			if (sta)
 				sta->is_authorized = true;
@@ -2834,81 +2920,31 @@ static int wave600_cfg80211_del_station(struct wiphy *wiphy,
 {
 	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
 	struct wave600_dev *wdev = radio->wdev;
-	struct wave600_umi_stop_traffic sreq;
-	struct wave600_umi_stop_traffic scfm;
-	struct wave600_umi_sta_remove req;
-	struct wave600_umi_sta_remove cfm;
-	struct wave600_umi_remove_sid rreq;
-	struct wave600_umi_remove_sid rcfm;
 	struct wave600_station *sta = NULL;
-	const u8 *del_mac = NULL;
-	u16 sid = 0;
-	int ret;
+	int i;
 
-	if (!radio->ap_started)
+	if (!radio->ap_started || atomic_read(&wdev->in_recovery) ||
+	    wdev->state != W600_STATE_RUNNING) {
+		if (params && params->mac)
+			wave600_del_sta_entry(radio, params->mac);
 		return 0;
+	}
 
 	if (params && params->mac) {
-		del_mac = params->mac;
-		sta = wave600_find_sta(radio, del_mac);
-		if (sta)
-			sid = sta->sid;
-		else if (radio->sta_connected && ether_addr_equal(del_mac, radio->sta_mac))
-			sid = radio->sta_sid;
-		else
-			return 0;
-	} else if (radio->sta_connected) {
-		del_mac = radio->sta_mac;
-		sid = radio->sta_sid;
-	} else {
+		sta = wave600_find_sta(radio, params->mac);
+		if (!sta)
+			return 0; /* Station already removed - nothing to do */
+
+		wave600_teardown_station(radio, sta);
 		return 0;
 	}
 
-	dev_dbg(wdev->dev, "Radio %u cfg80211: del station %pM (sid %u)\n",
-		radio->radio_idx, del_mac, sid);
-
-	/* Stop traffic queues before removing station to prevent FW assertion 0x03c2 */
-	memset(&sreq, 0, sizeof(sreq));
-	sreq.sid = cpu_to_le16(sid);
-	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
-				    WAVE600_UM_MAN_STOP_TRAFFIC_REQ,
-				    WAVE600_MC_MAN_STOP_TRAFFIC_CFM,
-				    &sreq, sizeof(sreq), &scfm, sizeof(scfm), 2000,
-				    radio->vap_id);
-	if (ret)
-		dev_warn(wdev->dev, "Radio %u STOP_TRAFFIC IPC failed: %d\n", radio->radio_idx, ret);
-
-	memset(&req, 0, sizeof(req));
-	req.sid = cpu_to_le16(sid);
-	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
-				    WAVE600_UM_MAN_STA_REMOVE_REQ,
-				    WAVE600_MC_MAN_STA_REMOVE_CFM,
-				    &req, sizeof(req), &cfm, sizeof(cfm), 2000,
-				    radio->vap_id);
-	if (ret)
-		dev_warn(wdev->dev, "Radio %u STA_REMOVE IPC failed: %d\n", radio->radio_idx, ret);
-
-	/* Release SID in ARC firmware hardware table (vendor core.c:14879 UM_MAN_REMOVE_SID_REQ) */
-	memset(&rreq, 0, sizeof(rreq));
-	rreq.sid = cpu_to_le16(sid);
-	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
-				    WAVE600_UM_MAN_REMOVE_SID_REQ,
-				    WAVE600_MC_MAN_REMOVE_SID_CFM,
-				    &rreq, sizeof(rreq), &rcfm, sizeof(rcfm), 2000,
-				    radio->vap_id);
-	if (ret)
-		dev_warn(wdev->dev, "Radio %u REMOVE_SID IPC failed: %d\n", radio->radio_idx, ret);
-
-	if (del_mac)
-		wave600_del_sta_entry(radio, del_mac);
-
-	if (radio->num_stations == 0) {
-		radio->sta_connected = false;
-		radio->sta_sid = 0;
-		radio->sta_connect_time = 0;
-		radio->sta_last_rx = 0;
-		eth_zero_addr(radio->sta_mac);
+	/* Flush all stations on this radio */
+	for (i = 0; i < WAVE600_MAX_STATIONS; i++) {
+		if (radio->stations[i].valid)
+			wave600_teardown_station(radio, &radio->stations[i]);
 	}
+
 	return 0;
 }
 
@@ -2923,11 +2959,8 @@ static int wave600_cfg80211_get_station(struct wiphy *wiphy,
 	if (!radio)
 		return -ENOENT;
 
-	/* Fetch live metrics directly from FullMAC firmware via DMA */
-	wave600_stats_update_telemetry(radio->wdev);
-
 	sta = wave600_find_sta(radio, mac);
-	if (!sta && !(radio->sta_connected && ether_addr_equal(mac, radio->sta_mac)))
+	if (!sta)
 		return -ENOENT;
 
 	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_INACTIVE_TIME) |
@@ -2937,59 +2970,42 @@ static int wave600_cfg80211_get_station(struct wiphy *wiphy,
 			 BIT_ULL(NL80211_STA_INFO_RX_PACKETS) |
 			 BIT_ULL(NL80211_STA_INFO_TX_PACKETS);
 
-	if (sta) {
-		sinfo->inactive_time = jiffies_to_msecs(jiffies - sta->last_rx);
-		sinfo->connected_time = ktime_get_seconds() - sta->connect_time;
-		if (sta->signal < 0 && sta->signal >= -100) {
-			sinfo->signal = sta->signal;
-			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
-		}
-		if (sta->signal_avg < 0 && sta->signal_avg >= -100) {
-			sinfo->signal_avg = sta->signal_avg;
-			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG);
-		}
-		sinfo->rx_bytes = sta->rx_bytes;
-		sinfo->tx_bytes = sta->tx_bytes;
-		sinfo->rx_packets = sta->rx_packets;
-		sinfo->tx_packets = sta->tx_packets;
+	sinfo->inactive_time = jiffies_to_msecs(jiffies - sta->last_rx);
+	sinfo->connected_time = ktime_get_seconds() - sta->connect_time;
+	if (sta->signal < 0 && sta->signal >= -100) {
+		sinfo->signal = sta->signal;
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+	}
+	if (sta->signal_avg < 0 && sta->signal_avg >= -100) {
+		sinfo->signal_avg = sta->signal_avg;
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG);
+	}
+	sinfo->rx_bytes = sta->rx_bytes;
+	sinfo->tx_bytes = sta->tx_bytes;
+	sinfo->rx_packets = sta->rx_packets;
+	sinfo->tx_packets = sta->tx_packets;
 
-		/* Live TX Rate from firmware telemetry */
-		if (sta->tx_bitrate > 0) {
-			sinfo->txrate.legacy = sta->tx_bitrate;
-			sinfo->txrate.bw = sta->tx_bw;
-			sinfo->txrate.nss = sta->tx_nss;
-			sinfo->txrate.mcs = sta->tx_mcs;
-			sinfo->txrate.flags = sta->tx_flags;
-			sinfo->txrate.he_gi = sta->tx_gi;
-			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
-		}
+	/* Live TX Rate from firmware telemetry */
+	if (sta->tx_bitrate > 0) {
+		sinfo->txrate.legacy = sta->tx_bitrate;
+		sinfo->txrate.bw = sta->tx_bw;
+		sinfo->txrate.nss = sta->tx_nss;
+		sinfo->txrate.mcs = sta->tx_mcs;
+		sinfo->txrate.flags = sta->tx_flags;
+		sinfo->txrate.he_gi = sta->tx_gi;
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
+	}
 
-		/* Live RX Rate from firmware telemetry */
-		if (sta->rx_bitrate > 0) {
-			sinfo->rxrate.legacy = sta->rx_bitrate;
-			sinfo->rxrate.bw = sta->rx_bw;
-			sinfo->rxrate.nss = sta->rx_nss;
-			sinfo->rxrate.mcs = sta->rx_mcs;
-			sinfo->rxrate.flags = sta->rx_flags;
-			sinfo->rxrate.he_gi = sta->rx_gi;
-			sinfo->rxrate.he_dcm = sta->rx_dcm;
-			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
-		}
-	} else {
-		sinfo->inactive_time = jiffies_to_msecs(jiffies - radio->sta_last_rx);
-		sinfo->connected_time = ktime_get_seconds() - radio->sta_connect_time;
-		if (radio->sta_signal < 0 && radio->sta_signal >= -100) {
-			sinfo->signal = radio->sta_signal;
-			sinfo->signal_avg = radio->sta_signal;
-			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL) |
-					 BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG);
-		}
-		if (radio->ndev) {
-			sinfo->rx_bytes = radio->ndev->stats.rx_bytes;
-			sinfo->tx_bytes = radio->ndev->stats.tx_bytes;
-			sinfo->rx_packets = radio->ndev->stats.rx_packets;
-			sinfo->tx_packets = radio->ndev->stats.tx_packets;
-		}
+	/* Live RX Rate from firmware telemetry */
+	if (sta->rx_bitrate > 0) {
+		sinfo->rxrate.legacy = sta->rx_bitrate;
+		sinfo->rxrate.bw = sta->rx_bw;
+		sinfo->rxrate.nss = sta->rx_nss;
+		sinfo->rxrate.mcs = sta->rx_mcs;
+		sinfo->rxrate.flags = sta->rx_flags;
+		sinfo->rxrate.he_gi = sta->rx_gi;
+		sinfo->rxrate.he_dcm = sta->rx_dcm;
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
 	}
 
 	return 0;
@@ -3015,11 +3031,6 @@ static int wave600_cfg80211_dump_station(struct wiphy *wiphy,
 			}
 			count++;
 		}
-	}
-
-	if (count == 0 && radio->sta_connected && idx == 0) {
-		ether_addr_copy(mac, radio->sta_mac);
-		return wave600_cfg80211_get_station(wiphy, ndev, mac, sinfo);
 	}
 
 	return -ENOENT;
@@ -3074,7 +3085,12 @@ static int wave600_cfg80211_add_key(struct wiphy *wiphy,
 			radio->radio_idx, sid, key_index, params->key_len);
 	} else if (pairwise && mac_addr) {
 		int sta_sid = wave600_radio_find_sid(radio, mac_addr);
-		sid = (sta_sid >= 0) ? (u16)sta_sid : radio->sta_sid;
+		if (sta_sid < 0) {
+			dev_warn(wdev->dev, "Radio %u add_key: station %pM not found\n",
+				 radio->radio_idx, mac_addr);
+			return -ENOENT;
+		}
+		sid = (u16)sta_sid;
 		key_type = WAVE600_UMI_RSN_PAIRWISE_KEY;
 		dev_dbg(wdev->dev, "Radio %u add_key (PAIRWISE): STA %pM sid=%u key_idx=%u cipher=0x%04x len=%u\n",
 			radio->radio_idx, mac_addr, sid, key_index, u16_cipher, params->key_len);

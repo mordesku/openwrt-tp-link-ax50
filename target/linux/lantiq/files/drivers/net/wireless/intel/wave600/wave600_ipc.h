@@ -361,12 +361,11 @@ struct wave600_umi_stop_traffic {
 	u8 reserved;
 } __packed;
 
-/* Vendor UMI_802_1X_FILTER (0x0446) */
+/* Vendor UMI_802_1X_FILTER (0x0446) - exactly 5 bytes per vendor mhi_umi.h:2899 */
 struct wave600_umi_802_1x_filter {
 	__le16 status;
 	__le16 sid;
 	u8 is_filter_open;
-	u8 reserved;
 } __packed;
 
 #define WAVE600_UMI_RSN_SEQ_NUM_LEN 8 /* 6 bytes seq num + 2 bytes pad */
