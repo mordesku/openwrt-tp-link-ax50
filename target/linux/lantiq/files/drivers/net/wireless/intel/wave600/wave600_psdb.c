@@ -557,7 +557,21 @@ int wave600_psdb_regd_limits(struct wave600_dev *wdev, u8 regd_code, u8 chan_num
 		u32 pwl = psdb_rd32(e + 16);
 		int slot = -1;
 
-		if (code != regd_code || e_freq != freq)
+		u32 target_freq = freq;
+
+		if (code != regd_code)
+			continue;
+
+		if (chan_num > 14) {
+			if (chanwidth == 40)
+				target_freq = wave600_chan_to_subband_cf(chan_num, 1);
+			else if (chanwidth == 80)
+				target_freq = wave600_chan_to_subband_cf(chan_num, 2);
+			else if (chanwidth == 160)
+				target_freq = wave600_chan_to_subband_cf(chan_num, 3);
+		}
+
+		if (e_freq != target_freq)
 			continue;
 
 		/* vendor _get_regd_entry_phy_cw */

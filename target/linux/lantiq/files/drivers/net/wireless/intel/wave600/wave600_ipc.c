@@ -272,6 +272,25 @@ static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 			} else if (msg_id == WAVE600_MC_MAN_CLASS3_ERROR_IND) {
 				dev_dbg(wdev->dev, "class 3 error ind (0x3304) on radio %u vap %u (slot %u)\n",
 					radio, vap, idx);
+			} else if (msg_id == WAVE600_MC_MAN_RADAR_IND) {
+				struct wave600_radio *r = (radio == 1) ? &wdev->radios[1] : &wdev->radios[0];
+
+				dev_warn(wdev->dev, "RADAR detected on radio %u vap %u (slot %u)\n",
+					 radio, vap, idx);
+				if (r) {
+					if (r->cac_in_progress) {
+						dev_warn(wdev->dev, "Radio %u Radar detected during CAC! Aborting CAC.\n",
+							 radio);
+						cancel_delayed_work(&r->cac_work);
+						r->cac_in_progress = false;
+						cfg80211_cac_event(r->ndev, &r->cac_chandef,
+								   NL80211_RADAR_CAC_ABORTED, GFP_ATOMIC, 0);
+					} else if (r->ap_started) {
+						dev_warn(wdev->dev, "Radio %u Radar detected while AP operating! Notifying hostapd for CSA.\n",
+							 radio);
+						cfg80211_radar_event(r->wiphy, &r->chandef, GFP_ATOMIC);
+					}
+				}
 			} else {
 				dev_info_ratelimited(wdev->dev, "asynchronous indication 0x%04x on radio %u vap %u (slot %u)\n",
 						     msg_id, radio, vap, idx);

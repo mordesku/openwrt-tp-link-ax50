@@ -126,6 +126,7 @@ struct wave600_radio {
 	struct wireless_dev *wdev_net;
 	bool ap_started;
 	bool radio_enabled;
+	bool vap_added;
 	struct cfg80211_chan_def chandef;
 	u16 ap_channel;
 	u8 ap_width;
@@ -155,6 +156,12 @@ struct wave600_radio {
 	u16 beacon_interval;
 	u16 dtim_period;
 	struct wave600_umi_beacon_set beacon_set_params;
+
+	/* DFS / CAC tracking */
+	bool cac_in_progress;
+	struct cfg80211_chan_def cac_chandef;
+	u32 cac_time_ms;
+	struct delayed_work cac_work;
 };
 
 struct wave600_dev {
