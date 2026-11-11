@@ -1,5 +1,7 @@
 {
 	"pci": [		
+		[ "0x8086", "0x09d0", "0x8086", "0x0000", 0, 0, "Intel/MaxLinear", "WAV654 (wave600)" ],
+		[ "0x1bef", "0x09d0", "0xffff", "0xffff", 0, 0, "Intel/MaxLinear", "WAV654 (wave600)" ],
 		[ "0x0777", "0x11ac", "0x0777", "0xe7f9", 0, 0, "Ubiquiti", "LiteBeam, 5AC" ],
 		[ "0xffff", "0xffff", "0xffff", "0xb102", 0, 0, "Ubiquiti", "PowerStation2, (18V)" ],
 		[ "0xffff", "0xffff", "0xffff", "0xb202", 0, 0, "Ubiquiti", "PowerStation2, (16D)" ],

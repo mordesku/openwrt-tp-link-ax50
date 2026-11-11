@@ -582,6 +582,9 @@ void wave600_stats_update_telemetry(struct wave600_dev *wdev)
 	if (wdev->state != W600_STATE_RUNNING || atomic_read(&wdev->in_recovery))
 		return;
 
+	if (!wdev->radios[0].num_stations && !wdev->radios[1].num_stations)
+		return;
+
 	if (atomic_cmpxchg(&stats->telemetry_busy, 0, 1) != 0)
 		return;
 
@@ -590,9 +593,6 @@ void wave600_stats_update_telemetry(struct wave600_dev *wdev)
 		goto out;
 
 	stats->last_telemetry_jiffies = jiffies;
-
-	if (!wdev->radios[0].num_stations && !wdev->radios[1].num_stations)
-		return;
 
 	/* 1. Fetch PHY Status via UMI 0x040F */
 	if (stats->phy_db) {
@@ -697,14 +697,14 @@ void wave600_stats_update_telemetry(struct wave600_dev *wdev)
 					sta->tx_gi = (scp == 1) ? NL80211_RATE_INFO_HE_GI_0_8 :
 						     ((scp == 2) ? NL80211_RATE_INFO_HE_GI_1_6 :
 								   NL80211_RATE_INFO_HE_GI_3_2);
-				} else if (pmode == 3) { /* VHT */
+				} else if (pmode == 3 && radio->radio_idx != 0) { /* VHT (5 GHz) */
 					sta->tx_flags = RATE_INFO_FLAGS_VHT_MCS | (scp ? RATE_INFO_FLAGS_SHORT_GI : 0);
 					sta->tx_mcs = mcs <= 9 ? mcs : 9;
 					sta->tx_nss = nss;
-				} else if (pmode == 2) { /* HT */
+				} else if (pmode == 2 || (pmode == 3 && radio->radio_idx == 0)) { /* HT (802.11n / 2.4 GHz) */
 					sta->tx_flags = RATE_INFO_FLAGS_MCS | (scp ? RATE_INFO_FLAGS_SHORT_GI : 0);
-					sta->tx_mcs = mcs <= 31 ? mcs : 15;
-					sta->tx_nss = (sta->tx_mcs / 8) + 1;
+					sta->tx_mcs = (nss - 1) * 8 + (mcs <= 7 ? mcs : 7);
+					sta->tx_nss = nss;
 				} else { /* Legacy */
 					sta->tx_flags = 0;
 					sta->tx_mcs = mcs <= 7 ? mcs : 7;
@@ -720,7 +720,10 @@ void wave600_stats_update_telemetry(struct wave600_dev *wdev)
 				else
 					sta->tx_bw = RATE_INFO_BW_20;
 
-				tx_r = wave600_calc_bitrate(pmode, cbw, scp, sta->tx_mcs, sta->tx_nss);
+				{
+					u8 eff_mode = (pmode == 3 && radio->radio_idx == 0) ? 2 : pmode;
+					tx_r = wave600_calc_bitrate(eff_mode, cbw, scp, sta->tx_mcs, sta->tx_nss);
+				}
 				if (tx_r > 0)
 					sta->tx_bitrate = tx_r;
 

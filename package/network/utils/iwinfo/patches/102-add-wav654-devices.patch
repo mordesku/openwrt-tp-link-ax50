@@ -1,0 +1,7 @@
+--- a/devices.txt
++++ b/devices.txt
+@@ -3,4 +3,6 @@
+ # txpower offset | frequency offset | "vendor name" | "device name"
++0x8086 0x09d0 0x8086 0x0000    0      0  "Intel/MaxLinear" "WAV654 (wave600)"
++0x1bef 0x09d0 0xffff 0xffff    0      0  "Intel/MaxLinear" "WAV654 (wave600)"
+ 0x0777 0x11ac 0x0777 0xe7f9    0      0  "Ubiquiti" "LiteBeam 5AC"

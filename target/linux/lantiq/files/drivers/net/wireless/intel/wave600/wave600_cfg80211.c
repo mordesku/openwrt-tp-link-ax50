@@ -2327,6 +2327,7 @@ static int wave600_cfg80211_change_beacon(struct wiphy *wiphy, struct net_device
 }
 
 static int wave600_cfg80211_set_channel(struct wiphy *wiphy,
+					struct net_device *dev,
 					struct cfg80211_chan_def *chandef)
 {
 	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
