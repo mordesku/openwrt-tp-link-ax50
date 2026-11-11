@@ -150,6 +150,12 @@ struct wave600_umi_logger_set_severity {
 #define WAVE600_MC_MAN_SET_TXOP_CONFIG_CFM      WAVE600_UMI_MSG_MAN_CFM(0x75) /* 0x1475 */
 #define WAVE600_UM_MAN_HE_MU_OPERATION_CONFIG_REQ WAVE600_UMI_MSG_MAN_REQ(0x7A) /* 0x047A */
 #define WAVE600_MC_MAN_HE_MU_OPERATION_CONFIG_CFM WAVE600_UMI_MSG_MAN_CFM(0x7A) /* 0x147A */
+#define WAVE600_UM_MAN_TS_VAP_CONFIGURE_REQ     WAVE600_UMI_MSG_MAN_REQ(0x65) /* 0x0465 */
+#define WAVE600_MC_MAN_TS_VAP_CONFIGURE_CFM     WAVE600_UMI_MSG_MAN_CFM(0x65) /* 0x1465 */
+#define WAVE600_UM_MAN_MSDU_IN_AMSDU_CONFIG_REQ WAVE600_UMI_MSG_MAN_REQ(0x66) /* 0x0466 */
+#define WAVE600_MC_MAN_MSDU_IN_AMSDU_CONFIG_CFM WAVE600_UMI_MSG_MAN_CFM(0x66) /* 0x1466 */
+#define WAVE600_UM_MAN_MAX_MPDU_LENGTH_REQ      WAVE600_UMI_MSG_MAN_REQ(0x6B) /* 0x046B */
+#define WAVE600_MC_MAN_MAX_MPDU_LENGTH_CFM      WAVE600_UMI_MSG_MAN_CFM(0x6B) /* 0x146B */
 
 /* Firmware-initiated events (UMI_MSG_MAN_IND(type, dir=IND, num)) */
 #define WAVE600_MC_MAN_CLASS3_ERROR_IND          WAVE600_UMI_MSG(WAVE600_MSG_IND, WAVE600_MSG_TYPE_MAN_IND, 0x04) /* 0x3304 */
@@ -283,6 +289,30 @@ struct wave600_umi_txop_config {
 	u8 mode;
 	u8 get_set_operation;
 	u8 reserved[2];
+} __packed;
+
+/* Vendor UMI_TS_VAP_CONFIGURE (0x0465) */
+struct wave600_umi_ts_vap_configure {
+	u8 get_set_op;
+	u8 vap_id;
+	u8 enable_ba;
+	u8 amsdu_support;
+	__le32 window_size;
+} __packed;
+
+/* Vendor UMI_MSDU_IN_AMSDU_CONFIG (0x0466) */
+struct wave600_umi_msdu_in_amsdu_config {
+	u8 get_set_op;
+	u8 ht_msdu_in_amsdu;
+	u8 vht_msdu_in_amsdu;
+	u8 he_msdu_in_amsdu;
+} __packed;
+
+/* Vendor UMI_MAX_MPDU (0x046B) */
+struct wave600_umi_max_mpdu {
+	__le32 max_mpdu_length;
+	u8 get_set_op;
+	u8 reserved[3];
 } __packed;
 
 /* Vendor UMI_STA_ADD (0x043B) */

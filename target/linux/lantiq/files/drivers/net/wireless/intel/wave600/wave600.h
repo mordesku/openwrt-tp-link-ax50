@@ -126,6 +126,7 @@ struct wave600_radio {
 	struct wireless_dev *wdev_net;
 	bool ap_started;
 	bool radio_enabled;
+	struct cfg80211_chan_def chandef;
 	u16 ap_channel;
 	u8 ap_width;
 	u32 ap_freq;
