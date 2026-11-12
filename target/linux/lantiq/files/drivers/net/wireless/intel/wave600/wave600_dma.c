@@ -357,7 +357,7 @@ recycle_reuse:
 	return processed;
 }
 
-static int wave600_dma_tx_clean(struct wave600_dma *dma, int budget)
+static int wave600_dma_tx_clean_locked(struct wave600_dma *dma, int budget)
 {
 	struct wave600_dev *wdev = dma->wdev;
 	struct wave600_dma_ring *r = &dma->tx;
@@ -373,18 +373,13 @@ static int wave600_dma_tx_clean(struct wave600_dma *dma, int budget)
 	while (processed < hds) {
 		struct wave600_host_dsc *hd = &r->descs[r->read_ptr];
 		u32 bd = FIELD_GET(W600_TX_BD_INDEX, le32_to_cpu(hd->bd_index));
-		unsigned long flags;
 
 		if (bd < WAVE600_DMA_RING_SIZE && dma->tx_skbs[bd]) {
-			spin_lock_irqsave(&dma->tx_lock, flags);
-			if (dma->tx_skbs[bd]) {
-				dma_unmap_single(wdev->dev, dma->tx_dma[bd],
-						 dma->tx_len[bd], DMA_TO_DEVICE);
-				dev_kfree_skb_any(dma->tx_skbs[bd]);
-				dma->tx_skbs[bd] = NULL;
-				dma->tx_in_use--;
-			}
-			spin_unlock_irqrestore(&dma->tx_lock, flags);
+			dma_unmap_single(wdev->dev, dma->tx_dma[bd],
+					 dma->tx_len[bd], DMA_TO_DEVICE);
+			dev_kfree_skb_any(dma->tx_skbs[bd]);
+			dma->tx_skbs[bd] = NULL;
+			dma->tx_in_use--;
 		}
 		dma->tx_done++;
 		processed++;
@@ -392,7 +387,31 @@ static int wave600_dma_tx_clean(struct wave600_dma *dma, int budget)
 	}
 
 	ring_clear_interrupt(r, processed);
+
+	if (dma->tx_in_use < WAVE600_DMA_RING_SIZE - 64) {
+		int i;
+
+		for (i = 0; i < 2; i++) {
+			struct net_device *ndev = wdev->radios[i].ndev;
+
+			if (ndev && netif_queue_stopped(ndev))
+				netif_wake_queue(ndev);
+		}
+	}
+
 	return processed;
+}
+
+int wave600_dma_tx_clean(struct wave600_dma *dma, int budget)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&dma->tx_lock, flags);
+	ret = wave600_dma_tx_clean_locked(dma, budget);
+	spin_unlock_irqrestore(&dma->tx_lock, flags);
+
+	return ret;
 }
 
 /*
@@ -829,12 +848,29 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		return NETDEV_TX_OK;
 	}
 
+	if (!is_multicast_ether_addr(skb->data)) {
+		int sid = wave600_radio_find_sid(radio, skb->data);
+
+		if (sid < 0) {
+			/*
+			 * Drop unicast frames for stations not associated on
+			 * this radio (e.g. frames flooded across br-lan to both
+			 * 2.4G and 5G APs, or frames to recently disconnected STAs).
+			 * Never push unassociated destinations to ARC firmware as
+			 * firmware does not complete them, permanently exhausting
+			 * the host TX ring.
+			 */
+			goto drop;
+		}
+	}
+
 	dma_addr = dma_map_single(wdev->dev, skb->data, skb->len,
 				  DMA_TO_DEVICE);
 	if (dma_mapping_error(wdev->dev, dma_addr))
 		goto drop;
 
 	spin_lock_irqsave(&dma->tx_lock, flags);
+	wave600_dma_tx_clean_locked(dma, 64);
 	bd = dma->tx_write;
 	if (dma->tx_skbs[bd]) {
 		spin_unlock_irqrestore(&dma->tx_lock, flags);
@@ -846,6 +882,17 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	dma->tx_len[bd] = skb->len;
 	dma->tx_write = (dma->tx_write + 1) % WAVE600_DMA_RING_SIZE;
 	dma->tx_in_use++;
+
+	if (dma->tx_in_use >= WAVE600_DMA_RING_SIZE - 32) {
+		int i;
+
+		for (i = 0; i < 2; i++) {
+			struct net_device *d = wdev->radios[i].ndev;
+
+			if (d && !netif_queue_stopped(d))
+				netif_stop_queue(d);
+		}
+	}
 	spin_unlock_irqrestore(&dma->tx_lock, flags);
 
 	memset(&hd, 0, sizeof(hd));
@@ -861,6 +908,7 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		info0 |= W600_TX_MCF;
 	} else {
 		int sid = wave600_radio_find_sid(radio, skb->data);
+
 		if (sid >= 0)
 			info0 |= FIELD_PREP(W600_TX_STAID, (u16)sid);
 		else

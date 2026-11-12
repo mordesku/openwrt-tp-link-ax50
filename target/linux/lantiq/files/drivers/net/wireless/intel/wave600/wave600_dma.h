@@ -148,6 +148,7 @@ void wave600_dma_cleanup(struct wave600_dev *wdev);
 void wave600_dma_enable_napi(struct wave600_dev *wdev);
 bool wave600_dma_schedule_napi(struct wave600_dev *wdev);
 netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev);
+int wave600_dma_tx_clean(struct wave600_dma *dma, int budget);
 int wave600_dma_mgmt_tx(struct wave600_radio *radio, const u8 *buf, size_t len);
 int wave600_dma_mgmt_tx_eapol(struct wave600_radio *radio, const u8 *buf, size_t len);
 extern const struct net_device_ops wave600_netdev_ops;

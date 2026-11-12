@@ -32,6 +32,7 @@ static void wave600_pci_telemetry_work(struct work_struct *work)
 	struct wave600_dev *wdev =
 		container_of(work, struct wave600_dev, telemetry_work.work);
 
+	wave600_dma_tx_clean(&wdev->dma, WAVE600_DMA_RING_SIZE);
 	wave600_stats_update_telemetry(wdev);
 
 	if (wdev->state == W600_STATE_RUNNING)
