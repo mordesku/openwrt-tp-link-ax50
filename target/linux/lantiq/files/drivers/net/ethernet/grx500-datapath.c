@@ -3,6 +3,7 @@
 #include <linux/bitops.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
+#include <linux/ethtool.h>
 #include <linux/grx500-gswip.h>
 #include <linux/grx500-memory.h>
 #include <linux/if_vlan.h>
@@ -298,6 +299,9 @@ struct grx500_port {
 	struct net_device *ndev;
 	struct phy_device *phy;
 	bool opened;
+	bool link;
+	int speed;
+	int duplex;
 	struct grx500_tx_diagnostics tx_diag;
 };
 
@@ -1340,11 +1344,42 @@ static int grx500_cbm_start_port_dma(struct grx500_datapath *dp)
 static void grx500_adjust_link(struct net_device *ndev)
 {
 	struct grx500_port *port = grx500_port_priv(ndev);
+	struct grx500_datapath *dp = port->dp;
+	struct phy_device *phy = port->phy;
+	bool status_change = false;
 
-	if (port->phy->link)
-		netif_carrier_on(ndev);
-	else
-		netif_carrier_off(ndev);
+	if (!phy)
+		return;
+
+	if (phy->link) {
+		if (!port->link || port->speed != phy->speed || port->duplex != phy->duplex) {
+			port->speed = phy->speed;
+			port->duplex = phy->duplex;
+			status_change = true;
+
+			grx500_gswip_set_mac_link(dp->gswip[port->config->switch_id],
+						  port->config->switch_id,
+						  port->config->switch_port,
+						  phy->speed, phy->duplex,
+						  phy->pause);
+		}
+	}
+
+	if (phy->link != port->link) {
+		if (!phy->link) {
+			port->speed = SPEED_UNKNOWN;
+			port->duplex = DUPLEX_UNKNOWN;
+			grx500_gswip_set_mac_link(dp->gswip[port->config->switch_id],
+						  port->config->switch_id,
+						  port->config->switch_port,
+						  SPEED_UNKNOWN, DUPLEX_UNKNOWN, 0);
+		}
+		port->link = phy->link;
+		status_change = true;
+	}
+
+	if (status_change)
+		phy_print_status(phy);
 }
 
 static void grx500_cbm_irq_mask(struct grx500_datapath *dp)
@@ -1783,6 +1818,13 @@ static int grx500_stop(struct net_device *ndev)
 	phy_stop(port->phy);
 	netif_carrier_off(ndev);
 	WRITE_ONCE(port->opened, false);
+	port->link = false;
+	port->speed = SPEED_UNKNOWN;
+	port->duplex = DUPLEX_UNKNOWN;
+	grx500_gswip_set_mac_link(dp->gswip[port->config->switch_id],
+				  port->config->switch_id,
+				  port->config->switch_port,
+				  SPEED_UNKNOWN, DUPLEX_UNKNOWN, 0);
 	/* LAN logical ports also carry internal GSWIP-R P2P traffic. Only
 	 * gate the physical left port, or the right WAN endpoint itself.
 	 */
@@ -1800,6 +1842,13 @@ static const struct net_device_ops grx500_ops = {
 	.ndo_start_xmit = grx500_xmit,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr = eth_validate_addr,
+};
+
+static const struct ethtool_ops grx500_ethtool_ops = {
+	.get_link		= ethtool_op_get_link,
+	.get_link_ksettings	= phy_ethtool_get_link_ksettings,
+	.set_link_ksettings	= phy_ethtool_set_link_ksettings,
+	.nway_reset		= phy_ethtool_nway_reset,
 };
 
 static int grx500_read_lan_routes(struct platform_device *pdev,
@@ -2247,10 +2296,14 @@ static int grx500_datapath_probe(struct platform_device *pdev)
 		port->dp = dp;
 		port->ndev = ndev;
 		port->config = &grx500_ports[i];
+		port->speed = SPEED_UNKNOWN;
+		port->duplex = DUPLEX_UNKNOWN;
+		port->link = false;
 		dp->ports[i] = port;
 		strscpy(ndev->name, port->config->name, IFNAMSIZ);
 		SET_NETDEV_DEV(ndev, &pdev->dev);
 		ndev->netdev_ops = &grx500_ops;
+		ndev->ethtool_ops = &grx500_ethtool_ops;
 		ndev->min_mtu = ETH_MIN_MTU;
 		ndev->max_mtu = ETH_DATA_LEN;
 		ndev->features &= ~(NETIF_F_SG | NETIF_F_HW_CSUM | NETIF_F_TSO);

@@ -46,15 +46,18 @@
 #define GRX500_SDMA_PCTRL_FCSIGN         5
 #define GRX500_PCE_PCTRL                 0x480
 #define GRX500_PCE_PCTRL_3               0x483
-#define GRX500_MAC_PCTRL(port)           (0x903 + 0x0c * (port))
+#define GRX500_MAC_PCTRL(port)           (0x903 + 0x0c * ((port) - 1))
 #define GRX500_MAC_CTRL                  0x903
 #define GRX500_GSW_CTRL                  GRX500_GSW_TOP
 #define GRX500_GSW_CTRL_ENABLE           BIT(15)
 #define GRX500_GSWT_MDCCFG_0             (GRX500_GSW_TOP + 0x007)
 #define GRX500_GSWT_MDCCFG_1             (GRX500_GSW_TOP + 0x008)
 #define GRX500_GSWT_MII_CFG_1            (GRX500_GSW_TOP + 0x009)
-#define GRX500_GSWT_PHY_ADDR_1           (GRX500_GSW_TOP + 0x044)
-#define GRX500_GSWT_MDIO_STAT_1          (GRX500_GSW_TOP + 0x045)
+#define GRX500_GSWT_PHY_ADDR(port)       (GRX500_GSW_TOP + 0x044 + 4 * ((port) - 1))
+#define GRX500_GSWT_MDIO_STAT(port)      (GRX500_GSW_TOP + 0x045 + 4 * ((port) - 1))
+#define GRX500_GSWT_ANEG_EEE(port)       (GRX500_GSW_TOP + 0x046 + 4 * ((port) - 1))
+#define GRX500_GSWT_PHY_ADDR_1           GRX500_GSWT_PHY_ADDR(1)
+#define GRX500_GSWT_MDIO_STAT_1          GRX500_GSWT_MDIO_STAT(1)
 #define GRX500_PCE_GCTRL                 0x456
 #define GRX500_PCE_GCTRL_MC_VALID        BIT(3)
 #define GRX500_PCE_TFCR_NUM              0x46f
@@ -326,17 +329,6 @@ int grx500_gswip_prepare_pmac(struct mii_bus *bus, bool right)
 					 BIT(11) | BIT(14), BIT(11) | BIT(14));
 		grx500_gswip_update_bits(base, GRX500_MAC_CTRL, BIT(7), BIT(7));
 
-		/* GSWIP-R TOP link and PHY interface setup:
-		 * Enable MDIO clock (FREQ=0xFF), enable MCEN, deassert reset (RES).
-		 * Enable MDIO hardware auto-polling for PHY 1 (PEN_1).
-		 * Configure Port 1 link: 1000M full duplex (0x3201).
-		 * Configure Port 1 MAC_CTRL: PADEN, FCS, FDUP, GMII 1000M (0x186).
-		 */
-		grx500_gswip_write(base, GRX500_GSWT_MDCCFG_1, 0x81ff);
-		grx500_gswip_update_bits(base, GRX500_GSWT_MDCCFG_0, GENMASK(6, 1), BIT(1));
-		grx500_gswip_write(base, GRX500_GSWT_PHY_ADDR_1, 0x3201);
-		grx500_gswip_write(base, GRX500_MAC_PCTRL(1), 0x186);
-
 		for (port = 0; port < 16; port++) {
 			/* No egress special tag on physical or forward ports. */
 			grx500_gswip_update_bits(base,
@@ -391,13 +383,60 @@ int grx500_gswip_enable_port(struct mii_bus *bus, bool right, u8 port)
 				 BIT(0), BIT(0));
 	grx500_gswip_update_bits(base, GRX500_FDMA_PCTRL + 6 * port,
 				 BIT(0), BIT(0));
-	if (right && port == 1) {
-		grx500_gswip_write(base, GRX500_MAC_PCTRL(1), 0x186);
-		grx500_gswip_write(base, GRX500_GSWT_PHY_ADDR_1, 0x3201);
-	}
 	return 0;
 }
 EXPORT_SYMBOL_GPL(grx500_gswip_enable_port);
+
+int grx500_gswip_set_mac_link(struct mii_bus *bus, bool right, u8 port,
+			      int speed, int duplex, int pause)
+{
+	void __iomem *base;
+	u32 mac_val = BIT(8) | BIT(7); /* PADEN | FCS */
+	u32 phy_addr_val = port & 0x1f;
+
+	if (!bus || !bus->priv || !bus->parent || !bus->parent->of_node ||
+	    right != of_property_read_bool(bus->parent->of_node,
+					   "lantiq,wait-for-gphy") ||
+	    !port || port > (right ? 15 : 5))
+		return -EINVAL;
+	base = bus->priv;
+
+	if (speed == SPEED_UNKNOWN) {
+		grx500_gswip_write(base, GRX500_MAC_PCTRL(port), 0);
+		/* Force link DOWN in switch TOP */
+		grx500_gswip_write(base, GRX500_GSWT_PHY_ADDR(port),
+				   (2 << 13) | phy_addr_val);
+		return 0;
+	}
+
+	if (duplex == DUPLEX_FULL) {
+		mac_val |= (1 << 2); /* FDUP: Full Duplex */
+		phy_addr_val |= (1 << 9); /* Full Duplex */
+	} else {
+		mac_val |= (3 << 2); /* FDUP: Half Duplex (bits[3:2] = 11) */
+	}
+
+	if (speed == SPEED_1000) {
+		mac_val |= 2; /* GMII 1000M */
+		phy_addr_val |= (2 << 11); /* 1000M */
+	} else if (speed == SPEED_100) {
+		mac_val |= 1; /* MII 100M */
+		phy_addr_val |= (1 << 11); /* 100M */
+	}
+
+	if (pause) {
+		mac_val |= (1 << 4); /* FCON: Flow Control Rx/Tx */
+		phy_addr_val |= (1 << 7) | (1 << 5); /* FCONTX | FCONRX */
+	}
+
+	/* Force link UP in switch TOP */
+	phy_addr_val |= (1 << 13);
+
+	grx500_gswip_write(base, GRX500_MAC_PCTRL(port), mac_val);
+	grx500_gswip_write(base, GRX500_GSWT_PHY_ADDR(port), phy_addr_val);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(grx500_gswip_set_mac_link);
 
 int grx500_gswip_disable_port(struct mii_bus *bus, bool right, u8 port)
 {
