@@ -85,8 +85,15 @@ static void wave600_dma_ring_push(struct wave600_dma *dma,
 {
 	r->descs[r->write_ptr] = *d;
 	wmb();
+	/*
+	 * Read back from uncached DDR to flush the MIPS memory controller
+	 * write buffer before issuing the PCIe BAR0 doorbell write (mirroring
+	 * vendor _mtlk_mmb_put_hd_to_ring readback in hw_mmb.c:8355-8360).
+	 */
+	(void)READ_ONCE(r->descs[r->write_ptr].bd_index);
 	r->write_ptr = (r->write_ptr + 1) % r->size;
 	ring_doorbell(r);
+	mmiowb();
 }
 
 static int wave600_dma_ring_alloc(struct wave600_dev *wdev,
@@ -372,13 +379,31 @@ static int wave600_dma_tx_clean_locked(struct wave600_dma *dma, int budget)
 
 	while (processed < hds) {
 		struct wave600_host_dsc *hd = &r->descs[r->read_ptr];
-		u32 bd = FIELD_GET(W600_TX_BD_INDEX, le32_to_cpu(hd->bd_index));
+		u32 info3, bd;
+		int iters = W600_OWN_POLL_ITERS;
+
+		info3 = le32_to_cpu(hd->info3);
+		while (FIELD_GET(W600_TX_OWN, info3) == W600_OWN_FW) {
+			if (--iters == 0) {
+				dev_err_ratelimited(wdev->dev,
+					"TX HD own bit stuck (ptr %u, info3=0x%08x)\n",
+					r->read_ptr, info3);
+				break;
+			}
+			info3 = le32_to_cpu(hd->info3);
+		}
+		if (iters == 0)
+			break;
+
+		bd = FIELD_GET(W600_TX_BD_INDEX, le32_to_cpu(hd->bd_index));
 
 		if (bd < WAVE600_DMA_RING_SIZE && dma->tx_skbs[bd]) {
 			dma_unmap_single(wdev->dev, dma->tx_dma[bd],
 					 dma->tx_len[bd], DMA_TO_DEVICE);
 			dev_kfree_skb_any(dma->tx_skbs[bd]);
 			dma->tx_skbs[bd] = NULL;
+			if (dma->tx_free_top < WAVE600_DMA_RING_SIZE)
+				dma->tx_free_bds[dma->tx_free_top++] = (u16)bd;
 			dma->tx_in_use--;
 		}
 		dma->tx_done++;
@@ -386,7 +411,8 @@ static int wave600_dma_tx_clean_locked(struct wave600_dma *dma, int budget)
 		r->read_ptr = (r->read_ptr + 1) % r->size;
 	}
 
-	ring_clear_interrupt(r, processed);
+	if (processed > 0)
+		ring_clear_interrupt(r, processed);
 
 	if (dma->tx_in_use < WAVE600_DMA_RING_SIZE - 64) {
 		int i;
@@ -905,12 +931,12 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	spin_lock_irqsave(&dma->tx_lock, flags);
 	wave600_dma_tx_clean_locked(dma, 64);
-	bd = dma->tx_write;
-	if (dma->tx_skbs[bd]) {
+	if (dma->tx_free_top == 0) {
 		spin_unlock_irqrestore(&dma->tx_lock, flags);
 		dma->tx_dropped++;
 		goto drop_unmap;
 	}
+	bd = dma->tx_free_bds[--dma->tx_free_top];
 	dma->tx_skbs[bd] = skb;
 	dma->tx_dma[bd] = dma_addr;
 	dma->tx_len[bd] = skb->len;
@@ -1173,11 +1199,15 @@ static void wave600_dma_ring_reset(struct wave600_dev *wdev, struct wave600_dma_
 void wave600_dma_reset_rings(struct wave600_dev *wdev)
 {
 	struct wave600_dma *dma = &wdev->dma;
+	u32 i;
 
 	wave600_dma_ring_reset(wdev, &dma->tx);
 	wave600_dma_ring_reset(wdev, &dma->rx);
 	wave600_dma_ring_reset(wdev, &dma->mgmt_tx);
 	wave600_dma_ring_reset(wdev, &dma->mgmt_rx);
+	for (i = 0; i < WAVE600_DMA_RING_SIZE; i++)
+		dma->tx_free_bds[i] = WAVE600_DMA_RING_SIZE - 1 - i;
+	dma->tx_free_top = WAVE600_DMA_RING_SIZE;
 	dev_info(wdev->dev, "DMA host descriptor rings reset for recovery\n");
 }
 
@@ -1241,10 +1271,13 @@ __maybe_unused static int dc_rings_alloc(struct wave600_dev *wdev, struct wave60
 int wave600_dma_init(struct wave600_dev *wdev)
 {
 	struct wave600_dma *dma = &wdev->dma;
-	u32 rx_ring_size;
+	u32 rx_ring_size, i;
 	int ret;
 
 	spin_lock_init(&dma->tx_lock);
+	for (i = 0; i < WAVE600_DMA_RING_SIZE; i++)
+		dma->tx_free_bds[i] = WAVE600_DMA_RING_SIZE - 1 - i;
+	dma->tx_free_top = WAVE600_DMA_RING_SIZE;
 
 	dev_info(wdev->dev,
 		 "CHI RD pool raw: base=0x%08x rd_size=%u payload_off=%u idx_off=%u num_rds=%u num_mgt=%u\n",

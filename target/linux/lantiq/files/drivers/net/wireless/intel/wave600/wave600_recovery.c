@@ -40,6 +40,7 @@
 #include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/netdevice.h>
+#include <linux/etherdevice.h>
 #include <linux/workqueue.h>
 #include <linux/sysfs.h>
 #include <net/cfg80211.h>
@@ -131,6 +132,8 @@ void wave600_recovery_sysfs_remove(struct wave600_dev *wdev)
 static void wave600_recovery_work_fn(struct work_struct *work)
 {
 	struct wave600_dev *wdev = container_of(work, struct wave600_dev, recovery_work);
+	u8 prev_sta_macs[2][WAVE600_MAX_STATIONS][ETH_ALEN];
+	int prev_sta_cnt[2] = { 0, 0 };
 	unsigned long flags;
 	int ret, i;
 
@@ -157,11 +160,11 @@ static void wave600_recovery_work_fn(struct work_struct *work)
 
 		r->radio_enabled = false;
 		r->vap_added = false;
-		if (r->ndev) {
-			for (s = 0; s < WAVE600_MAX_STATIONS; s++) {
-				if (r->stations[s].valid)
-					cfg80211_del_sta(r->ndev, r->stations[s].mac,
-							 GFP_KERNEL);
+		for (s = 0; s < WAVE600_MAX_STATIONS; s++) {
+			if (r->stations[s].valid) {
+				memcpy(prev_sta_macs[i][prev_sta_cnt[i]],
+				       r->stations[s].mac, ETH_ALEN);
+				prev_sta_cnt[i]++;
 			}
 		}
 		memset(r->stations, 0, sizeof(r->stations));
@@ -298,12 +301,51 @@ static void wave600_recovery_work_fn(struct work_struct *work)
 	dev_info(wdev->dev, "recovery: step 5 (AP restoration) complete\n");
 
 	/* ------------------------------------------------------------------ */
-	/* 6. Finalize: enable NAPI, resume network                            */
+	/* 6. Finalize: enable NAPI, resume network, flush stale STAs          */
 	/* ------------------------------------------------------------------ */
 	wave600_dma_enable_napi(wdev);
 
 	wdev->state = W600_STATE_RUNNING;
 	atomic_set(&wdev->in_recovery, 0);
+
+	/*
+	 * Notify both hostapd (via synthetic RX Deauth) and over-the-air
+	 * clients (via broadcast Deauth TX) that the AP restarted so stations
+	 * immediately re-associate instead of waiting for inactivity timeout.
+	 */
+	for (i = 0; i < 2; i++) {
+		struct wave600_radio *r = &wdev->radios[i];
+		int s, freq;
+		u8 deauth[26];
+
+		if (!r->ap_started || !r->ndev || !r->wdev_net)
+			continue;
+
+		freq = r->ap_freq ? r->ap_freq : ((r->radio_idx == 1) ? 5180 : 2437);
+
+		for (s = 0; s < prev_sta_cnt[i]; s++) {
+			memset(deauth, 0, sizeof(deauth));
+			deauth[0] = 0xc0; /* IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_DEAUTH */
+			deauth[1] = 0x00;
+			memcpy(deauth + 4, r->ndev->dev_addr, ETH_ALEN);  /* DA = AP BSSID */
+			memcpy(deauth + 10, prev_sta_macs[i][s], ETH_ALEN); /* SA = STA MAC */
+			memcpy(deauth + 16, r->ndev->dev_addr, ETH_ALEN); /* BSSID */
+			deauth[24] = 2; /* WLAN_REASON_PREV_AUTH_NOT_VALID */
+			deauth[25] = 0;
+			cfg80211_rx_mgmt(r->wdev_net, freq, -50, deauth, sizeof(deauth), 0);
+		}
+
+		/* Broadcast Deauth over the air so clients reconnect immediately */
+		memset(deauth, 0, sizeof(deauth));
+		deauth[0] = 0xc0;
+		deauth[1] = 0x00;
+		eth_broadcast_addr(deauth + 4);                   /* DA = broadcast */
+		memcpy(deauth + 10, r->ndev->dev_addr, ETH_ALEN); /* SA = AP BSSID */
+		memcpy(deauth + 16, r->ndev->dev_addr, ETH_ALEN); /* BSSID */
+		deauth[24] = 2; /* WLAN_REASON_PREV_AUTH_NOT_VALID */
+		deauth[25] = 0;
+		wave600_dma_mgmt_tx(r, deauth, sizeof(deauth));
+	}
 
 	schedule_delayed_work(&wdev->telemetry_work, msecs_to_jiffies(1000));
 

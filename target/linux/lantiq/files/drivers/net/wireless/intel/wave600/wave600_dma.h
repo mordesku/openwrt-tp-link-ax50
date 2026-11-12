@@ -13,11 +13,10 @@ struct wave600_radio;
 
 /*
  * Ring geometry. Vendor defaults are 4096 for TX/RX and 128 for the
- * management rings; the Wi-Fi bring-up plan uses 512 for data rings.
- * The RX ring is additionally clamped to the RD pool size reported by
- * the firmware in CHI sRdPOOL.
+ * management rings; 2048 matches the firmware CHI sRdPOOL num_rds (2048)
+ * and satisfies the vendor invariant ring_size >= pool_size (hw_mmb.c:4761).
  */
-#define WAVE600_DMA_RING_SIZE		512
+#define WAVE600_DMA_RING_SIZE		2048
 #define WAVE600_DMA_MGMT_RING_SIZE	128
 
 /* Vendor RX_DATA_FRAME_SIZE = 2048 - 128 - 192 (hw_mmb.h) */
@@ -123,11 +122,13 @@ struct wave600_dma {
 	struct wave600_dma_buf *rx_bufs;
 	struct wave600_dma_buf *mgmt_bufs;
 
-	/* TX bookkeeping: one mirror per ring slot */
+	/* TX bookkeeping: one mirror per ring slot + O(1) free BD stack */
 	spinlock_t tx_lock;
 	struct sk_buff *tx_skbs[WAVE600_DMA_RING_SIZE];
 	dma_addr_t tx_dma[WAVE600_DMA_RING_SIZE];
 	u32 tx_len[WAVE600_DMA_RING_SIZE];
+	u16 tx_free_bds[WAVE600_DMA_RING_SIZE];
+	u32 tx_free_top;
 	u32 tx_write;
 	u32 tx_in_use;
 
