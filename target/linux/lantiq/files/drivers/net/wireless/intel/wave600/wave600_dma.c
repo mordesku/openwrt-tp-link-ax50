@@ -630,6 +630,7 @@ int wave600_dma_mgmt_tx(struct wave600_radio *radio, const u8 *buf, size_t len)
 	struct wave600_dma *dma = &wdev->dma;
 	struct wave600_dma_ring *r = &dma->mgmt_tx;
 	struct wave600_host_dsc hd;
+	unsigned long flags;
 	u32 slot_idx, info0_val;
 	dma_addr_t slot_dma;
 	void *slot_va;
@@ -642,12 +643,6 @@ int wave600_dma_mgmt_tx(struct wave600_radio *radio, const u8 *buf, size_t len)
 
 	if (len > WAVE600_DMA_MGMT_BUF_SIZE)
 		return -EMSGSIZE;
-
-	slot_idx = r->write_ptr;
-	slot_va = dma->mgmt_tx_pool + (slot_idx * WAVE600_DMA_MGMT_BUF_SIZE);
-	slot_dma = dma->mgmt_tx_pool_dma + (slot_idx * WAVE600_DMA_MGMT_BUF_SIZE);
-
-	memcpy(slot_va, buf, len);
 
 	fc = (len >= 2) ? (buf[0] | (buf[1] << 8)) : 0;
 	type = (fc & 0x0c) >> 2;
@@ -673,6 +668,13 @@ int wave600_dma_mgmt_tx(struct wave600_radio *radio, const u8 *buf, size_t len)
 		info0_val |= W600_TX_UNKNOWN_SID;
 	}
 
+	spin_lock_irqsave(&dma->tx_lock, flags);
+	slot_idx = r->write_ptr;
+	slot_va = dma->mgmt_tx_pool + (slot_idx * WAVE600_DMA_MGMT_BUF_SIZE);
+	slot_dma = dma->mgmt_tx_pool_dma + (slot_idx * WAVE600_DMA_MGMT_BUF_SIZE);
+
+	memcpy(slot_va, buf, len);
+
 	memset(&hd, 0, sizeof(hd));
 	hd.info0 = cpu_to_le32(info0_val);
 	hd.info1 = cpu_to_le32(FIELD_PREP(W600_TX_CLASS, 15) |
@@ -685,6 +687,7 @@ int wave600_dma_mgmt_tx(struct wave600_radio *radio, const u8 *buf, size_t len)
 	hd.bd_index = cpu_to_le32(FIELD_PREP(W600_TX_BD_INDEX, slot_idx));
 
 	wave600_dma_ring_push(dma, r, &hd);
+	spin_unlock_irqrestore(&dma->tx_lock, flags);
 	return 0;
 }
 
@@ -694,6 +697,7 @@ int wave600_dma_mgmt_tx_eapol(struct wave600_radio *radio, const u8 *buf, size_t
 	struct wave600_dma *dma = &wdev->dma;
 	struct wave600_dma_ring *r = &dma->mgmt_tx;
 	struct wave600_host_dsc hd;
+	unsigned long flags;
 	u32 slot_idx, info0_val;
 	dma_addr_t slot_dma;
 	void *slot_va;
@@ -704,12 +708,6 @@ int wave600_dma_mgmt_tx_eapol(struct wave600_radio *radio, const u8 *buf, size_t
 
 	if (len > WAVE600_DMA_MGMT_BUF_SIZE)
 		return -EMSGSIZE;
-
-	slot_idx = r->write_ptr;
-	slot_va = dma->mgmt_tx_pool + (slot_idx * WAVE600_DMA_MGMT_BUF_SIZE);
-	slot_dma = dma->mgmt_tx_pool_dma + (slot_idx * WAVE600_DMA_MGMT_BUF_SIZE);
-
-	memcpy(slot_va, buf, len);
 
 	/*
 	 * ARC FullMAC firmware EAPOL TX over Mgmt TX ring:
@@ -738,6 +736,13 @@ int wave600_dma_mgmt_tx_eapol(struct wave600_radio *radio, const u8 *buf, size_t
 		return -EINVAL;
 	}
 
+	spin_lock_irqsave(&dma->tx_lock, flags);
+	slot_idx = r->write_ptr;
+	slot_va = dma->mgmt_tx_pool + (slot_idx * WAVE600_DMA_MGMT_BUF_SIZE);
+	slot_dma = dma->mgmt_tx_pool_dma + (slot_idx * WAVE600_DMA_MGMT_BUF_SIZE);
+
+	memcpy(slot_va, buf, len);
+
 	memset(&hd, 0, sizeof(hd));
 	hd.info0 = cpu_to_le32(info0_val);
 	hd.info1 = cpu_to_le32(FIELD_PREP(W600_TX_CLASS, 7) |
@@ -750,6 +755,7 @@ int wave600_dma_mgmt_tx_eapol(struct wave600_radio *radio, const u8 *buf, size_t
 	hd.bd_index = cpu_to_le32(FIELD_PREP(W600_TX_BD_INDEX, slot_idx));
 
 	wave600_dma_ring_push(dma, r, &hd);
+	spin_unlock_irqrestore(&dma->tx_lock, flags);
 	return 0;
 }
 
@@ -869,32 +875,6 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	if (dma_mapping_error(wdev->dev, dma_addr))
 		goto drop;
 
-	spin_lock_irqsave(&dma->tx_lock, flags);
-	wave600_dma_tx_clean_locked(dma, 64);
-	bd = dma->tx_write;
-	if (dma->tx_skbs[bd]) {
-		spin_unlock_irqrestore(&dma->tx_lock, flags);
-		dma->tx_dropped++;
-		goto drop_unmap;
-	}
-	dma->tx_skbs[bd] = skb;
-	dma->tx_dma[bd] = dma_addr;
-	dma->tx_len[bd] = skb->len;
-	dma->tx_write = (dma->tx_write + 1) % WAVE600_DMA_RING_SIZE;
-	dma->tx_in_use++;
-
-	if (dma->tx_in_use >= WAVE600_DMA_RING_SIZE - 32) {
-		int i;
-
-		for (i = 0; i < 2; i++) {
-			struct net_device *d = wdev->radios[i].ndev;
-
-			if (d && !netif_queue_stopped(d))
-				netif_stop_queue(d);
-		}
-	}
-	spin_unlock_irqrestore(&dma->tx_lock, flags);
-
 	memset(&hd, 0, sizeof(hd));
 	/*
 	 * Vendor _mtlk_hw_send_data + _mtlk_mmb_put_hd_to_ring (hw_mmb.c:8346-8437):
@@ -922,9 +902,35 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 			       FIELD_PREP(W600_TX_OFFSET, dma_addr & 7) |
 			       FIELD_PREP(W600_TX_LENGTH, skb->len) |
 			       W600_OWN_FW);
-	hd.bd_index = cpu_to_le32(FIELD_PREP(W600_TX_BD_INDEX, bd));
 
+	spin_lock_irqsave(&dma->tx_lock, flags);
+	wave600_dma_tx_clean_locked(dma, 64);
+	bd = dma->tx_write;
+	if (dma->tx_skbs[bd]) {
+		spin_unlock_irqrestore(&dma->tx_lock, flags);
+		dma->tx_dropped++;
+		goto drop_unmap;
+	}
+	dma->tx_skbs[bd] = skb;
+	dma->tx_dma[bd] = dma_addr;
+	dma->tx_len[bd] = skb->len;
+	dma->tx_write = (dma->tx_write + 1) % WAVE600_DMA_RING_SIZE;
+	dma->tx_in_use++;
+
+	if (dma->tx_in_use >= WAVE600_DMA_RING_SIZE - 32) {
+		int i;
+
+		for (i = 0; i < 2; i++) {
+			struct net_device *d = wdev->radios[i].ndev;
+
+			if (d && !netif_queue_stopped(d))
+				netif_stop_queue(d);
+		}
+	}
+
+	hd.bd_index = cpu_to_le32(FIELD_PREP(W600_TX_BD_INDEX, bd));
 	wave600_dma_ring_push(dma, &dma->tx, &hd);
+	spin_unlock_irqrestore(&dma->tx_lock, flags);
 	if (!is_multicast_ether_addr(skb->data)) {
 		struct wave600_station *sta = wave600_find_sta(radio, skb->data);
 

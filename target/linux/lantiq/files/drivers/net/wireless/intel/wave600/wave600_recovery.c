@@ -42,6 +42,7 @@
 #include <linux/netdevice.h>
 #include <linux/workqueue.h>
 #include <linux/sysfs.h>
+#include <net/cfg80211.h>
 #include "wave600.h"
 #include "wave600_regs.h"
 #include "wave600_fw.h"
@@ -152,8 +153,17 @@ static void wave600_recovery_work_fn(struct work_struct *work)
 
 	for (i = 0; i < 2; i++) {
 		struct wave600_radio *r = &wdev->radios[i];
+		int s;
+
 		r->radio_enabled = false;
 		r->vap_added = false;
+		if (r->ndev) {
+			for (s = 0; s < WAVE600_MAX_STATIONS; s++) {
+				if (r->stations[s].valid)
+					cfg80211_del_sta(r->ndev, r->stations[s].mac,
+							 GFP_KERNEL);
+			}
+		}
 		memset(r->stations, 0, sizeof(r->stations));
 		r->num_stations = 0;
 		if (r->ndev) {
