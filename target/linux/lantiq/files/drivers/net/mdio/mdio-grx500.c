@@ -52,10 +52,14 @@
 #define GRX500_GSW_CTRL_ENABLE           BIT(15)
 #define GRX500_GSWT_MDCCFG_0             (GRX500_GSW_TOP + 0x007)
 #define GRX500_GSWT_MDCCFG_1             (GRX500_GSW_TOP + 0x008)
+#define GRX500_GSWT_MDCCFG_1_RES         BIT(15)
+#define GRX500_GSWT_MDCCFG_1_MCEN        BIT(8)
+#define GRX500_GSWT_MDCCFG_1_FREQ_97KHZ  0xff
 #define GRX500_GSWT_MII_CFG_1            (GRX500_GSW_TOP + 0x009)
 #define GRX500_GSWT_PHY_ADDR(port)       (GRX500_GSW_TOP + 0x044 + 4 * ((port) - 1))
 #define GRX500_GSWT_MDIO_STAT(port)      (GRX500_GSW_TOP + 0x045 + 4 * ((port) - 1))
 #define GRX500_GSWT_ANEG_EEE(port)       (GRX500_GSW_TOP + 0x046 + 4 * ((port) - 1))
+#define GRX500_GSWT_ANEG_EEE_CLK_STOP    GENMASK(3, 2)
 #define GRX500_GSWT_PHY_ADDR_1           GRX500_GSWT_PHY_ADDR(1)
 #define GRX500_GSWT_MDIO_STAT_1          GRX500_GSWT_MDIO_STAT(1)
 #define GRX500_PCE_GCTRL                 0x456
@@ -809,18 +813,44 @@ static ssize_t switch_counters_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(switch_counters);
 
+static void grx500_mdio_hw_init(void __iomem *base, bool right)
+{
+	u8 max_port = right ? 1 : 5;
+	u8 port;
+
+	/* Disable hardware MDIO auto-polling left enabled by bootloader; Linux
+	 * phylib owns PHY polling and updates switch MAC link state manually.
+	 */
+	grx500_gswip_write(base, GRX500_GSWT_MDCCFG_0, 0);
+
+	/* Match GSWIP 3.0 MDIO clock (97.6 kHz), enable MDC, and reset block. */
+	grx500_gswip_write(base, GRX500_GSWT_MDCCFG_1,
+			   GRX500_GSWT_MDCCFG_1_MCEN |
+			   GRX500_GSWT_MDCCFG_1_FREQ_97KHZ);
+	grx500_gswip_update_bits(base, GRX500_GSWT_MDCCFG_1,
+				 GRX500_GSWT_MDCCFG_1_RES,
+				 GRX500_GSWT_MDCCFG_1_RES);
+
+	/* Override EEE clock-stop capability on all external switch ports. */
+	for (port = 1; port <= max_port; port++)
+		grx500_gswip_update_bits(base, GRX500_GSWT_ANEG_EEE(port),
+					 GRX500_GSWT_ANEG_EEE_CLK_STOP,
+					 GRX500_GSWT_ANEG_EEE_CLK_STOP);
+}
+
 static int grx500_mdio_probe(struct platform_device *pdev)
 {
 	struct mii_bus *bus;
 	void __iomem *base;
+	bool right;
 	int ret;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
 		return PTR_ERR(base);
-	if (of_property_read_bool(pdev->dev.of_node,
-				  "lantiq,wait-for-gphy") &&
-	    !READ_ONCE(grx500_gphy_ready))
+	right = of_property_read_bool(pdev->dev.of_node,
+				      "lantiq,wait-for-gphy");
+	if (right && !READ_ONCE(grx500_gphy_ready))
 		return -EPROBE_DEFER;
 	/* GRX500 sysctrl registers both switch clocks with always_on=0.
 	 * Its cgu_enable()/cgu_disable() intentionally do nothing for those
@@ -829,6 +859,7 @@ static int grx500_mdio_probe(struct platform_device *pdev)
 	ret = grx500_gphy_boot(pdev, base);
 	if (ret)
 		return ret;
+	grx500_mdio_hw_init(base, right);
 	bus = devm_mdiobus_alloc(&pdev->dev);
 	if (!bus)
 		return -ENOMEM;

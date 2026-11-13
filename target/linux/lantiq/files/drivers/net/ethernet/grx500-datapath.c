@@ -1795,6 +1795,11 @@ static int grx500_open(struct net_device *ndev)
 	if (ret)
 		return ret;
 	port->phy = phy;
+	/* Switch MAC LPI is disabled; clear GPHY EEE advertisement and
+	 * renegotiate so the link cannot enter LPI without MAC support.
+	 */
+	if (phy_write_mmd(phy, MDIO_MMD_AN, MDIO_AN_EEE_ADV, 0) == 0)
+		genphy_restart_aneg(phy);
 	ret = grx500_gswip_enable_port(dp->gswip[port->config->switch_id],
 				      port->config->switch_id, port->config->switch_port);
 	if (ret) {
