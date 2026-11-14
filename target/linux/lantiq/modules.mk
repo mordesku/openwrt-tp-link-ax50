@@ -45,8 +45,9 @@ define KernelPackage/grx500-switch
 	CONFIG_GRX500_DATAPATH
   FILES:= \
 	$(LINUX_DIR)/drivers/net/mdio/mdio-grx500.ko \
+	$(LINUX_DIR)/drivers/net/ethernet/grx500-gswip.ko \
 	$(LINUX_DIR)/drivers/net/ethernet/grx500-datapath.ko
-  AUTOLOAD:=$(call AutoLoad,40,mdio-grx500 grx500-datapath)
+  AUTOLOAD:=$(call AutoLoad,40,mdio-grx500 grx500-gswip grx500-datapath)
 endef
 
 define KernelPackage/grx500-switch/description
