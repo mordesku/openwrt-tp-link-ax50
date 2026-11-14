@@ -1791,13 +1791,20 @@ static int grx500_open(struct net_device *ndev)
 	ret = grx500_start(dp);
 	if (ret)
 		return ret;
-	ret = phy_connect_direct(ndev, phy, grx500_adjust_link, PHY_INTERFACE_MODE_RGMII);
+	ret = phy_connect_direct(ndev, phy, grx500_adjust_link,
+				 port->config->switch_id ?
+				 PHY_INTERFACE_MODE_RGMII :
+				 PHY_INTERFACE_MODE_GMII);
 	if (ret)
 		return ret;
 	port->phy = phy;
-	/* Switch MAC LPI is disabled; clear GPHY EEE advertisement and
-	 * renegotiate so the link cannot enter LPI without MAC support.
+	/* Switch MAC LPI is disabled; disable EEE in phylib state and GPHY
+	 * advertisement so phy_start() cannot re-advertise EEE.
 	 */
+	phy->eee_broken_modes = -1;
+	linkmode_zero(phy->advertising_eee);
+	phy->eee_cfg.eee_enabled = false;
+	phy->eee_cfg.tx_lpi_enabled = false;
 	if (phy_write_mmd(phy, MDIO_MMD_AN, MDIO_AN_EEE_ADV, 0) == 0)
 		genphy_restart_aneg(phy);
 	ret = grx500_gswip_enable_port(dp->gswip[port->config->switch_id],

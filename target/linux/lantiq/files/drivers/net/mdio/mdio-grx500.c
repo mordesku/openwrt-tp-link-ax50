@@ -47,6 +47,10 @@
 #define GRX500_PCE_PCTRL                 0x480
 #define GRX500_PCE_PCTRL_3               0x483
 #define GRX500_MAC_PCTRL(port)           (0x903 + 0x0c * ((port) - 1))
+#define GRX500_MAC_CTRL4(port)           (0x907 + 0x0c * ((port) - 1))
+#define GRX500_MAC_CTRL4_GWAIT_SHIFT     8
+#define GRX500_MAC_CTRL4_LPIEN           BIT(7)
+#define GRX500_MAC_CTRL4_WAIT_SHIFT      0
 #define GRX500_MAC_CTRL                  0x903
 #define GRX500_GSW_CTRL                  GRX500_GSW_TOP
 #define GRX500_GSW_CTRL_ENABLE           BIT(15)
@@ -395,8 +399,10 @@ int grx500_gswip_set_mac_link(struct mii_bus *bus, bool right, u8 port,
 			      int speed, int duplex, int pause)
 {
 	void __iomem *base;
-	u32 mac_val = BIT(8) | BIT(7); /* PADEN | FCS */
-	u32 phy_addr_val = port & 0x1f;
+	u32 mac_val = 0;
+	u32 phy_addr_val = 0;
+	u32 mac_ctrl4_val = (0x32 << GRX500_MAC_CTRL4_GWAIT_SHIFT) |
+			    (0x15 << GRX500_MAC_CTRL4_WAIT_SHIFT);
 
 	if (!bus || !bus->priv || !bus->parent || !bus->parent->of_node ||
 	    right != of_property_read_bool(bus->parent->of_node,
@@ -406,10 +412,12 @@ int grx500_gswip_set_mac_link(struct mii_bus *bus, bool right, u8 port,
 	base = bus->priv;
 
 	if (speed == SPEED_UNKNOWN) {
-		grx500_gswip_write(base, GRX500_MAC_PCTRL(port), 0);
-		/* Force link DOWN in switch TOP */
-		grx500_gswip_write(base, GRX500_GSWT_PHY_ADDR(port),
-				   (2 << 13) | phy_addr_val);
+		grx500_gswip_update_bits(base, GRX500_MAC_PCTRL(port),
+					 GENMASK(5, 0), 0);
+		grx500_gswip_write(base, GRX500_MAC_CTRL4(port), mac_ctrl4_val);
+		/* Force link DOWN in switch TOP without clobbering PHY addr */
+		grx500_gswip_update_bits(base, GRX500_GSWT_PHY_ADDR(port),
+					 GENMASK(14, 5), (2 << 13));
 		return 0;
 	}
 
@@ -436,8 +444,11 @@ int grx500_gswip_set_mac_link(struct mii_bus *bus, bool right, u8 port,
 	/* Force link UP in switch TOP */
 	phy_addr_val |= (1 << 13);
 
-	grx500_gswip_write(base, GRX500_MAC_PCTRL(port), mac_val);
-	grx500_gswip_write(base, GRX500_GSWT_PHY_ADDR(port), phy_addr_val);
+	grx500_gswip_update_bits(base, GRX500_MAC_PCTRL(port),
+				 GENMASK(5, 0), mac_val);
+	grx500_gswip_write(base, GRX500_MAC_CTRL4(port), mac_ctrl4_val);
+	grx500_gswip_update_bits(base, GRX500_GSWT_PHY_ADDR(port),
+				 GENMASK(14, 5), phy_addr_val);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(grx500_gswip_set_mac_link);
@@ -563,19 +574,12 @@ static int grx500_gphy_boot(struct platform_device *pdev, void __iomem *base)
 
 static int grx500_mdio_wait(void __iomem *base)
 {
-	int tries;
+	u32 val;
 
-	for (tries = 0; tries < 10000; tries++) {
-		/* Match the vendor GSWIP 3.0 read/write sequence: wait before
-		 * even the first busy read. An immediate idle observation after
-		 * a command may otherwise expose the previous MDIO result and
-		 * report a false PHY link transition. Keep the bounded timeout.
-		 */
-		udelay(1);
-		if (!(__raw_readl(base + GRX500_MDCTRL) & GRX500_MDCTRL_BUSY))
-			return 0;
-	}
-	return -ETIMEDOUT;
+	return read_poll_timeout_atomic(__raw_readl, val,
+					!(val & GRX500_MDCTRL_BUSY),
+					10, 10000, false,
+					base + GRX500_MDCTRL);
 }
 
 static int grx500_mdio_read(struct mii_bus *bus, int phy, int reg)
@@ -590,9 +594,14 @@ static int grx500_mdio_read(struct mii_bus *bus, int phy, int reg)
 		return ret;
 	__raw_writel(GRX500_MDCTRL_READ | (phy << 5) | reg,
 		     base + GRX500_MDCTRL);
+	wmb();
+	(void)__raw_readl(base + GRX500_MDCTRL);
+	/* MDC runs at 97.6 kHz (10.24 us/cycle); wait >1 cycle for BUSY to latch. */
+	udelay(12);
 	ret = grx500_mdio_wait(base);
 	if (ret)
 		return ret;
+	rmb();
 	return __raw_readl(base + GRX500_MDREAD) & 0xffff;
 }
 
@@ -607,8 +616,12 @@ static int grx500_mdio_write(struct mii_bus *bus, int phy, int reg, u16 val)
 	if (ret)
 		return ret;
 	__raw_writel(val, base + GRX500_MDWRITE);
+	wmb();
 	__raw_writel(GRX500_MDCTRL_WRITE | (phy << 5) | reg,
 		     base + GRX500_MDCTRL);
+	wmb();
+	(void)__raw_readl(base + GRX500_MDCTRL);
+	udelay(12);
 	return grx500_mdio_wait(base);
 }
 
