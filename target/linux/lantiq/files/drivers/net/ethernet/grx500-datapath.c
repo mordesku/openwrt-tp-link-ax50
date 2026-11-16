@@ -269,7 +269,8 @@ struct grx500_port {
 	bool link;
 	int speed;
 	int duplex;
-	struct u64_stats_sync syncp;
+	struct u64_stats_sync rx_syncp;
+	struct u64_stats_sync tx_syncp;
 	u64 rx_packets;
 	u64 rx_bytes;
 	u64 rx_errors;
@@ -277,6 +278,7 @@ struct grx500_port {
 	u64 tx_packets;
 	u64 tx_bytes;
 	u64 tx_dropped;
+	atomic_long_t tx_timeout_dropped;
 };
 
 struct grx500_datapath {
@@ -1454,21 +1456,21 @@ static int grx500_poll(struct napi_struct *napi, int budget)
 				 * pulled, including frames with a stripped PMAC prefix.
 				 */
 				if (unlikely(!IS_ALIGNED((unsigned long)skb->data, 4))) {
-					u64_stats_update_begin(&port->syncp);
+					u64_stats_update_begin(&port->rx_syncp);
 					port->rx_errors++;
-					u64_stats_update_end(&port->syncp);
+					u64_stats_update_end(&port->rx_syncp);
 					dev_kfree_skb_any(skb);
 				} else {
 					napi_gro_receive(napi, skb);
-					u64_stats_update_begin(&port->syncp);
+					u64_stats_update_begin(&port->rx_syncp);
 					port->rx_packets++;
 					port->rx_bytes += len;
-					u64_stats_update_end(&port->syncp);
+					u64_stats_update_end(&port->rx_syncp);
 				}
 			} else {
-				u64_stats_update_begin(&port->syncp);
+				u64_stats_update_begin(&port->rx_syncp);
 				port->rx_dropped++;
-				u64_stats_update_end(&port->syncp);
+				u64_stats_update_end(&port->rx_syncp);
 			}
 		}
 		dma_sync_single_for_device(dp->dev, ptr & ~7u,
@@ -1530,9 +1532,9 @@ static netdev_tx_t grx500_xmit(struct sk_buff *skb,
 
 	if (unlikely(skb->len > ndev->mtu + ETH_HLEN + VLAN_HLEN ||
 		     skb->len < ETH_HLEN)) {
-		stats_flags = u64_stats_update_begin_irqsave(&port->syncp);
+		stats_flags = u64_stats_update_begin_irqsave(&port->tx_syncp);
 		port->tx_dropped++;
-		u64_stats_update_end_irqrestore(&port->syncp, stats_flags);
+		u64_stats_update_end_irqrestore(&port->tx_syncp, stats_flags);
 		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
 	}
@@ -1570,9 +1572,9 @@ static netdev_tx_t grx500_xmit(struct sk_buff *skb,
 		spin_lock_irqsave(&dp->tx_lock, irqflags);
 		grx500_cbm_cpu_return(dp, 0, frame);
 		spin_unlock_irqrestore(&dp->tx_lock, irqflags);
-		stats_flags = u64_stats_update_begin_irqsave(&port->syncp);
+		stats_flags = u64_stats_update_begin_irqsave(&port->tx_syncp);
 		port->tx_dropped++;
-		u64_stats_update_end_irqrestore(&port->syncp, stats_flags);
+		u64_stats_update_end_irqrestore(&port->tx_syncp, stats_flags);
 		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
 	}
@@ -1594,10 +1596,10 @@ static netdev_tx_t grx500_xmit(struct sk_buff *skb,
 		     desc + 12);
 	spin_unlock_irqrestore(&dp->tx_lock, irqflags);
 
-	stats_flags = u64_stats_update_begin_irqsave(&port->syncp);
+	stats_flags = u64_stats_update_begin_irqsave(&port->tx_syncp);
 	port->tx_packets++;
 	port->tx_bytes += skb->len;
-	u64_stats_update_end_irqrestore(&port->syncp, stats_flags);
+	u64_stats_update_end_irqrestore(&port->tx_syncp, stats_flags);
 	dev_consume_skb_any(skb);
 	return NETDEV_TX_OK;
 }
@@ -1809,15 +1811,21 @@ static void grx500_get_stats64(struct net_device *ndev,
 	unsigned int start;
 
 	do {
-		start = u64_stats_fetch_begin(&port->syncp);
+		start = u64_stats_fetch_begin(&port->rx_syncp);
 		stats->rx_packets = port->rx_packets;
 		stats->rx_bytes = port->rx_bytes;
 		stats->rx_errors = port->rx_errors;
 		stats->rx_dropped = port->rx_dropped;
+	} while (u64_stats_fetch_retry(&port->rx_syncp, start));
+
+	do {
+		start = u64_stats_fetch_begin(&port->tx_syncp);
 		stats->tx_packets = port->tx_packets;
 		stats->tx_bytes = port->tx_bytes;
 		stats->tx_dropped = port->tx_dropped;
-	} while (u64_stats_fetch_retry(&port->syncp, start));
+	} while (u64_stats_fetch_retry(&port->tx_syncp, start));
+
+	stats->tx_dropped += (u64)atomic_long_read(&port->tx_timeout_dropped);
 }
 
 static int grx500_change_mtu(struct net_device *ndev, int new_mtu)
@@ -1840,11 +1848,8 @@ static int grx500_change_mtu(struct net_device *ndev, int new_mtu)
 static void grx500_tx_timeout(struct net_device *ndev, unsigned int txqueue)
 {
 	struct grx500_port *port = grx500_port_priv(ndev);
-	unsigned long flags;
 
-	flags = u64_stats_update_begin_irqsave(&port->syncp);
-	port->tx_dropped++;
-	u64_stats_update_end_irqrestore(&port->syncp, flags);
+	atomic_long_inc(&port->tx_timeout_dropped);
 	netdev_warn(ndev, "TX timeout on queue %u; waking queue\n", txqueue);
 	netif_wake_queue(ndev);
 }
@@ -2334,7 +2339,9 @@ static int grx500_datapath_probe(struct platform_device *pdev)
 		port->config = &grx500_ports[i];
 		port->speed = SPEED_UNKNOWN;
 		port->duplex = DUPLEX_UNKNOWN;
-		u64_stats_init(&port->syncp);
+		u64_stats_init(&port->rx_syncp);
+		u64_stats_init(&port->tx_syncp);
+		atomic_long_set(&port->tx_timeout_dropped, 0);
 		port->link = false;
 		dp->ports[i] = port;
 		if (port->config->rx_port < ARRAY_SIZE(dp->rx_port_map))
