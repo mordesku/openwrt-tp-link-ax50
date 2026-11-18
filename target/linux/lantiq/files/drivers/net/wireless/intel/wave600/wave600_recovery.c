@@ -158,6 +158,7 @@ static void wave600_recovery_work_fn(struct work_struct *work)
 		struct wave600_radio *r = &wdev->radios[i];
 		int s;
 
+		wave600_cfg80211_abort_scan(r);
 		r->radio_enabled = false;
 		r->vap_added = false;
 		for (s = 0; s < WAVE600_MAX_STATIONS; s++) {

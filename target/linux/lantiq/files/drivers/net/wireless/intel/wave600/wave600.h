@@ -159,6 +159,15 @@ struct wave600_radio {
 	struct cfg80211_chan_def cac_chandef;
 	u32 cac_time_ms;
 	struct delayed_work cac_work;
+
+	/* Active/passive scan tracking */
+	struct cfg80211_scan_request *scan_req;
+	struct delayed_work scan_work;
+	struct mutex scan_lock;
+	u32 scan_chan_idx;
+	bool scan_in_progress;
+	bool scan_aborted;
+	u32 scan_freq;
 };
 
 struct wave600_dev {
@@ -238,6 +247,7 @@ void wave600_cal_cleanup(struct wave600_dev *wdev);
 int wave600_cfg80211_init(struct wave600_dev *wdev);
 void wave600_cfg80211_cleanup(struct wave600_dev *wdev);
 int wave600_cfg80211_restore_ap(struct wave600_radio *radio);
+void wave600_cfg80211_abort_scan(struct wave600_radio *radio);
 void wave600_diag_handlers_probe(struct wave600_dev *wdev);
 int wave600_stats_init(struct wave600_dev *wdev);
 void wave600_stats_cleanup(struct wave600_dev *wdev);

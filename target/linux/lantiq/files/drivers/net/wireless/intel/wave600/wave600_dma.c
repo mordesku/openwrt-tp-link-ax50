@@ -497,8 +497,9 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 			u8 ep = FIELD_GET(W600_TX_EP, info1);
 			u8 radio_idx = (ep ^ 1) & 1;
 			struct wave600_radio *radio = (radio_idx < 2) ? &wdev->radios[radio_idx] : NULL;
-			int freq = (radio && radio->ap_freq) ? radio->ap_freq :
-				   ((radio_idx == 1) ? 5180 : 2437);
+			int freq = (radio && radio->scan_in_progress && radio->scan_freq) ? radio->scan_freq :
+				   ((radio && radio->ap_freq) ? radio->ap_freq :
+				   ((radio_idx == 1) ? 5180 : 2437));
 			bool is_eapol;
 			u32 sync_len = offset + len;
 			u32 metrics_off = offset + len + 16 - ((offset + len) & 15);
@@ -561,57 +562,78 @@ static int wave600_dma_mgmt_rx(struct wave600_dma *dma, int budget)
 						}
 					}
 				}
-			} else if (radio && radio->ap_started && radio->wdev_net) {
+			} else if (radio && (radio->scan_in_progress || (radio->ap_started && radio->wdev_net))) {
 				int sig = (measured_rssi != 0) ? measured_rssi :
 					  (radio->sta_signal ? radio->sta_signal : 0);
 
-				if (len >= 24 && !is_multicast_ether_addr(data + 10)) {
-					struct wave600_station *sta = wave600_find_sta(radio, data + 10);
-					if (sta) {
-						if (measured_rssi != 0) {
-							sta->signal = measured_rssi;
-							if (sta->signal_avg == 0 || sta->signal_avg <= -99)
-								sta->signal_avg = measured_rssi;
-							else
-								sta->signal_avg = (s8)(((int)sta->signal_avg * 7 + measured_rssi) / 8);
+				if (len >= sizeof(struct ieee80211_hdr_3addr) && radio->wiphy) {
+					__le16 fc = ((struct ieee80211_hdr *)data)->frame_control;
+
+					if (ieee80211_is_beacon(fc) || ieee80211_is_probe_resp(fc)) {
+						struct ieee80211_channel *chan = ieee80211_get_channel(radio->wiphy, freq);
+
+						if (chan) {
+							s32 sig_mbm = (measured_rssi != 0) ? ((s32)measured_rssi * 100) : -7500;
+							struct cfg80211_bss *bss;
+
+							bss = cfg80211_inform_bss_frame(radio->wiphy, chan,
+											(struct ieee80211_mgmt *)data,
+											len, sig_mbm, GFP_ATOMIC);
+							if (bss)
+								cfg80211_put_bss(radio->wiphy, bss);
 						}
-						if (metrics_off + 80 <= WAVE600_DMA_MGMT_BUF_SIZE) {
-							u32 *s0 = (u32 *)phys_to_virt(payload_addr + metrics_off + 48);
-							u32 w0 = le32_to_cpu(*s0);
-
-							if ((w0 >> 1) & 1) {
-								u32 w0_u = le32_to_cpu(*(u32 *)phys_to_virt(payload_addr + metrics_off + 64));
-								u32 w1_u = le32_to_cpu(*(u32 *)phys_to_virt(payload_addr + metrics_off + 68));
-								u32 hw_r = (w1_u >> 4) & 0x1FFFF;
-
-								if (hw_r > 0 && hw_r < 0x1FFFF) {
-									u32 c0 = le32_to_cpu(*(u32 *)phys_to_virt(payload_addr + metrics_off + 0));
-									u8 pmode = (c0 >> 17) & 0x07;
-
-									sta->rx_bitrate = hw_r;
-									if (pmode == 4) {
-										sta->rx_flags = RATE_INFO_FLAGS_HE_MCS;
-										sta->rx_mcs = (w0_u >> 24) & 0x0F;
-										sta->rx_nss = ((w0_u >> 28) & 0x07) + 1;
-										sta->rx_dcm = (w0_u >> 31) & 0x01;
-									} else if (pmode == 3) {
-										sta->rx_flags = RATE_INFO_FLAGS_VHT_MCS | RATE_INFO_FLAGS_SHORT_GI;
-										sta->rx_mcs = (w0_u >> 28) & 0x07;
-										sta->rx_nss = ((w0_u >> 24) & 0x0F) + 1;
-									} else if (pmode == 2) {
-										sta->rx_flags = RATE_INFO_FLAGS_MCS | RATE_INFO_FLAGS_SHORT_GI;
-										sta->rx_mcs = (w0_u >> 24) & 0x3F;
-										sta->rx_nss = (sta->rx_mcs / 8) + 1;
-									}
-								}
-							}
-						}
-						sta->last_rx = jiffies;
 					}
 				}
 
-				cfg80211_rx_mgmt(radio->wdev_net, freq, sig,
-						 data, len, 0);
+				if (radio->ap_started && radio->wdev_net) {
+					if (len >= 24 && !is_multicast_ether_addr(data + 10)) {
+						struct wave600_station *sta = wave600_find_sta(radio, data + 10);
+						if (sta) {
+							if (measured_rssi != 0) {
+								sta->signal = measured_rssi;
+								if (sta->signal_avg == 0 || sta->signal_avg <= -99)
+									sta->signal_avg = measured_rssi;
+								else
+									sta->signal_avg = (s8)(((int)sta->signal_avg * 7 + measured_rssi) / 8);
+							}
+							if (metrics_off + 80 <= WAVE600_DMA_MGMT_BUF_SIZE) {
+								u32 *s0 = (u32 *)phys_to_virt(payload_addr + metrics_off + 48);
+								u32 w0 = le32_to_cpu(*s0);
+
+								if ((w0 >> 1) & 1) {
+									u32 w0_u = le32_to_cpu(*(u32 *)phys_to_virt(payload_addr + metrics_off + 64));
+									u32 w1_u = le32_to_cpu(*(u32 *)phys_to_virt(payload_addr + metrics_off + 68));
+									u32 hw_r = (w1_u >> 4) & 0x1FFFF;
+
+									if (hw_r > 0 && hw_r < 0x1FFFF) {
+										u32 c0 = le32_to_cpu(*(u32 *)phys_to_virt(payload_addr + metrics_off + 0));
+										u8 pmode = (c0 >> 17) & 0x07;
+
+										sta->rx_bitrate = hw_r;
+										if (pmode == 4) {
+											sta->rx_flags = RATE_INFO_FLAGS_HE_MCS;
+											sta->rx_mcs = (w0_u >> 24) & 0x0F;
+											sta->rx_nss = ((w0_u >> 28) & 0x07) + 1;
+											sta->rx_dcm = (w0_u >> 31) & 0x01;
+										} else if (pmode == 3) {
+											sta->rx_flags = RATE_INFO_FLAGS_VHT_MCS | RATE_INFO_FLAGS_SHORT_GI;
+											sta->rx_mcs = (w0_u >> 28) & 0x07;
+											sta->rx_nss = ((w0_u >> 24) & 0x0F) + 1;
+										} else if (pmode == 2) {
+											sta->rx_flags = RATE_INFO_FLAGS_MCS | RATE_INFO_FLAGS_SHORT_GI;
+											sta->rx_mcs = (w0_u >> 24) & 0x3F;
+											sta->rx_nss = (sta->rx_mcs / 8) + 1;
+										}
+									}
+								}
+							}
+							sta->last_rx = jiffies;
+						}
+					}
+
+					cfg80211_rx_mgmt(radio->wdev_net, freq, sig,
+							 data, len, 0);
+				}
 			}
 
 			dma_sync_single_for_device(wdev->dev, (dma_addr_t)payload_addr,
@@ -664,7 +686,8 @@ int wave600_dma_mgmt_tx(struct wave600_radio *radio, const u8 *buf, size_t len)
 	u8 type, subtype;
 	bool mcf;
 
-	if (!dma->data_path_ready || !dma->mgmt_tx_pool || !radio->ap_started)
+	if (!dma->data_path_ready || !dma->mgmt_tx_pool ||
+	    (!radio->ap_started && !radio->scan_in_progress))
 		return -ENETDOWN;
 
 	if (len > WAVE600_DMA_MGMT_BUF_SIZE)
@@ -729,7 +752,8 @@ int wave600_dma_mgmt_tx_eapol(struct wave600_radio *radio, const u8 *buf, size_t
 	void *slot_va;
 	const struct ethhdr *eth = (const struct ethhdr *)buf;
 
-	if (!dma->data_path_ready || !dma->mgmt_tx_pool || !radio->ap_started)
+	if (!dma->data_path_ready || !dma->mgmt_tx_pool ||
+	    (!radio->ap_started && !radio->scan_in_progress))
 		return -ENETDOWN;
 
 	if (len > WAVE600_DMA_MGMT_BUF_SIZE)

@@ -2060,6 +2060,18 @@ static int wave600_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *nde
 			return ret;
 		}
 		radio->vap_added = true;
+	} else {
+		ret = wave600_send_mib_pre_activate(radio, is_5g, width, primary_idx);
+		if (ret) {
+			dev_err(wdev->dev, "Radio %u start_ap: MIB_PRE_ACTIVATE failed: %d\n", radio->radio_idx, ret);
+			return ret;
+		}
+
+		ret = wave600_send_mib_spectrum_mode(radio, width);
+		if (ret) {
+			dev_err(wdev->dev, "Radio %u start_ap: MIB_SPECTRUM_MODE failed: %d\n", radio->radio_idx, ret);
+			return ret;
+		}
 	}
 
 	if (!radio->radio_enabled) {
@@ -2243,6 +2255,8 @@ static int wave600_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *ndev
 		u8 reserved;
 	} __packed p;
 	int ret;
+
+	wave600_cfg80211_abort_scan(radio);
 
 	if (radio->cac_in_progress) {
 		cancel_delayed_work_sync(&radio->cac_work);
@@ -2504,11 +2518,262 @@ static void wave600_cfg80211_end_cac(struct wiphy *wiphy,
 		return;
 
 	dev_info(radio->wdev->dev, "Radio %u end_cac (aborted)\n", radio->radio_idx);
+	wave600_cfg80211_abort_scan(radio);
 	cancel_delayed_work_sync(&radio->cac_work);
 	radio->cac_in_progress = false;
 
 	cfg80211_cac_event(radio->ndev, &radio->cac_chandef,
 			   NL80211_RADAR_CAC_ABORTED, GFP_KERNEL, 0);
+}
+
+static int wave600_send_probe_req(struct wave600_radio *radio,
+				  struct cfg80211_scan_request *req,
+				  bool is_5g)
+{
+	static const u8 rates_2g[8] = { 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 };
+	static const u8 ext_rates_2g[4] = { 0x30, 0x48, 0x60, 0x6c };
+	static const u8 rates_5g[8] = { 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c };
+	int n_ssids = req->n_ssids > 0 ? req->n_ssids : 1;
+	u8 *buf;
+	int i, ret = 0;
+
+	buf = kmalloc(WAVE600_DMA_MGMT_BUF_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	for (i = 0; i < n_ssids; i++) {
+		struct ieee80211_hdr_3addr *hdr = (struct ieee80211_hdr_3addr *)buf;
+		u8 *pos = buf + sizeof(*hdr);
+		const u8 *ssid = (req->n_ssids > 0) ? req->ssids[i].ssid : NULL;
+		u8 ssid_len = (req->n_ssids > 0) ? req->ssids[i].ssid_len : 0;
+		size_t needed = sizeof(*hdr) + 2 + ssid_len + 2 + 8 + (is_5g ? 0 : 6) + req->ie_len;
+
+		if (needed > WAVE600_DMA_MGMT_BUF_SIZE)
+			continue;
+
+		memset(hdr, 0, sizeof(*hdr));
+		hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_PROBE_REQ);
+		eth_broadcast_addr(hdr->addr1);
+		ether_addr_copy(hdr->addr2, radio->ndev->dev_addr);
+		eth_broadcast_addr(hdr->addr3);
+
+		*pos++ = WLAN_EID_SSID;
+		*pos++ = ssid_len;
+		if (ssid_len && ssid) {
+			memcpy(pos, ssid, ssid_len);
+			pos += ssid_len;
+		}
+
+		*pos++ = WLAN_EID_SUPP_RATES;
+		*pos++ = 8;
+		memcpy(pos, is_5g ? rates_5g : rates_2g, 8);
+		pos += 8;
+
+		if (!is_5g) {
+			*pos++ = WLAN_EID_EXT_SUPP_RATES;
+			*pos++ = 4;
+			memcpy(pos, ext_rates_2g, 4);
+			pos += 4;
+		}
+
+		if (req->ie && req->ie_len > 0) {
+			memcpy(pos, req->ie, req->ie_len);
+			pos += req->ie_len;
+		}
+
+		ret = wave600_dma_mgmt_tx(radio, buf, pos - buf);
+		if (ret)
+			break;
+	}
+
+	kfree(buf);
+	return ret;
+}
+
+static void wave600_scan_work(struct work_struct *work)
+{
+	struct wave600_radio *radio = container_of(work, struct wave600_radio, scan_work.work);
+	struct wave600_dev *wdev = radio->wdev;
+	struct cfg80211_scan_request *req;
+	struct cfg80211_scan_info info = {};
+	struct ieee80211_channel *chan;
+	bool aborted = false;
+	bool is_5g;
+	unsigned long dwell_ms;
+	int ret;
+
+	mutex_lock(&radio->scan_lock);
+	req = radio->scan_req;
+	if (!radio->scan_in_progress || !req) {
+		mutex_unlock(&radio->scan_lock);
+		return;
+	}
+
+	if (radio->scan_aborted || wdev->state != W600_STATE_RUNNING ||
+	    atomic_read(&wdev->in_recovery)) {
+		aborted = true;
+		goto finish_scan;
+	}
+
+	if (radio->scan_chan_idx >= req->n_channels) {
+		if (radio->ap_started && radio->ap_channel) {
+			bool ap_5g = (radio->ap_freq >= 5000);
+
+			wave600_send_tpc_config(radio, radio->ap_channel, ap_5g);
+			wave600_send_tpc_ant_params(radio, radio->ap_channel, ap_5g);
+			wave600_send_set_chan(radio, radio->ap_low_chan, radio->ap_width,
+					      radio->ap_primary_idx, W600_SWITCH_TYPE_NORMAL, 0);
+		}
+		goto finish_scan;
+	}
+
+	chan = req->channels[radio->scan_chan_idx];
+	is_5g = (chan->band == NL80211_BAND_5GHZ);
+	radio->scan_freq = chan->center_freq;
+
+	wave600_send_tpc_config(radio, chan->hw_value, is_5g);
+	wave600_send_tpc_ant_params(radio, chan->hw_value, is_5g);
+	ret = wave600_send_set_chan(radio, chan->hw_value, 0, 0,
+				    W600_SWITCH_TYPE_SCAN, 0);
+	if (ret)
+		dev_warn(wdev->dev, "Radio %u scan: SET_CHAN %u MHz failed: %d\n",
+			 radio->radio_idx, chan->center_freq, ret);
+	else if (!(chan->flags & (IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR)))
+		wave600_send_probe_req(radio, req, is_5g);
+
+	radio->scan_chan_idx++;
+	if (req->duration)
+		dwell_ms = max_t(unsigned long, ieee80211_tu_to_usec(req->duration) / 1000, 20);
+	else
+		dwell_ms = (chan->flags & (IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR)) ? 200 : 100;
+
+	schedule_delayed_work(&radio->scan_work, msecs_to_jiffies(dwell_ms));
+	mutex_unlock(&radio->scan_lock);
+	return;
+
+finish_scan:
+	radio->scan_req = NULL;
+	radio->scan_in_progress = false;
+	radio->scan_aborted = false;
+	radio->scan_freq = 0;
+	mutex_unlock(&radio->scan_lock);
+
+	info.aborted = aborted;
+	cfg80211_scan_done(req, &info);
+}
+
+void wave600_cfg80211_abort_scan(struct wave600_radio *radio)
+{
+	struct cfg80211_scan_request *req = NULL;
+	struct cfg80211_scan_info info = { .aborted = true };
+
+	if (!radio)
+		return;
+
+	mutex_lock(&radio->scan_lock);
+	if (!radio->scan_in_progress) {
+		mutex_unlock(&radio->scan_lock);
+		return;
+	}
+	radio->scan_aborted = true;
+	mutex_unlock(&radio->scan_lock);
+
+	cancel_delayed_work_sync(&radio->scan_work);
+
+	mutex_lock(&radio->scan_lock);
+	if (radio->scan_req) {
+		req = radio->scan_req;
+		radio->scan_req = NULL;
+		radio->scan_in_progress = false;
+		radio->scan_aborted = false;
+		radio->scan_freq = 0;
+	}
+	mutex_unlock(&radio->scan_lock);
+
+	if (req)
+		cfg80211_scan_done(req, &info);
+}
+
+static int wave600_cfg80211_scan(struct wiphy *wiphy,
+				 struct cfg80211_scan_request *request)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+	struct wave600_dev *wdev;
+	bool is_5g;
+	int ret;
+
+	if (!radio || !request || !request->n_channels)
+		return -EINVAL;
+
+	wdev = radio->wdev;
+	if (!wdev || wdev->state != W600_STATE_RUNNING || atomic_read(&wdev->in_recovery))
+		return -EBUSY;
+
+	if (request->n_ssids > 16 || request->ie_len > 2048)
+		return -EINVAL;
+
+	mutex_lock(&radio->scan_lock);
+	if (radio->scan_in_progress || radio->cac_in_progress) {
+		mutex_unlock(&radio->scan_lock);
+		return -EBUSY;
+	}
+
+	is_5g = (request->channels[0]->band == NL80211_BAND_5GHZ);
+
+	if (!radio->vap_added) {
+		ret = wave600_send_vap_db_add(radio);
+		if (ret)
+			goto err_unlock;
+		ret = wave600_send_mib_ieee_addr(radio);
+		if (ret)
+			goto err_unlock;
+		ret = wave600_send_mib_pre_activate(radio, is_5g, 0, 0);
+		if (ret)
+			goto err_unlock;
+		ret = wave600_send_mib_spectrum_mode(radio, 0);
+		if (ret)
+			goto err_unlock;
+		ret = wave600_send_pre_activate(radio);
+		if (ret)
+			goto err_unlock;
+		ret = wave600_send_add_vap(radio, is_5g);
+		if (ret)
+			goto err_unlock;
+		radio->vap_added = true;
+	}
+
+	if (!radio->radio_enabled) {
+		ret = wave600_send_enable_radio(radio, 1);
+		if (ret)
+			goto err_unlock;
+		radio->radio_enabled = true;
+		wave600_send_he_mu_operation(radio, 1);
+		wave600_send_bf_mode(radio, WAVE600_BF_MODE_NON_BF);
+		wave600_send_txop_mode(radio, WAVE600_GEN6_ALL_STA_SID,
+				       WAVE600_TXOP_MODE_INVALID);
+	}
+
+	radio->scan_req = request;
+	radio->scan_chan_idx = 0;
+	radio->scan_aborted = false;
+	radio->scan_in_progress = true;
+	radio->scan_freq = request->channels[0]->center_freq;
+
+	schedule_delayed_work(&radio->scan_work, 0);
+	mutex_unlock(&radio->scan_lock);
+	return 0;
+
+err_unlock:
+	mutex_unlock(&radio->scan_lock);
+	return ret;
+}
+
+static void wave600_cfg80211_abort_scan_op(struct wiphy *wiphy,
+					   struct wireless_dev *wdev_net)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+
+	wave600_cfg80211_abort_scan(radio);
 }
 
 static int wave600_cfg80211_get_channel(struct wiphy *wiphy,
@@ -3254,6 +3519,8 @@ static const struct cfg80211_ops wave600_cfg80211_ops = {
 	.change_virtual_intf = wave600_cfg80211_change_virt_intf,
 	.start_ap = wave600_cfg80211_start_ap,
 	.stop_ap = wave600_cfg80211_stop_ap,
+	.scan = wave600_cfg80211_scan,
+	.abort_scan = wave600_cfg80211_abort_scan_op,
 	.get_channel = wave600_cfg80211_get_channel,
 	.change_beacon = wave600_cfg80211_change_beacon,
 	.set_monitor_channel = wave600_cfg80211_set_channel,
@@ -3535,6 +3802,8 @@ static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 	radio->vap_id = 0; /* primary AP VAP index is 0 on both radios */
 	radio->antenna_mask = (radio_idx == 0) ? 0x05 : 0x0A;
 	INIT_DELAYED_WORK(&radio->cac_work, wave600_cac_work);
+	INIT_DELAYED_WORK(&radio->scan_work, wave600_scan_work);
+	mutex_init(&radio->scan_lock);
 
 	wiphy = wiphy_new(&wave600_cfg80211_ops, sizeof(struct wave600_radio *));
 	if (!wiphy)
@@ -3557,7 +3826,8 @@ static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 	wiphy->mgmt_stypes = wave600_mgmt_stypes;
 	wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	wiphy->reg_notifier = wave600_reg_notifier;
-	wiphy->max_scan_ssids = 1;
+	wiphy->max_scan_ssids = 16;
+	wiphy->max_scan_ie_len = 2048;
 	strscpy(wiphy->fw_version, wdev->fw_version, sizeof(wiphy->fw_version));
 
 	if (radio_idx == 0) {
@@ -3737,6 +4007,7 @@ static void wave600_radio_cleanup(struct wave600_radio *radio)
 	struct wave600_dev *wdev = radio->wdev;
 	struct ieee80211_supported_band *band;
 
+	wave600_cfg80211_abort_scan(radio);
 	cancel_delayed_work_sync(&radio->cac_work);
 	radio->cac_in_progress = false;
 
