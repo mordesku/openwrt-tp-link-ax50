@@ -305,7 +305,7 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 		struct net_device *ndev = (radio && radio->ndev) ? radio->ndev : NULL;
 		struct sk_buff *new_skb;
 		dma_addr_t new_dma;
-		u8 src_mac[ETH_ALEN];
+		u8 src_mac[ETH_ALEN] __aligned(2);
 
 		if (unlikely(!ndev || !buf->skb))
 			goto recycle_reuse;

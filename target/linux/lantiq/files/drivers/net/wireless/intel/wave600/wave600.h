@@ -31,9 +31,9 @@ enum wave600_state {
 #define WAVE600_MAX_STATIONS 32
 
 struct wave600_station {
-	bool valid;
-	u8 mac[ETH_ALEN];
+	u8 mac[ETH_ALEN] __aligned(2);
 	u16 sid;
+	bool valid;
 	u32 connect_time;
 	unsigned long last_rx;
 	s8 signal;
