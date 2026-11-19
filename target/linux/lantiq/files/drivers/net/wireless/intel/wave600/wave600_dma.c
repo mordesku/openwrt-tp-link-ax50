@@ -287,8 +287,8 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 
 		buf = &dma->rx_bufs[bd];
 		offset = FIELD_GET(W600_TX_OFFSET, info3);
-		/* Gen6: real offset is 4 bits wide, MSB lives in payload addr bit 3 */
-		offset += (0x08 & le32_to_cpu(hd->payload_addr));
+		/* Gen6: real offset is 4 bits wide, MSB lives in payload addr bit 3 (vendor hw_mmb.c:2067) */
+		offset += (0x08 & (le32_to_cpu(hd->payload_addr) ^ (u32)buf->dma));
 		len = FIELD_GET(W600_TX_LENGTH, info3);
 		total = offset + len;
 
@@ -298,62 +298,82 @@ static int wave600_dma_rx(struct wave600_dma *dma, int budget)
 			goto recycle_reuse;
 		}
 
-		dma_sync_single_for_cpu(wdev->dev, buf->dma, buf->size,
-					DMA_FROM_DEVICE);
-
-		/*
-		 * Allocate an aligned skb via napi_alloc_skb().
-		 * On MIPS, napi_alloc_skb() automatically reserves NET_SKB_PAD +
-		 * NET_IP_ALIGN (2 bytes). When the 14-byte Ethernet header is
-		 * pulled by eth_type_trans(), the resulting L3 header is at
-		 * offset 16 (4-byte aligned), preventing fatal MIPS ADEL exceptions.
-		 * (Canon pattern from grx500-datapath.c:1445-1463).
-		 */
 		u32 info1 = le32_to_cpu(hd->info1);
 		u8 ep = FIELD_GET(W600_TX_EP, info1);
 		u8 radio_idx = (ep ^ 1) & 1;
 		struct wave600_radio *radio = (radio_idx < 2) ? &wdev->radios[radio_idx] : NULL;
-		struct net_device *ndev = (radio && radio->ndev) ? radio->ndev : dma->ndev;
+		struct net_device *ndev = (radio && radio->ndev) ? radio->ndev : NULL;
+		struct sk_buff *new_skb;
+		dma_addr_t new_dma;
+		u8 src_mac[ETH_ALEN];
 
-		skb = napi_alloc_skb(&dma->napi, len);
-		if (unlikely(!skb)) {
-			if (ndev)
-				ndev->stats.rx_dropped++;
-			dma_sync_single_for_device(wdev->dev, buf->dma,
-						   buf->size, DMA_FROM_DEVICE);
+		if (unlikely(!ndev || !buf->skb))
+			goto recycle_reuse;
+
+		/*
+		 * Zero-copy RX buffer recycling (vendor _mtlk_mmb_handle_dat_ind):
+		 * allocate and DMA-map the replacement skb before unmapping and
+		 * handing the received skb up to napi_gro_receive(). On OOM or
+		 * mapping failure, keep the existing buffer in the ring.
+		 */
+		new_skb = dev_alloc_skb(buf->size);
+		if (unlikely(!new_skb)) {
+			ndev->stats.rx_dropped++;
 			goto recycle_reuse;
 		}
 
-		const struct ethhdr *eth = (const struct ethhdr *)(buf->skb->data + offset);
-		const u8 *src_mac = eth->h_source;
+		new_dma = dma_map_single(wdev->dev, new_skb->data, buf->size,
+					 DMA_FROM_DEVICE);
+		if (unlikely(dma_mapping_error(wdev->dev, new_dma))) {
+			dev_kfree_skb_any(new_skb);
+			ndev->stats.rx_dropped++;
+			goto recycle_reuse;
+		}
 
-		skb_put_data(skb, buf->skb->data + offset, len);
-		dma_sync_single_for_device(wdev->dev, buf->dma, buf->size,
-					   DMA_FROM_DEVICE);
+		skb = buf->skb;
+		dma_unmap_single(wdev->dev, buf->dma, buf->size, DMA_FROM_DEVICE);
+		buf->skb = new_skb;
+		buf->dma = new_dma;
+
+		skb_put(skb, total);
+		skb_pull(skb, offset);
+
+		/*
+		 * Ensure 4-byte alignment of the L3 header (after eth_type_trans()
+		 * pulls ETH_HLEN = 14 bytes) on MIPS when HW offset % 4 != 0.
+		 */
+		{
+			unsigned int align = ((unsigned long)(skb->data + ETH_HLEN)) & 3;
+
+			if (unlikely(align)) {
+				skb_push(skb, align);
+				memmove(skb->data, skb->data + align, len);
+				skb_trim(skb, len);
+			}
+		}
+
+		ether_addr_copy(src_mac, ((const struct ethhdr *)skb->data)->h_source);
 
 		skb->protocol = eth_type_trans(skb, ndev);
 		skb->ip_summed = CHECKSUM_NONE;
 
 		napi_gro_receive(&dma->napi, skb);
 		dma->rx_packets++;
-		if (ndev) {
-			ndev->stats.rx_packets++;
-			ndev->stats.rx_bytes += len;
-		}
-		if (radio) {
-			if (!is_multicast_ether_addr(src_mac)) {
-				struct wave600_station *sta = wave600_find_sta(radio, src_mac);
+		ndev->stats.rx_packets++;
+		ndev->stats.rx_bytes += len;
+		if (!is_multicast_ether_addr(src_mac)) {
+			struct wave600_station *sta = wave600_find_sta(radio, src_mac);
 
-				if (sta) {
-					sta->rx_packets++;
-					sta->rx_bytes += len;
-					sta->last_rx = jiffies;
-				}
+			if (sta) {
+				sta->rx_packets++;
+				sta->rx_bytes += len;
+				sta->last_rx = jiffies;
 			}
 		}
 
 recycle_reuse:
 		recycle_hd = *hd;
+		recycle_hd.payload_addr = cpu_to_le32((u32)buf->dma);
 		recycle_hd.info3 = cpu_to_le32((le32_to_cpu(recycle_hd.info3) & ~W600_TX_OWN) |
 					       W600_OWN_FW);
 		wave600_dma_ring_push(dma, r, &recycle_hd);
@@ -1403,7 +1423,8 @@ void wave600_dma_enable_napi(struct wave600_dev *wdev)
 {
 	struct wave600_dma *dma = &wdev->dma;
 
-	netif_napi_add(dma->ndev, &dma->napi, wave600_dma_poll);
+	init_dummy_netdev(&dma->napi_dev);
+	netif_napi_add(&dma->napi_dev, &dma->napi, wave600_dma_poll);
 	napi_enable(&dma->napi);
 	dma->napi_added = true;
 }
@@ -1411,14 +1432,19 @@ void wave600_dma_enable_napi(struct wave600_dev *wdev)
 void wave600_dma_stop_netdev(struct wave600_dev *wdev)
 {
 	struct wave600_dma *dma = &wdev->dma;
+	int i;
 
 	if (dma->napi_added) {
 		napi_disable(&dma->napi);
 		netif_napi_del(&dma->napi);
 		dma->napi_added = false;
 	}
-	if (dma->ndev)
-		netif_tx_disable(dma->ndev);
+	for (i = 0; i < 2; i++) {
+		struct net_device *ndev = wdev->radios[i].ndev;
+
+		if (ndev)
+			netif_tx_disable(ndev);
+	}
 }
 
 void wave600_dma_cleanup(struct wave600_dev *wdev)

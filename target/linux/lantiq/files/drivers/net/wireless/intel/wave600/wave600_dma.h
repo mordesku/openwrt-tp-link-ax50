@@ -82,6 +82,7 @@ struct wave600_dma_buf {
 struct wave600_dma {
 	struct wave600_dev *wdev;
 	struct net_device *ndev;
+	struct net_device napi_dev;
 	struct napi_struct napi;
 	bool data_path_ready;
 	bool napi_added;
