@@ -835,6 +835,8 @@ static int wave600_dma_poll(struct napi_struct *napi, int budget)
 	struct wave600_dev *wdev = dma->wdev;
 	int work;
 
+	/* Drain IPC confirmations/indications while NAPI holds HOST_IRQ_MASK at 0 */
+	wave600_ipc_service_control(wdev);
 	wave600_dma_tx_clean(dma, WAVE600_DMA_RING_SIZE);
 	wave600_dma_mgmt_tx_clean(dma, WAVE600_DMA_MGMT_RING_SIZE);
 	wave600_dma_mgmt_rx(dma, WAVE600_DMA_MGMT_RING_SIZE);

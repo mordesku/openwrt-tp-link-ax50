@@ -376,6 +376,9 @@ static int wave600_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *ndev
 	netif_tx_stop_all_queues(ndev);
 	netif_carrier_off(ndev);
 
+	/* Ensure all stations are removed from FW before stopping/removing the VAP */
+	wave600_radio_flush_stations(radio);
+
 	memset(&p, 0, sizeof(p));
 	p.vap_id = radio->vap_id;
 
@@ -1024,7 +1027,8 @@ static int wave600_cfg80211_add_key(struct wiphy *wiphy,
 	u16 key_type;
 	int ret;
 
-	if (!params || !params->key || params->key_len == 0)
+	if (!params || !params->key || params->key_len == 0 ||
+	    params->key_len > WAVE600_UMI_RSN_TK_LEN)
 		return -EINVAL;
 
 	switch (params->cipher) {
@@ -1049,12 +1053,19 @@ static int wave600_cfg80211_add_key(struct wiphy *wiphy,
 		return -EOPNOTSUPP;
 	}
 
-	if (params->cipher == WLAN_CIPHER_SUITE_AES_CMAC) {
-		sid = WAVE600_BCAST_DEST_SID;
-		key_type = WAVE600_UMI_RSN_MGMT_GROUP_KEY; /* 2 = IGTK (BIP) */
-		dev_dbg(wdev->dev, "Radio %u add_key (IGTK/BIP): bcast sid=0x%04x key_idx=%u len=%u\n",
-			radio->radio_idx, sid, key_index, params->key_len);
-	} else if (pairwise && mac_addr) {
+	/*
+	 * Firmware key table holds only indices 0..3 (MIB_WEP_N_DEFAULT_KEYS = 4).
+	 * IGTK keys (indices 4/5 for AES-CMAC/BIP) must not be sent to FW,
+	 * otherwise FW asserts in UM_MAN_SET_KEY_REQ. Accept in cfg80211 as in
+	 * vendor wave_radio_key_add() / mac80211.c.
+	 */
+	if (key_index >= WAVE600_MAX_HW_KEY_INDEX) {
+		dev_dbg(wdev->dev, "Radio %u add_key: key_idx=%u >= %u ignored by FW\n",
+			radio->radio_idx, key_index, WAVE600_MAX_HW_KEY_INDEX);
+		return 0;
+	}
+
+	if (pairwise && mac_addr) {
 		int sta_sid = wave600_radio_find_sid(radio, mac_addr);
 		if (sta_sid < 0) {
 			dev_warn(wdev->dev, "Radio %u add_key: station %pM not found\n",
@@ -1066,11 +1077,15 @@ static int wave600_cfg80211_add_key(struct wiphy *wiphy,
 		dev_dbg(wdev->dev, "Radio %u add_key (PAIRWISE): STA %pM sid=%u key_idx=%u cipher=0x%04x len=%u\n",
 			radio->radio_idx, mac_addr, sid, key_index, u16_cipher, params->key_len);
 	} else {
+		/* Vendor core.c:12912 uses UMI_RSN_GROUP_KEY for both GTK and IGTK/BIP in SET_KEY */
 		sid = WAVE600_BCAST_DEST_SID;
 		key_type = WAVE600_UMI_RSN_GROUP_KEY;
-		radio->is_secure = true;
-		dev_dbg(wdev->dev, "Radio %u add_key (GROUP): bcast sid=0x%04x key_idx=%u cipher=0x%04x len=%u\n",
-			radio->radio_idx, sid, key_index, u16_cipher, params->key_len);
+		if (params->cipher != WLAN_CIPHER_SUITE_AES_CMAC)
+			radio->is_secure = true;
+		dev_dbg(wdev->dev, "Radio %u add_key (%s): bcast sid=0x%04x key_idx=%u cipher=0x%04x len=%u\n",
+			radio->radio_idx,
+			params->cipher == WLAN_CIPHER_SUITE_AES_CMAC ? "IGTK/BIP" : "GROUP",
+			sid, key_index, u16_cipher, params->key_len);
 	}
 
 	memset(&req, 0, sizeof(req));
@@ -1125,25 +1140,17 @@ static int wave600_cfg80211_del_key(struct wiphy *wiphy,
 	return 0;
 }
 
-static int wave600_cfg80211_set_default_key(struct wiphy *wiphy,
-					    struct net_device *ndev,
-					    int link_id,
-					    u8 key_index,
-					    bool unicast,
-					    bool multicast)
+static int wave600_set_default_key_idx(struct wave600_radio *radio,
+				       u16 key_type, u8 key_index)
 {
-	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
 	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_umi_default_key_index req;
 	struct wave600_umi_default_key_index cfm;
 	int ret;
 
-	dev_dbg(wdev->dev, "Radio %u set_default_key: key_idx=%u unicast=%d multicast=%d\n",
-		radio->radio_idx, key_index, unicast, multicast);
-
 	memset(&req, 0, sizeof(req));
 	req.sid = cpu_to_le16(WAVE600_BCAST_DEST_SID);
-	req.key_type = cpu_to_le16(WAVE600_UMI_RSN_GROUP_KEY);
+	req.key_type = cpu_to_le16(key_type);
 	req.key_index = cpu_to_le16(key_index);
 
 	ret = wave600_ipc_cmd_radio(wdev, radio->radio_idx,
@@ -1153,11 +1160,48 @@ static int wave600_cfg80211_set_default_key(struct wiphy *wiphy,
 				    &cfm, sizeof(cfm), 2000,
 				    radio->vap_id);
 	if (ret) {
-		dev_warn(wdev->dev, "Radio %u SET_DEFAULT_KEY IPC failed: %d\n", radio->radio_idx, ret);
+		dev_warn(wdev->dev,
+			 "Radio %u SET_DEFAULT_KEY (type %u idx %u) IPC failed: %d\n",
+			 radio->radio_idx, key_type, key_index, ret);
 		return ret;
 	}
 
 	return 0;
+}
+
+static int wave600_cfg80211_set_default_key(struct wiphy *wiphy,
+					    struct net_device *ndev,
+					    int link_id,
+					    u8 key_index,
+					    bool unicast,
+					    bool multicast)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+
+	dev_dbg(radio->wdev->dev, "Radio %u set_default_key: key_idx=%u unicast=%d multicast=%d\n",
+		radio->radio_idx, key_index, unicast, multicast);
+
+	return wave600_set_default_key_idx(radio, WAVE600_UMI_RSN_GROUP_KEY, key_index);
+}
+
+static int wave600_cfg80211_set_default_mgmt_key(struct wiphy *wiphy,
+						 struct net_device *ndev,
+						 int link_id,
+						 u8 key_index)
+{
+	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
+
+	if (key_index >= WAVE600_MAX_HW_KEY_INDEX) {
+		dev_dbg(radio->wdev->dev,
+			"Radio %u set_default_mgmt_key: key_idx=%u >= %u ignored by FW\n",
+			radio->radio_idx, key_index, WAVE600_MAX_HW_KEY_INDEX);
+		return 0;
+	}
+
+	dev_dbg(radio->wdev->dev, "Radio %u set_default_mgmt_key: key_idx=%u\n",
+		radio->radio_idx, key_index);
+
+	return wave600_set_default_key_idx(radio, WAVE600_UMI_RSN_MGMT_GROUP_KEY, key_index);
 }
 
 static int wave600_cfg80211_get_txpower(struct wiphy *wiphy,
@@ -1242,6 +1286,7 @@ static const struct cfg80211_ops wave600_cfg80211_ops = {
 	.add_key = wave600_cfg80211_add_key,
 	.del_key = wave600_cfg80211_del_key,
 	.set_default_key = wave600_cfg80211_set_default_key,
+	.set_default_mgmt_key = wave600_cfg80211_set_default_mgmt_key,
 	.auth = wave600_cfg80211_auth,
 	.assoc = wave600_cfg80211_assoc,
 	.deauth = wave600_cfg80211_deauth,

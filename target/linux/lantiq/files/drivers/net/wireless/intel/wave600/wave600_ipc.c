@@ -78,7 +78,7 @@ static bool wave600_ipc_dbg_cfm_poll(struct wave600_dev *wdev)
 
 /*
  * Consume completed messages from the Indication FIFO.
- * Runs in tasklet context only (ind_idx is owned by the tasklet).
+ * Serialized by ind_lock so both the IPC tasklet and NAPI poll can drain it.
  * Returns the number of messages consumed (0 if the FIFO was empty).
  */
 static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
@@ -86,7 +86,9 @@ static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 	struct wave600_ipc *ipc = &wdev->ipc;
 	int processed = 0;
 	int max_to_process = ipc->ind_num ? ipc->ind_num : 16;
+	unsigned long flags;
 
+	spin_lock_irqsave(&ipc->ind_lock, flags);
 	while (processed < max_to_process) {
 		u32 descr, type, idx, radio, vap;
 
@@ -519,8 +521,24 @@ static int wave600_ipc_process_fifo_ind(struct wave600_dev *wdev)
 			dev_dbg(wdev->dev, "unhandled descriptor type %u, index %u\n", type, idx);
 		}
 	}
+	spin_unlock_irqrestore(&ipc->ind_lock, flags);
 
 	return processed;
+}
+
+/**
+ * wave600_ipc_service_control - Drain control/IPC Indication FIFO while NAPI holds IRQ masked.
+ * @wdev: Wave600 device instance.
+ */
+void wave600_ipc_service_control(struct wave600_dev *wdev)
+{
+	u32 status = wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_STATUS);
+
+	if (status & WAVE600_IRQ_CONTROL) {
+		wave600_write32(wdev, WAVE600_MAC_GEN_PHI_IRQ_CLEAR, 0x1);
+		mmiowb();
+	}
+	wave600_ipc_process_fifo_ind(wdev);
 }
 
 /*
@@ -751,12 +769,13 @@ int wave600_ipc_cmd_radio(struct wave600_dev *wdev, u8 radio_idx, u16 req_id, u1
 	t = wait_for_completion_timeout(&cmd->done, msecs_to_jiffies(timeout_ms));
 	if (t == 0) {
 		u32 irq_stat = wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_STATUS);
+		u32 irq_mask = wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK);
 		u32 irq_vec = wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC);
 		u32 wdt_stat = wave600_read32(wdev, WAVE600_SOC_PCIE_AMBA_ORDR_WDT);
 
 		ipc->consecutive_timeouts++;
-		dev_err(wdev->dev, "IPC cmd 0x%04x timed out after %lu ms (consecutive %u, slot %u, IRQ_STATUS=0x%08x, INTR_VEC=0x%08x, AMBA_ORDR_WDT_INT=0x%08x)\n",
-			req_id, timeout_ms, ipc->consecutive_timeouts, slot, irq_stat, irq_vec, wdt_stat);
+		dev_err(wdev->dev, "IPC cmd 0x%04x timed out after %lu ms (consecutive %u, slot %u, IRQ_STATUS=0x%08x, IRQ_MASK=0x%08x, INTR_VEC=0x%08x, AMBA_ORDR_WDT_INT=0x%08x, storm=%d)\n",
+			req_id, timeout_ms, ipc->consecutive_timeouts, slot, irq_stat, irq_mask, irq_vec, wdt_stat, ipc->storm_latched);
 		ret = -ETIMEDOUT;
 
 		/* Only trigger recovery after 2 consecutive timeouts (user directive) */
@@ -804,6 +823,7 @@ int wave600_ipc_init(struct wave600_dev *wdev)
 	memset(ipc, 0, sizeof(*ipc));
 	ipc->wdev = wdev;
 	spin_lock_init(&ipc->lock);
+	spin_lock_init(&ipc->ind_lock);
 
 	for (i = 0; i < WAVE600_IPC_MAX_MAN_REQS; i++)
 		init_completion(&ipc->cmds[i].done);

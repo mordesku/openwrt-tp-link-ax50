@@ -422,6 +422,20 @@ int wave600_cfg80211_change_station(struct wiphy *wiphy,
 	return 0;
 }
 
+/**
+ * wave600_radio_flush_stations - Tear down all active stations on a radio.
+ * @radio: Radio instance whose stations should be removed from firmware and host table.
+ */
+void wave600_radio_flush_stations(struct wave600_radio *radio)
+{
+	int i;
+
+	for (i = 0; i < WAVE600_MAX_STATIONS; i++) {
+		if (radio->stations[i].valid)
+			wave600_teardown_station(radio, &radio->stations[i]);
+	}
+}
+
 int wave600_cfg80211_del_station(struct wiphy *wiphy,
 				 struct net_device *ndev,
 				 struct station_del_parameters *params)
@@ -429,7 +443,6 @@ int wave600_cfg80211_del_station(struct wiphy *wiphy,
 	struct wave600_radio *radio = wave600_wiphy_to_radio(wiphy);
 	struct wave600_dev *wdev = radio->wdev;
 	struct wave600_station *sta = NULL;
-	int i;
 
 	if (!radio->ap_started || atomic_read(&wdev->in_recovery) ||
 	    wdev->state != W600_STATE_RUNNING) {
@@ -448,10 +461,7 @@ int wave600_cfg80211_del_station(struct wiphy *wiphy,
 	}
 
 	/* Flush all stations on this radio */
-	for (i = 0; i < WAVE600_MAX_STATIONS; i++) {
-		if (radio->stations[i].valid)
-			wave600_teardown_station(radio, &radio->stations[i]);
-	}
+	wave600_radio_flush_stations(radio);
 
 	return 0;
 }

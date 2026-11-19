@@ -370,6 +370,7 @@ struct wave600_umi_802_1x_filter {
 
 #define WAVE600_UMI_RSN_SEQ_NUM_LEN 8 /* 6 bytes seq num + 2 bytes pad */
 #define WAVE600_UMI_RSN_TK_LEN      32 /* 16 bytes TK1 + 16 bytes TK2 */
+#define WAVE600_MAX_HW_KEY_INDEX    4 /* MIB_WEP_N_DEFAULT_KEYS: FW key table holds indices 0..3 */
 
 /* RSN Key types (vendor umi_rsn.h) */
 #define WAVE600_UMI_RSN_PAIRWISE_KEY    0
@@ -714,6 +715,7 @@ struct wave600_ipc_cmd {
 struct wave600_ipc {
 	struct wave600_dev *wdev;
 	spinlock_t lock;
+	spinlock_t ind_lock; /* serializes Indication FIFO consumer (tasklet & NAPI) */
 
 	/* SHRAM FIFO Queue Geometry */
 	u32 req_offset;
@@ -819,6 +821,7 @@ int wave600_ipc_dbg_set_severity(struct wave600_dev *wdev, u32 level, u32 cpu);
 int wave600_ipc_fw_logger_init(struct wave600_dev *wdev);
 void wave600_ipc_fw_logger_cleanup(struct wave600_dev *wdev);
 void wave600_ipc_diag_fw_state(struct wave600_dev *wdev, const char *tag);
+void wave600_ipc_service_control(struct wave600_dev *wdev);
 irqreturn_t wave600_ipc_isr(int irq, void *dev_id);
 
 #endif /* __WAVE600_IPC_H__ */
