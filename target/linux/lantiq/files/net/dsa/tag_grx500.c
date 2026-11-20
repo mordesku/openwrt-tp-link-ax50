@@ -56,6 +56,7 @@ static struct sk_buff *grx500_tag_rcv(struct sk_buff *skb,
 		return NULL;
 
 	skb_pull_rcsum(skb, GRX500_PMAC_HDR_LEN);
+	dsa_default_offload_fwd_mark(skb);
 
 	return skb;
 }

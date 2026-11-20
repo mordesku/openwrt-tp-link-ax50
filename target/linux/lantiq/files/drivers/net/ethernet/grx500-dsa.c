@@ -3,9 +3,11 @@
  * Intel / Lantiq GRX500 GSWIP 3.0 DSA switch driver
  */
 
+#include <linux/bitfield.h>
 #include <linux/errno.h>
 #include <linux/ethtool.h>
 #include <linux/grx500-gswip.h>
+#include <linux/if_bridge.h>
 #include <linux/mdio.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -15,8 +17,14 @@
 #include <linux/platform_device.h>
 #include <net/dsa.h>
 
-#define GRX500_DSA_NUM_PORTS	6
-#define GRX500_DSA_MAX_MTU	1528
+#define GRX500_DSA_NUM_PORTS		6
+#define GRX500_DSA_MAX_MTU		1528
+#define GRX500_DSA_MAX_VLANS		64
+#define GRX500_DSA_BR_FID		1
+#define GRX500_DSA_MAC_BRIDGE_SIZE	2048
+#define GRX500_DSA_MAC_FID_MASK		GENMASK(5, 0)
+#define GRX500_DSA_MAC_PORT_MASK	GENMASK(7, 4)
+#define GRX500_DSA_MAC_STATIC		BIT(0)
 
 struct grx500_dsa_port_cfg {
 	u8 switch_id;
@@ -46,10 +54,20 @@ static const char grx500_dsa_rmon_names[GRX500_GSWIP_RMON_STATS][ETH_GSTRING_LEN
 	"gswip_rx_undersize_bad",
 };
 
+struct grx500_dsa_vlan {
+	bool active;
+	u16 vid;
+	u16 port_mask;
+	u16 untag_mask;
+};
+
 struct grx500_dsa {
 	struct dsa_switch ds;
 	struct device *dev;
 	struct mii_bus *gswip[2];
+	u16 br_port_mask;
+	bool vlan_filtering;
+	struct grx500_dsa_vlan vlans[GRX500_DSA_MAX_VLANS];
 };
 
 static void grx500_dsa_release_buses(void *data)
@@ -102,6 +120,7 @@ static enum dsa_tag_protocol grx500_dsa_get_tag_protocol(struct dsa_switch *ds,
 
 static int grx500_dsa_setup(struct dsa_switch *ds)
 {
+	ds->configure_vlan_while_not_filtering = true;
 	return 0;
 }
 
@@ -260,6 +279,325 @@ static void grx500_dsa_get_ethtool_stats(struct dsa_switch *ds, int port,
 		memset(data, 0, sizeof(u64) * GRX500_GSWIP_RMON_STATS);
 }
 
+static int grx500_dsa_write_vlan_slot(struct grx500_dsa *priv, u16 slot,
+				      u16 vid, u16 fid, u16 port_mask,
+				      u16 untag_mask, bool valid)
+{
+	struct grx500_gswip_pce_entry entry = {
+		.index = slot,
+		.table = GRX500_PCE_TBL_ACTIVE_VLAN,
+		.key = { vid },
+		.val = { fid },
+		.valid = valid,
+	};
+	int ret;
+
+	ret = grx500_gswip_pce_write(priv->gswip[0], false, &entry);
+	if (ret || !valid)
+		return ret;
+
+	memset(&entry, 0, sizeof(entry));
+	entry.index = slot;
+	entry.table = GRX500_PCE_TBL_VLAN_MAPPING;
+	entry.val[0] = vid;
+	entry.val[1] = port_mask;
+	entry.val[2] = untag_mask;
+	return grx500_gswip_pce_write(priv->gswip[0], false, &entry);
+}
+
+static int grx500_dsa_port_bridge_join(struct dsa_switch *ds, int port,
+				       struct dsa_bridge bridge,
+				       bool *tx_fwd_offload,
+				       struct netlink_ext_ack *extack)
+{
+	struct grx500_dsa *priv = ds->priv;
+	int ret;
+
+	/* Never bridge GSWIP-R (wan, port 1) into GSWIP-L hardware switching. */
+	if (port <= 1 || port >= GRX500_DSA_NUM_PORTS)
+		return -EOPNOTSUPP;
+
+	priv->br_port_mask |= BIT(port);
+	if (!priv->vlan_filtering) {
+		ret = grx500_dsa_write_vlan_slot(priv, port + 1, 0, port + 1,
+						 0, 0, false);
+		if (ret)
+			return ret;
+		ret = grx500_dsa_write_vlan_slot(priv, GRX500_DSA_BR_FID, 0,
+						 GRX500_DSA_BR_FID,
+						 priv->br_port_mask | BIT(0),
+						 0, true);
+		if (ret)
+			return ret;
+	}
+
+	ret = grx500_gswip_set_pmap(priv->gswip[0], false, priv->br_port_mask);
+	if (!ret)
+		*tx_fwd_offload = true;
+	return ret;
+}
+
+static void grx500_dsa_port_bridge_leave(struct dsa_switch *ds, int port,
+					 struct dsa_bridge bridge)
+{
+	struct grx500_dsa *priv = ds->priv;
+
+	if (port <= 1 || port >= GRX500_DSA_NUM_PORTS)
+		return;
+
+	priv->br_port_mask &= ~BIT(port);
+	grx500_gswip_set_pmap(priv->gswip[0], false, priv->br_port_mask);
+
+	if (!priv->vlan_filtering) {
+		grx500_dsa_write_vlan_slot(priv, GRX500_DSA_BR_FID, 0,
+					   GRX500_DSA_BR_FID,
+					   priv->br_port_mask | BIT(0),
+					   0, !!priv->br_port_mask);
+		grx500_dsa_write_vlan_slot(priv, port + 1, 0, port + 1,
+					   BIT(port) | BIT(0), 0, true);
+	}
+}
+
+static void grx500_dsa_port_stp_state_set(struct dsa_switch *ds, int port,
+					  u8 state)
+{
+	struct grx500_dsa *priv = ds->priv;
+	const struct grx500_dsa_port_cfg *cfg;
+	u8 gswip_state;
+
+	if (port <= 0 || port >= GRX500_DSA_NUM_PORTS)
+		return;
+
+	switch (state) {
+	case BR_STATE_DISABLED:
+		gswip_state = 0xff;
+		break;
+	case BR_STATE_BLOCKING:
+	case BR_STATE_LISTENING:
+		gswip_state = 0;
+		break;
+	case BR_STATE_LEARNING:
+		gswip_state = 3;
+		break;
+	case BR_STATE_FORWARDING:
+		gswip_state = 7;
+		break;
+	default:
+		return;
+	}
+
+	cfg = &grx500_dsa_ports[port];
+	grx500_gswip_set_stp_state(priv->gswip[cfg->switch_id],
+				   cfg->switch_id, cfg->switch_port,
+				   gswip_state);
+}
+
+static void grx500_dsa_port_fast_age(struct dsa_switch *ds, int port)
+{
+	struct grx500_dsa *priv = ds->priv;
+	struct grx500_gswip_pce_entry mac = { 0 };
+	int i;
+
+	if (port <= 1 || port >= GRX500_DSA_NUM_PORTS)
+		return;
+
+	for (i = 0; i < GRX500_DSA_MAC_BRIDGE_SIZE; i++) {
+		memset(&mac, 0, sizeof(mac));
+		mac.table = GRX500_PCE_TBL_MAC_BRIDGE;
+		mac.index = i;
+		if (grx500_gswip_pce_read(priv->gswip[0], false, &mac))
+			return;
+		if (!mac.valid || (mac.val[1] & GRX500_DSA_MAC_STATIC))
+			continue;
+		if (FIELD_GET(GRX500_DSA_MAC_PORT_MASK, mac.val[0]) != port)
+			continue;
+		mac.valid = false;
+		if (grx500_gswip_pce_write(priv->gswip[0], false, &mac))
+			return;
+	}
+}
+
+static int grx500_dsa_port_fdb(struct dsa_switch *ds, int port,
+			       const unsigned char *addr, u16 vid, bool add)
+{
+	struct grx500_dsa *priv = ds->priv;
+	struct grx500_gswip_pce_entry mac = { 0 };
+	u16 fid = GRX500_DSA_BR_FID;
+	int i;
+
+	if (port <= 1 || port >= GRX500_DSA_NUM_PORTS)
+		return 0;
+
+	if (vid && priv->vlan_filtering) {
+		for (i = 8; i < GRX500_DSA_MAX_VLANS; i++) {
+			if (priv->vlans[i].active && priv->vlans[i].vid == vid) {
+				fid = i;
+				break;
+			}
+		}
+	}
+
+	mac.table = GRX500_PCE_TBL_MAC_BRIDGE;
+	mac.key_mode = true;
+	mac.key[0] = addr[5] | (addr[4] << 8);
+	mac.key[1] = addr[3] | (addr[2] << 8);
+	mac.key[2] = addr[1] | (addr[0] << 8);
+	mac.key[3] = FIELD_PREP(GRX500_DSA_MAC_FID_MASK, fid);
+	mac.val[0] = add ? BIT(port) : 0;
+	mac.val[1] = GRX500_DSA_MAC_STATIC;
+	mac.valid = add;
+
+	return grx500_gswip_pce_write(priv->gswip[0], false, &mac);
+}
+
+static int grx500_dsa_port_fdb_add(struct dsa_switch *ds, int port,
+				   const unsigned char *addr, u16 vid,
+				   struct dsa_db db)
+{
+	return grx500_dsa_port_fdb(ds, port, addr, vid, true);
+}
+
+static int grx500_dsa_port_fdb_del(struct dsa_switch *ds, int port,
+				   const unsigned char *addr, u16 vid,
+				   struct dsa_db db)
+{
+	return grx500_dsa_port_fdb(ds, port, addr, vid, false);
+}
+
+static int grx500_dsa_port_fdb_dump(struct dsa_switch *ds, int port,
+				    dsa_fdb_dump_cb_t *cb, void *data)
+{
+	struct grx500_dsa *priv = ds->priv;
+	struct grx500_gswip_pce_entry mac;
+	unsigned char addr[ETH_ALEN];
+	int i, err;
+
+	if (port <= 1 || port >= GRX500_DSA_NUM_PORTS)
+		return 0;
+
+	for (i = 0; i < GRX500_DSA_MAC_BRIDGE_SIZE; i++) {
+		memset(&mac, 0, sizeof(mac));
+		mac.table = GRX500_PCE_TBL_MAC_BRIDGE;
+		mac.index = i;
+		err = grx500_gswip_pce_read(priv->gswip[0], false, &mac);
+		if (err)
+			return err;
+		if (!mac.valid)
+			continue;
+
+		addr[5] = mac.key[0] & 0xff;
+		addr[4] = (mac.key[0] >> 8) & 0xff;
+		addr[3] = mac.key[1] & 0xff;
+		addr[2] = (mac.key[1] >> 8) & 0xff;
+		addr[1] = mac.key[2] & 0xff;
+		addr[0] = (mac.key[2] >> 8) & 0xff;
+
+		if (mac.val[1] & GRX500_DSA_MAC_STATIC) {
+			if (mac.val[0] & BIT(port)) {
+				err = cb(addr, 0, true, data);
+				if (err)
+					return err;
+			}
+		} else if (port == FIELD_GET(GRX500_DSA_MAC_PORT_MASK,
+					     mac.val[0])) {
+			err = cb(addr, 0, false, data);
+			if (err)
+				return err;
+		}
+	}
+
+	return 0;
+}
+
+static int grx500_dsa_port_vlan_filtering(struct dsa_switch *ds, int port,
+					  bool vlan_filtering,
+					  struct netlink_ext_ack *extack)
+{
+	struct grx500_dsa *priv = ds->priv;
+	int p, ret;
+
+	if (port == 0)
+		return 0;
+	if (port == 1 || port >= GRX500_DSA_NUM_PORTS)
+		return -EOPNOTSUPP;
+
+	priv->vlan_filtering = vlan_filtering;
+	for (p = 2; p <= 5; p++) {
+		ret = grx500_gswip_set_vlan_ctrl(priv->gswip[0], false, p,
+						 vlan_filtering);
+		if (ret)
+			return ret;
+	}
+	return grx500_gswip_set_vlan_ctrl(priv->gswip[0], false, 0,
+					  vlan_filtering);
+}
+
+static int grx500_dsa_port_vlan_add(struct dsa_switch *ds, int port,
+				    const struct switchdev_obj_port_vlan *vlan,
+				    struct netlink_ext_ack *extack)
+{
+	struct grx500_dsa *priv = ds->priv;
+	bool untagged = vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED;
+	int i, slot = -1;
+
+	if (port == 0)
+		return 0;
+	if (port == 1 || port >= GRX500_DSA_NUM_PORTS)
+		return -EOPNOTSUPP;
+
+	for (i = 8; i < GRX500_DSA_MAX_VLANS; i++) {
+		if (priv->vlans[i].active && priv->vlans[i].vid == vlan->vid) {
+			slot = i;
+			break;
+		}
+		if (!priv->vlans[i].active && slot < 0)
+			slot = i;
+	}
+	if (slot < 0)
+		return -ENOSPC;
+
+	priv->vlans[slot].active = true;
+	priv->vlans[slot].vid = vlan->vid;
+	priv->vlans[slot].port_mask |= BIT(port) | BIT(0);
+	if (untagged)
+		priv->vlans[slot].untag_mask |= BIT(port);
+	else
+		priv->vlans[slot].untag_mask &= ~BIT(port);
+
+	return grx500_dsa_write_vlan_slot(priv, slot, vlan->vid, slot,
+					  priv->vlans[slot].port_mask,
+					  priv->vlans[slot].untag_mask, true);
+}
+
+static int grx500_dsa_port_vlan_del(struct dsa_switch *ds, int port,
+				    const struct switchdev_obj_port_vlan *vlan)
+{
+	struct grx500_dsa *priv = ds->priv;
+	int i;
+
+	if (port <= 1 || port >= GRX500_DSA_NUM_PORTS)
+		return 0;
+
+	for (i = 8; i < GRX500_DSA_MAX_VLANS; i++) {
+		if (!priv->vlans[i].active || priv->vlans[i].vid != vlan->vid)
+			continue;
+
+		priv->vlans[i].port_mask &= ~BIT(port);
+		priv->vlans[i].untag_mask &= ~BIT(port);
+		if (!(priv->vlans[i].port_mask & ~BIT(0))) {
+			priv->vlans[i].active = false;
+			priv->vlans[i].port_mask = 0;
+			return grx500_dsa_write_vlan_slot(priv, i, vlan->vid, i,
+							  0, 0, false);
+		}
+		return grx500_dsa_write_vlan_slot(priv, i, vlan->vid, i,
+						  priv->vlans[i].port_mask,
+						  priv->vlans[i].untag_mask,
+						  true);
+	}
+	return 0;
+}
+
 static const struct dsa_switch_ops grx500_dsa_ops = {
 	.get_tag_protocol	= grx500_dsa_get_tag_protocol,
 	.setup			= grx500_dsa_setup,
@@ -274,6 +612,16 @@ static const struct dsa_switch_ops grx500_dsa_ops = {
 	.get_sset_count		= grx500_dsa_get_sset_count,
 	.get_strings		= grx500_dsa_get_strings,
 	.get_ethtool_stats	= grx500_dsa_get_ethtool_stats,
+	.port_bridge_join	= grx500_dsa_port_bridge_join,
+	.port_bridge_leave	= grx500_dsa_port_bridge_leave,
+	.port_stp_state_set	= grx500_dsa_port_stp_state_set,
+	.port_fast_age		= grx500_dsa_port_fast_age,
+	.port_fdb_add		= grx500_dsa_port_fdb_add,
+	.port_fdb_del		= grx500_dsa_port_fdb_del,
+	.port_fdb_dump		= grx500_dsa_port_fdb_dump,
+	.port_vlan_filtering	= grx500_dsa_port_vlan_filtering,
+	.port_vlan_add		= grx500_dsa_port_vlan_add,
+	.port_vlan_del		= grx500_dsa_port_vlan_del,
 };
 
 static int grx500_dsa_probe(struct platform_device *pdev)

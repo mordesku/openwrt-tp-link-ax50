@@ -39,18 +39,36 @@
 
 #define GRX500_PCE_PCTRL		0x480
 #define GRX500_PCE_PCTRL_3		0x483
+#define GRX500_PCE_VCTRL(port)		(0x485 + 10 * (port))
+#define GRX500_PCE_VCTRL_UVR		BIT(0)
+#define GRX500_PCE_VCTRL_VIMR		BIT(3)
+#define GRX500_PCE_VCTRL_VEMR		BIT(4)
 #define GRX500_PCE_GCTRL		0x456
+#define GRX500_PCE_GCTRL_MTFL		BIT(0)
 #define GRX500_PCE_GCTRL_MC_VALID	BIT(3)
+#define GRX500_PCE_GCTRL_VLAN		BIT(14)
 #define GRX500_PCE_TFCR_NUM		0x46f
 #define GRX500_PCE_PMAP2		0x454
 #define GRX500_PCE_PMAP3		0x455
 #define GRX500_PCE_PORT_FORWARDING	7
 #define GRX500_PCE_TBL_CLEAR_FIRST	0x42a
 #define GRX500_PCE_TBL_CLEAR_LAST	0x449
+#define GRX500_PCE_TBL_KEY(x)		(0x447 - (x))
+#define GRX500_PCE_TBL_MASK		0x448
+#define GRX500_PCE_TBL_VAL(x)		(0x44d - (x))
 #define GRX500_PCE_TBL_VAL0		0x44d
 #define GRX500_PCE_TBL_ADDR		0x44e
 #define GRX500_PCE_TBL_CTRL		0x44f
 #define GRX500_PCE_TBL_BUSY		BIT(15)
+#define GRX500_PCE_TBL_TYPE		BIT(13)
+#define GRX500_PCE_TBL_VLD		BIT(12)
+#define GRX500_PCE_TBL_GMAP_MASK	GENMASK(10, 7)
+#define GRX500_PCE_TBL_OPMOD_MASK	GENMASK(6, 5)
+#define GRX500_PCE_TBL_OPMOD_ADRD	0x00
+#define GRX500_PCE_TBL_OPMOD_ADWR	0x20
+#define GRX500_PCE_TBL_OPMOD_KSRD	0x40
+#define GRX500_PCE_TBL_OPMOD_KSWR	0x60
+#define GRX500_PCE_TBL_ADDR_MASK	GENMASK(4, 0)
 #define GRX500_PCE_TBL_WRITE		BIT(5)
 
 #define GRX500_MAC_FLEN			0x8c5
@@ -73,6 +91,7 @@
 #define GRX500_BM_QUEUE_GCTRL		0x04a
 
 static DEFINE_MUTEX(grx500_gswip_bm_lock);
+static DEFINE_MUTEX(grx500_gswip_pce_lock);
 
 static u32 grx500_gswip_read(void __iomem *base, u16 word)
 {
@@ -142,14 +161,38 @@ int grx500_gswip_prepare_pce(struct mii_bus *bus, bool right)
 		grx500_gswip_write(base, GRX500_PCE_TBL_CTRL, 0);
 	}
 	grx500_gswip_update_bits(base, GRX500_PCE_GCTRL,
-				 GRX500_PCE_GCTRL_MC_VALID,
-				 GRX500_PCE_GCTRL_MC_VALID);
+				 GRX500_PCE_GCTRL_MC_VALID |
+				 (right ? 0 : GRX500_PCE_GCTRL_VLAN),
+				 GRX500_PCE_GCTRL_MC_VALID |
+				 (right ? 0 : GRX500_PCE_GCTRL_VLAN));
 	grx500_gswip_update_bits(base, GRX500_BM_QUEUE_GCTRL, BIT(10), 0);
 	for (port = 0; port <= (right ? 15 : 5); port++) {
 		grx500_gswip_update_bits(base, GRX500_BM_PCFG + 2 * port,
 					 BIT(0), BIT(0));
 		grx500_gswip_update_bits(base, GRX500_BM_RMON_CTRL + 2 * port,
 					 BIT(2), BIT(2));
+	}
+	if (!right) {
+		for (port = 2; port <= 5; port++) {
+			struct grx500_gswip_pce_entry vlan = {
+				.index = port + 1,
+				.table = GRX500_PCE_TBL_ACTIVE_VLAN,
+				.val = { port + 1 },
+				.valid = true,
+			};
+
+			ret = grx500_gswip_pce_write(bus, false, &vlan);
+			if (ret)
+				return ret;
+
+			memset(&vlan, 0, sizeof(vlan));
+			vlan.index = port + 1;
+			vlan.table = GRX500_PCE_TBL_VLAN_MAPPING;
+			vlan.val[1] = BIT(port) | BIT(0);
+			ret = grx500_gswip_pce_write(bus, false, &vlan);
+			if (ret)
+				return ret;
+		}
 	}
 	dev_info(bus->parent, "GSWIP PCE parser loaded (%zu rows); switch enabled\n",
 		 ARRAY_SIZE(grx500_pce_ucode));
@@ -443,6 +486,177 @@ int grx500_gswip_get_rmon_stats(struct mii_bus *bus, bool right, u8 port,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(grx500_gswip_get_rmon_stats);
+
+int grx500_gswip_pce_read(struct mii_bus *bus, bool right,
+			  struct grx500_gswip_pce_entry *entry)
+{
+	void __iomem *base;
+	u32 ctrl;
+	u16 addr_mode;
+	int i, ret;
+
+	if (!grx500_gswip_bus_valid(bus, right) || !entry)
+		return -EINVAL;
+	base = bus->priv;
+	addr_mode = entry->key_mode ? GRX500_PCE_TBL_OPMOD_KSRD :
+				      GRX500_PCE_TBL_OPMOD_ADRD;
+
+	mutex_lock(&grx500_gswip_pce_lock);
+	ret = read_poll_timeout(grx500_gswip_read, ctrl,
+				!(ctrl & GRX500_PCE_TBL_BUSY), 1, 1000,
+				false, base, GRX500_PCE_TBL_CTRL);
+	if (ret)
+		goto out;
+
+	grx500_gswip_write(base, GRX500_PCE_TBL_ADDR, entry->index);
+	grx500_gswip_update_bits(base, GRX500_PCE_TBL_CTRL,
+				 GRX500_PCE_TBL_ADDR_MASK |
+				 GRX500_PCE_TBL_OPMOD_MASK |
+				 GRX500_PCE_TBL_BUSY,
+				 (entry->table & GRX500_PCE_TBL_ADDR_MASK) |
+				 addr_mode | GRX500_PCE_TBL_BUSY);
+
+	ret = read_poll_timeout(grx500_gswip_read, ctrl,
+				!(ctrl & GRX500_PCE_TBL_BUSY), 1, 1000,
+				false, base, GRX500_PCE_TBL_CTRL);
+	if (ret)
+		goto out;
+
+	for (i = 0; i < ARRAY_SIZE(entry->key); i++)
+		entry->key[i] = grx500_gswip_read(base, GRX500_PCE_TBL_KEY(i));
+	for (i = 0; i < ARRAY_SIZE(entry->val); i++)
+		entry->val[i] = grx500_gswip_read(base, GRX500_PCE_TBL_VAL(i));
+	entry->mask = grx500_gswip_read(base, GRX500_PCE_TBL_MASK);
+
+	ctrl = grx500_gswip_read(base, GRX500_PCE_TBL_CTRL);
+	entry->type = !!(ctrl & GRX500_PCE_TBL_TYPE);
+	entry->valid = !!(ctrl & GRX500_PCE_TBL_VLD);
+	entry->gmap = (ctrl & GRX500_PCE_TBL_GMAP_MASK) >> 7;
+out:
+	mutex_unlock(&grx500_gswip_pce_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(grx500_gswip_pce_read);
+
+int grx500_gswip_pce_write(struct mii_bus *bus, bool right,
+			   const struct grx500_gswip_pce_entry *entry)
+{
+	void __iomem *base;
+	u32 ctrl;
+	u16 addr_mode;
+	int i, ret;
+
+	if (!grx500_gswip_bus_valid(bus, right) || !entry)
+		return -EINVAL;
+	base = bus->priv;
+	addr_mode = entry->key_mode ? GRX500_PCE_TBL_OPMOD_KSWR :
+				      GRX500_PCE_TBL_OPMOD_ADWR;
+
+	mutex_lock(&grx500_gswip_pce_lock);
+	ret = read_poll_timeout(grx500_gswip_read, ctrl,
+				!(ctrl & GRX500_PCE_TBL_BUSY), 1, 1000,
+				false, base, GRX500_PCE_TBL_CTRL);
+	if (ret)
+		goto out;
+
+	grx500_gswip_write(base, GRX500_PCE_TBL_ADDR, entry->index);
+	for (i = 0; i < ARRAY_SIZE(entry->key); i++)
+		grx500_gswip_write(base, GRX500_PCE_TBL_KEY(i), entry->key[i]);
+	for (i = 0; i < ARRAY_SIZE(entry->val); i++)
+		grx500_gswip_write(base, GRX500_PCE_TBL_VAL(i), entry->val[i]);
+	grx500_gswip_write(base, GRX500_PCE_TBL_MASK, entry->mask);
+
+	ctrl = (entry->table & GRX500_PCE_TBL_ADDR_MASK) | addr_mode |
+	       GRX500_PCE_TBL_BUSY | ((entry->gmap << 7) & GRX500_PCE_TBL_GMAP_MASK);
+	if (entry->type)
+		ctrl |= GRX500_PCE_TBL_TYPE;
+	if (entry->valid)
+		ctrl |= GRX500_PCE_TBL_VLD;
+
+	grx500_gswip_write(base, GRX500_PCE_TBL_CTRL, ctrl);
+	ret = read_poll_timeout(grx500_gswip_read, ctrl,
+				!(ctrl & GRX500_PCE_TBL_BUSY), 1, 1000,
+				false, base, GRX500_PCE_TBL_CTRL);
+out:
+	mutex_unlock(&grx500_gswip_pce_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(grx500_gswip_pce_write);
+
+int grx500_gswip_set_stp_state(struct mii_bus *bus, bool right, u8 port,
+			       u8 stp_state)
+{
+	void __iomem *base;
+
+	if (!grx500_gswip_bus_valid(bus, right) || port > (right ? 15 : 5))
+		return -EINVAL;
+	base = bus->priv;
+
+	if (stp_state == 0xff) {
+		grx500_gswip_update_bits(base, GRX500_SDMA_PCTRL + 6 * port,
+					 BIT(0), 0);
+		return 0;
+	}
+
+	grx500_gswip_update_bits(base, GRX500_SDMA_PCTRL + 6 * port,
+				 BIT(0), BIT(0));
+	grx500_gswip_update_bits(base, GRX500_PCE_PCTRL + 10 * port,
+				 GENMASK(2, 0), stp_state & GENMASK(2, 0));
+	return 0;
+}
+EXPORT_SYMBOL_GPL(grx500_gswip_set_stp_state);
+
+int grx500_gswip_set_pmap(struct mii_bus *bus, bool right, u16 port_mask)
+{
+	void __iomem *base;
+
+	if (!grx500_gswip_bus_valid(bus, right))
+		return -EINVAL;
+	base = bus->priv;
+
+	grx500_gswip_write(base, GRX500_PCE_PMAP2, port_mask | BIT(0));
+	grx500_gswip_write(base, GRX500_PCE_PMAP3, port_mask | BIT(0));
+	return 0;
+}
+EXPORT_SYMBOL_GPL(grx500_gswip_set_pmap);
+
+int grx500_gswip_set_vlan_ctrl(struct mii_bus *bus, bool right, u8 port,
+			       bool vlan_aware)
+{
+	void __iomem *base;
+	u32 vctrl = vlan_aware ? (GRX500_PCE_VCTRL_UVR |
+				  GRX500_PCE_VCTRL_VIMR |
+				  GRX500_PCE_VCTRL_VEMR) : 0;
+
+	if (!grx500_gswip_bus_valid(bus, right) || port > (right ? 15 : 5))
+		return -EINVAL;
+	base = bus->priv;
+
+	grx500_gswip_update_bits(base, GRX500_PCE_VCTRL(port),
+				 GRX500_PCE_VCTRL_UVR |
+				 GRX500_PCE_VCTRL_VIMR |
+				 GRX500_PCE_VCTRL_VEMR, vctrl);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(grx500_gswip_set_vlan_ctrl);
+
+int grx500_gswip_flush_fdb(struct mii_bus *bus, bool right)
+{
+	void __iomem *base;
+	u32 ctrl;
+
+	if (!grx500_gswip_bus_valid(bus, right))
+		return -EINVAL;
+	base = bus->priv;
+
+	grx500_gswip_update_bits(base, GRX500_PCE_GCTRL,
+				 GRX500_PCE_GCTRL_MTFL,
+				 GRX500_PCE_GCTRL_MTFL);
+	return read_poll_timeout(grx500_gswip_read, ctrl,
+				 !(ctrl & GRX500_PCE_GCTRL_MTFL), 1, 1000,
+				 false, base, GRX500_PCE_GCTRL);
+}
+EXPORT_SYMBOL_GPL(grx500_gswip_flush_fdb);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("GRX500 GSWIP 3.0 switch fabric helpers");
