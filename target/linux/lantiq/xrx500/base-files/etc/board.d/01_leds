@@ -13,8 +13,8 @@ tplink,archer-ax50-v1)
 	ucidef_set_led_netdev "lan" "LAN" "green:lan" "br-lan" "link tx rx"
 	ucidef_set_led_default "wan_amber" "WAN (Amber)" "amber:wan" "1"
 	ucidef_set_led_default "wan_blue" "WAN (Blue)" "blue:wan" "0"
-	ucidef_set_led_default "wlan2g" "Wi-Fi 2.4G" "green:wlan2g" "0"
-	ucidef_set_led_default "wlan5g" "Wi-Fi 5G" "green:wlan5g" "0"
+	ucidef_set_led_netdev "wlan2g" "Wi-Fi 2.4G" "green:wlan2g" "phy0-ap0" "link tx rx"
+	ucidef_set_led_netdev "wlan5g" "Wi-Fi 5G" "green:wlan5g" "phy1-ap0" "link tx rx"
 	ucidef_set_led_usbport "usb" "USB" "green:usb" "usb1-port1" "usb2-port1"
 	;;
 esac

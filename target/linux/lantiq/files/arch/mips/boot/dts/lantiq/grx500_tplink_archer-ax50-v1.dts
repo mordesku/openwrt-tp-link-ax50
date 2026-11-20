@@ -277,10 +277,10 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		ethernet-phy@2 { reg = <2>; };
-		ethernet-phy@3 { reg = <3>; };
-		ethernet-phy@4 { reg = <4>; };
-		ethernet-phy@5 { reg = <5>; };
+		phy2: ethernet-phy@2 { reg = <2>; };
+		phy3: ethernet-phy@3 { reg = <3>; };
+		phy4: ethernet-phy@4 { reg = <4>; };
+		phy5: ethernet-phy@5 { reg = <5>; };
 	};
 
 	gswip_r: gswitch@1a000000 {
@@ -290,10 +290,10 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		ethernet-phy@1 { reg = <1>; };
+		phy1: ethernet-phy@1 { reg = <1>; };
 	};
 
-	datapath@1e700000 {
+	datapath: datapath@1e700000 {
 		compatible = "lantiq,grx500-datapath";
 		reg = <0x1e700000 0x1000>,
 		      <0x1e710000 0x10000>,
@@ -333,6 +333,64 @@
 				 <16 26 2 13 2>, <17 27 2 14 2>;
 		lantiq,wan-dqm-route = <19 28 1 15 2>;
 		lantiq,cpu-dqm-port = <2 35>;
+	};
+
+	switch {
+		compatible = "lantiq,grx500-dsa";
+		lantiq,gswip-left = <&gswip_l>;
+		lantiq,gswip-right = <&gswip_r>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				label = "cpu";
+				ethernet = <&datapath>;
+				phy-mode = "internal";
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+				label = "wan";
+				phy-mode = "rgmii";
+				phy-handle = <&phy1>;
+			};
+
+			port@2 {
+				reg = <2>;
+				label = "lan4";
+				phy-mode = "gmii";
+				phy-handle = <&phy2>;
+			};
+
+			port@3 {
+				reg = <3>;
+				label = "lan3";
+				phy-mode = "gmii";
+				phy-handle = <&phy3>;
+			};
+
+			port@4 {
+				reg = <4>;
+				label = "lan2";
+				phy-mode = "gmii";
+				phy-handle = <&phy4>;
+			};
+
+			port@5 {
+				reg = <5>;
+				label = "lan1";
+				phy-mode = "gmii";
+				phy-handle = <&phy5>;
+			};
+		};
 	};
 };
 

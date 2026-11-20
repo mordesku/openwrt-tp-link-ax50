@@ -42,12 +42,16 @@ define KernelPackage/grx500-switch
   DEPENDS:=@TARGET_lantiq_xrx500
   KCONFIG:= \
 	CONFIG_MDIO_GRX500_GSWIP \
-	CONFIG_GRX500_DATAPATH
+	CONFIG_GRX500_DATAPATH \
+	CONFIG_GRX500_DSA \
+	CONFIG_NET_DSA_TAG_GRX500
   FILES:= \
 	$(LINUX_DIR)/drivers/net/mdio/mdio-grx500.ko \
 	$(LINUX_DIR)/drivers/net/ethernet/grx500-gswip.ko \
-	$(LINUX_DIR)/drivers/net/ethernet/grx500-datapath.ko
-  AUTOLOAD:=$(call AutoLoad,40,mdio-grx500 grx500-gswip grx500-datapath)
+	$(LINUX_DIR)/drivers/net/ethernet/grx500-datapath.ko \
+	$(LINUX_DIR)/drivers/net/ethernet/grx500-dsa.ko \
+	$(LINUX_DIR)/net/dsa/tag_grx500.ko
+  AUTOLOAD:=$(call AutoLoad,40,mdio-grx500 grx500-gswip tag_grx500 grx500-datapath grx500-dsa)
 endef
 
 define KernelPackage/grx500-switch/description

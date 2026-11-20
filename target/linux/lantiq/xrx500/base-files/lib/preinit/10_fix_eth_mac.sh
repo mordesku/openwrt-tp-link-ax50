@@ -14,10 +14,12 @@ preinit_set_mac_address() {
 		[ -z "$label_mac" ] && label_mac=$(mtd_get_mac_ascii "ubootconfigA" "ethaddr")
 		[ -z "$label_mac" ] && label_mac=$(mtd_get_mac_ascii "ubootconfigB" "ethaddr")
 
-		# Ensure switch and datapath modules are loaded
-		[ -d /sys/class/net/eth0 ] || {
+		# Ensure switch, datapath and DSA modules are loaded
+		[ -d /sys/class/net/wan ] || {
 			modprobe mdio-grx500 2>/dev/null
+			modprobe tag_grx500 2>/dev/null
 			modprobe grx500-datapath 2>/dev/null
+			modprobe grx500-dsa 2>/dev/null
 		}
 
 		if [ -n "$label_mac" ]; then
@@ -26,11 +28,12 @@ preinit_set_mac_address() {
 			wlan0_mac=$(macaddr_add "$label_mac" 2)
 			wlan1_mac=$(macaddr_add "$label_mac" 3)
 
-			ip link set dev eth0 address "$wan_mac" 2>/dev/null
-			ip link set dev eth1 address "$lan_mac" 2>/dev/null
-			ip link set dev eth2 address "$lan_mac" 2>/dev/null
-			ip link set dev eth3 address "$lan_mac" 2>/dev/null
-			ip link set dev eth4 address "$lan_mac" 2>/dev/null
+			ip link set dev eth0 address "$lan_mac" 2>/dev/null
+			ip link set dev wan address "$wan_mac" 2>/dev/null
+			ip link set dev lan1 address "$lan_mac" 2>/dev/null
+			ip link set dev lan2 address "$lan_mac" 2>/dev/null
+			ip link set dev lan3 address "$lan_mac" 2>/dev/null
+			ip link set dev lan4 address "$lan_mac" 2>/dev/null
 			[ -d /sys/class/net/wlan0 ] && ip link set dev wlan0 address "$wlan0_mac" 2>/dev/null
 			[ -d /sys/class/net/wlan1 ] && ip link set dev wlan1 address "$wlan1_mac" 2>/dev/null
 		fi

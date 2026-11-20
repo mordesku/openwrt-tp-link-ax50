@@ -1,0 +1,25 @@
+--- a/drivers/net/ethernet/Kconfig
++++ b/drivers/net/ethernet/Kconfig
+@@ -8,6 +8,14 @@ config GRX500_DATAPATH
+ 	  Provide the AX50 LAN1 netdevice through the GRX500 CBM/TMU packet
+ 	  path, with DMA, NAPI receive and read-only bring-up diagnostics.
+ 	  Other Ethernet ports are not exposed as netdevices yet.
++
++config GRX500_DSA
++	tristate "GRX500 GSWIP 3.0 DSA switch driver"
++	depends on LANTIQ && OF && NET_DSA
++	select NET_DSA_TAG_GRX500
++	help
++	  Expose GRX500 GSWIP-L and GSWIP-R ports as standard Linux DSA
++	  user interfaces (lan1-lan4, wan) over the GRX500 CPU conduit.
+ 
+ #
+ # Ethernet device configuration
+--- a/drivers/net/ethernet/Makefile
++++ b/drivers/net/ethernet/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_GRX500_DATAPATH) += grx500-gswip.o grx500-datapath.o
++obj-$(CONFIG_GRX500_DSA) += grx500-dsa.o
+ #
+ # Makefile for the Linux network Ethernet device drivers.
