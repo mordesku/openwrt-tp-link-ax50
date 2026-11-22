@@ -48,10 +48,11 @@ define KernelPackage/grx500-switch
   FILES:= \
 	$(LINUX_DIR)/drivers/net/mdio/mdio-grx500.ko \
 	$(LINUX_DIR)/drivers/net/ethernet/grx500-gswip.ko \
+	$(LINUX_DIR)/drivers/net/ethernet/grx500-pae.ko \
 	$(LINUX_DIR)/drivers/net/ethernet/grx500-datapath.ko \
 	$(LINUX_DIR)/drivers/net/ethernet/grx500-dsa.ko \
 	$(LINUX_DIR)/net/dsa/tag_grx500.ko
-  AUTOLOAD:=$(call AutoLoad,40,mdio-grx500 grx500-gswip tag_grx500 grx500-datapath grx500-dsa)
+  AUTOLOAD:=$(call AutoLoad,40,mdio-grx500 grx500-gswip grx500-pae tag_grx500 grx500-datapath grx500-dsa)
 endef
 
 define KernelPackage/grx500-switch/description

@@ -1,0 +1,9 @@
+--- a/drivers/net/ethernet/Makefile
++++ b/drivers/net/ethernet/Makefile
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
+-obj-$(CONFIG_GRX500_DATAPATH) += grx500-gswip.o grx500-datapath.o
++obj-$(CONFIG_GRX500_DATAPATH) += grx500-gswip.o grx500-pae.o grx500-datapath.o
+ obj-$(CONFIG_GRX500_DSA) += grx500-dsa.o
+ #
+ # Makefile for the Linux network Ethernet device drivers.

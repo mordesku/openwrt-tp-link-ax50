@@ -6,12 +6,19 @@
 #include <linux/ethtool.h>
 #include <linux/grx500-gswip.h>
 #include <linux/grx500-memory.h>
+#include <linux/grx500-pae.h>
+#include <linux/hashtable.h>
 #include <linux/if_vlan.h>
+#include <linux/in.h>
+#include <linux/in6.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/of.h>
 #include <linux/of_mdio.h>
@@ -23,8 +30,13 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/sysfs.h>
+#include <linux/tcp.h>
 #include <linux/timer.h>
 #include <linux/u64_stats_sync.h>
+#include <linux/udp.h>
+#include <net/dsa.h>
+#include <net/flow_offload.h>
+#include <net/pkt_cls.h>
 #include <lantiq_dmax.h>
 
 /* Offsets are from the vendor CBM/TMU generated register headers. */
@@ -281,6 +293,23 @@ struct grx500_datapath {
 		bool buffers_allocated;
 	} p2p[GRX500_LAN_P2P_CLASSES];
 	struct mii_bus *gswip[2];
+	struct grx500_pae_ctx *pae;
+	DECLARE_HASHTABLE(pae_flows, 8);
+	struct mutex pae_lock;
+	u32 pae_bind_cnt;
+	u32 pae_replace_ok;
+	u32 pae_replace_err;
+	u32 pae_del_cnt;
+	u32 pae_stats_cnt;
+	u32 pae_hit_cnt;
+	int pae_last_err;
+	u8 pae_last_stage;
+};
+
+struct grx500_pae_flow_entry {
+	struct hlist_node hnode;
+	unsigned long cookie;
+	u16 session_idx;
 };
 
 static struct grx500_datapath *grx500_conduit_priv(struct net_device *ndev)
@@ -1526,6 +1555,11 @@ static int grx500_start(struct grx500_datapath *dp)
 	ret = grx500_cbm_prepare_switches(dp);
 	if (ret)
 		goto err_engines;
+	if (dp->pae) {
+		ret = grx500_pae_enable_pce_rules(dp->pae);
+		if (ret)
+			dev_warn(dp->dev, "PAE PCE rules failed: %d\n", ret);
+	}
 	ret = request_irq(dp->irq[GRX500_RX_IRQ_INDEX], grx500_irq, 0, "grx500-ports", dp);
 	if (ret)
 		goto err_engines;
@@ -1682,6 +1716,419 @@ static void grx500_set_rx_mode(struct net_device *ndev)
 	 */
 }
 
+static int grx500_pae_port_map(struct grx500_datapath *dp,
+			       struct net_device *dev, u16 *port_map)
+{
+	struct dsa_port *p = dsa_port_from_netdev(dev);
+
+	if (IS_ERR(p) || dsa_port_to_conduit(p) != dp->ndev)
+		return -EOPNOTSUPP;
+
+	if (p->index == 1) {
+		*port_map = BIT(GRX500_WAN_ENDPOINT);
+		return 0;
+	}
+	if (p->index >= 2 && p->index <= 5) {
+		*port_map = BIT(p->index);
+		return 0;
+	}
+	return -EOPNOTSUPP;
+}
+
+static struct grx500_pae_flow_entry *
+grx500_pae_flow_lookup(struct grx500_datapath *dp, unsigned long cookie)
+{
+	struct grx500_pae_flow_entry *entry;
+
+	hash_for_each_possible(dp->pae_flows, entry, hnode, cookie) {
+		if (entry->cookie == cookie)
+			return entry;
+	}
+	return NULL;
+}
+
+static int grx500_pae_parse_mangle(const struct flow_action_entry *act,
+				   struct grx500_pae_flow *flow,
+				   u8 eth_hdr[12], u8 eth_mask[12],
+				   bool *has_snat, bool *has_dnat)
+{
+	u32 off = act->mangle.offset;
+	u32 val, mask, idx;
+
+	switch (act->mangle.htype) {
+	case FLOW_ACT_MANGLE_HDR_TYPE_ETH: {
+		u16 val16;
+
+		if (off > 8 || (off & 1))
+			return -EOPNOTSUPP;
+		memcpy(&val, &act->mangle.val, sizeof(val));
+		memcpy(&mask, &act->mangle.mask, sizeof(mask));
+		if (mask == 0) {
+			memcpy(&eth_hdr[off], &act->mangle.val, 4);
+			memset(&eth_mask[off], 0xff, 4);
+		} else if (off == 4 && mask == ~0x0000ffffu) {
+			val16 = (u16)val;
+			memcpy(&eth_hdr[4], &val16, 2);
+			memset(&eth_mask[4], 0xff, 2);
+		} else if (off == 4 && mask == ~0xffff0000u) {
+			val16 = (u16)(val >> 16);
+			memcpy(&eth_hdr[6], &val16, 2);
+			memset(&eth_mask[6], 0xff, 2);
+		} else {
+			return -EOPNOTSUPP;
+		}
+		return 0;
+	}
+	case FLOW_ACT_MANGLE_HDR_TYPE_IP4:
+		if (flow->is_ipv6)
+			return -EOPNOTSUPP;
+		if (off == offsetof(struct iphdr, saddr))
+			*has_snat = true;
+		else if (off == offsetof(struct iphdr, daddr))
+			*has_dnat = true;
+		else
+			return -EOPNOTSUPP;
+		flow->nat_ip[0] = ntohl((__force __be32)act->mangle.val);
+		return 0;
+	case FLOW_ACT_MANGLE_HDR_TYPE_IP6:
+		if (!flow->is_ipv6)
+			return -EOPNOTSUPP;
+		if (off >= offsetof(struct ipv6hdr, saddr) &&
+		    off < offsetof(struct ipv6hdr, daddr)) {
+			*has_snat = true;
+			idx = (off - offsetof(struct ipv6hdr, saddr)) / 4;
+		} else if (off >= offsetof(struct ipv6hdr, daddr) &&
+			   off < sizeof(struct ipv6hdr)) {
+			*has_dnat = true;
+			idx = (off - offsetof(struct ipv6hdr, daddr)) / 4;
+		} else {
+			return -EOPNOTSUPP;
+		}
+		if (idx >= 4)
+			return -EOPNOTSUPP;
+		flow->nat_ip[idx] = ntohl((__force __be32)act->mangle.val);
+		return 0;
+	case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
+	case FLOW_ACT_MANGLE_HDR_TYPE_UDP:
+		if (off != 0)
+			return -EOPNOTSUPP;
+		val = ntohl((__force __be32)act->mangle.val);
+		mask = ntohl((__force __be32)act->mangle.mask);
+		if (mask == 0x0000ffffu) {
+			*has_snat = true;
+			flow->nat_port = val >> 16;
+		} else if (mask == 0xffff0000u) {
+			*has_dnat = true;
+			flow->nat_port = val & 0xffff;
+		} else {
+			return -EOPNOTSUPP;
+		}
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int grx500_pae_cls_replace(struct grx500_datapath *dp,
+				  struct flow_cls_offload *f)
+{
+	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+	struct flow_dissector *dissector = rule->match.dissector;
+	struct flow_match_meta meta;
+	struct flow_match_control ctrl;
+	struct flow_match_basic basic;
+	struct flow_match_ports ports;
+	struct flow_action_entry *act;
+	struct grx500_pae_flow flow = { 0 };
+	struct grx500_pae_flow_entry *entry;
+	struct net_device *in_dev, *out_dev = NULL;
+	u8 eth_hdr[12] = { 0 }, eth_mask[12] = { 0 };
+	bool has_snat = false, has_dnat = false;
+	u16 in_port_map, out_port_map, sess_idx;
+	int i, ret;
+
+	if (!dp->pae) {
+		dp->pae_last_stage = 1;
+		dp->pae_last_err = -EOPNOTSUPP;
+		dp->pae_replace_err++;
+		return -EOPNOTSUPP;
+	}
+
+	if (dissector->used_keys &
+	    ~(BIT_ULL(FLOW_DISSECTOR_KEY_META) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_PORTS) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_TCP))) {
+		dp->pae_last_stage = 2;
+		dp->pae_last_err = -EOPNOTSUPP;
+		dp->pae_replace_err++;
+		return -EOPNOTSUPP;
+	}
+
+	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META) ||
+	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
+	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
+	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
+		dp->pae_last_stage = 3;
+		dp->pae_last_err = -EOPNOTSUPP;
+		dp->pae_replace_err++;
+		return -EOPNOTSUPP;
+	}
+
+	flow_rule_match_meta(rule, &meta);
+	rcu_read_lock();
+	in_dev = dev_get_by_index_rcu(dev_net(dp->ndev), meta.key->ingress_ifindex);
+	ret = grx500_pae_port_map(dp, in_dev, &in_port_map);
+	rcu_read_unlock();
+	if (ret) {
+		dp->pae_last_stage = 4;
+		dp->pae_last_err = ret;
+		dp->pae_replace_err++;
+		return ret;
+	}
+
+	flow_rule_match_basic(rule, &basic);
+	if (basic.key->ip_proto == IPPROTO_TCP)
+		flow.ext_id = GRX500_PAE_RT_EXTID_TCP;
+	else if (basic.key->ip_proto == IPPROTO_UDP)
+		flow.ext_id = GRX500_PAE_RT_EXTID_UDP;
+	else
+		return -EOPNOTSUPP;
+
+	flow_rule_match_control(rule, &ctrl);
+	if (ctrl.key->addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
+		struct flow_match_ipv4_addrs ip4;
+
+		flow_rule_match_ipv4_addrs(rule, &ip4);
+		flow.src_ip[0] = ntohl(ip4.key->src);
+		flow.dst_ip[0] = ntohl(ip4.key->dst);
+	} else if (ctrl.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
+		struct flow_match_ipv6_addrs ip6;
+
+		flow_rule_match_ipv6_addrs(rule, &ip6);
+		flow.is_ipv6 = true;
+		for (i = 0; i < 4; i++) {
+			flow.src_ip[i] = ntohl(ip6.key->src.s6_addr32[i]);
+			flow.dst_ip[i] = ntohl(ip6.key->dst.s6_addr32[i]);
+		}
+	} else {
+		return -EOPNOTSUPP;
+	}
+
+	flow_rule_match_ports(rule, &ports);
+	flow.src_port = ntohs(ports.key->src);
+	flow.dst_port = ntohs(ports.key->dst);
+
+	flow_action_for_each(i, act, &rule->action) {
+		switch (act->id) {
+		case FLOW_ACTION_MANGLE:
+			ret = grx500_pae_parse_mangle(act, &flow, eth_hdr,
+						      eth_mask, &has_snat,
+						      &has_dnat);
+			if (ret) {
+				dp->pae_last_stage = 5;
+				dp->pae_last_err = ret;
+				dp->pae_replace_err++;
+				return ret;
+			}
+			break;
+		case FLOW_ACTION_CSUM:
+			break;
+		case FLOW_ACTION_REDIRECT:
+			out_dev = act->dev;
+			break;
+		default:
+			dp->pae_last_stage = 6;
+			dp->pae_last_err = -EOPNOTSUPP;
+			dp->pae_replace_err++;
+			return -EOPNOTSUPP;
+		}
+	}
+
+	if (!out_dev || (has_snat && has_dnat)) {
+		dp->pae_last_stage = 7;
+		dp->pae_last_err = -EOPNOTSUPP;
+		dp->pae_replace_err++;
+		return -EOPNOTSUPP;
+	}
+
+	ret = grx500_pae_port_map(dp, out_dev, &out_port_map);
+	if (ret) {
+		dp->pae_last_stage = 8;
+		dp->pae_last_err = ret;
+		dp->pae_replace_err++;
+		return ret;
+	}
+
+	flow.dst_port_map = out_port_map;
+	flow.mtu = out_dev->mtu;
+	flow.ttl_dec = true;
+
+	if (memchr_inv(eth_mask, 0xff, ETH_ALEN) == NULL) {
+		memcpy(flow.dst_mac, eth_hdr, ETH_ALEN);
+		flow.use_dst_mac = true;
+	}
+	if (memchr_inv(eth_mask + ETH_ALEN, 0xff, ETH_ALEN) == NULL) {
+		memcpy(flow.src_mac, eth_hdr + ETH_ALEN, ETH_ALEN);
+		flow.use_src_mac = true;
+	}
+
+	if (has_snat || has_dnat) {
+		flow.mode = flow.nat_port ? GRX500_PAE_MODE_NAPT :
+					    GRX500_PAE_MODE_NAT;
+		flow.dir = has_snat ? 1 : 0;
+	} else {
+		flow.mode = GRX500_PAE_MODE_ROUTING;
+	}
+
+	mutex_lock(&dp->pae_lock);
+	entry = grx500_pae_flow_lookup(dp, f->cookie);
+	if (entry) {
+		grx500_pae_session_del(dp->pae, entry->session_idx);
+		hash_del(&entry->hnode);
+		kfree(entry);
+	}
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		mutex_unlock(&dp->pae_lock);
+		return -ENOMEM;
+	}
+
+	ret = grx500_pae_session_add(dp->pae, &flow, &sess_idx);
+	if (ret) {
+		dp->pae_last_stage = 9;
+		dp->pae_last_err = ret;
+		dp->pae_replace_err++;
+		kfree(entry);
+		mutex_unlock(&dp->pae_lock);
+		return ret;
+	}
+
+	entry->cookie = f->cookie;
+	entry->session_idx = sess_idx;
+	hash_add(dp->pae_flows, &entry->hnode, entry->cookie);
+	dp->pae_replace_ok++;
+	mutex_unlock(&dp->pae_lock);
+	return 0;
+}
+
+static int grx500_pae_cls_destroy(struct grx500_datapath *dp,
+				  struct flow_cls_offload *f)
+{
+	struct grx500_pae_flow_entry *entry;
+	int ret = 0;
+
+	if (!dp->pae)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&dp->pae_lock);
+	entry = grx500_pae_flow_lookup(dp, f->cookie);
+	if (entry) {
+		ret = grx500_pae_session_del(dp->pae, entry->session_idx);
+		hash_del(&entry->hnode);
+		kfree(entry);
+		dp->pae_del_cnt++;
+	}
+	mutex_unlock(&dp->pae_lock);
+	return ret;
+}
+
+static int grx500_pae_cls_stats(struct grx500_datapath *dp,
+				struct flow_cls_offload *f)
+{
+	struct grx500_pae_flow_entry *entry;
+	bool hit = false;
+	u32 packets = 0;
+	int ret;
+
+	if (!dp->pae)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&dp->pae_lock);
+	entry = grx500_pae_flow_lookup(dp, f->cookie);
+	if (!entry) {
+		mutex_unlock(&dp->pae_lock);
+		return -ENOENT;
+	}
+	ret = grx500_pae_session_hit_stats(dp->pae, entry->session_idx,
+					   true, &hit, &packets);
+	mutex_unlock(&dp->pae_lock);
+	dp->pae_stats_cnt++;
+	if (ret)
+		return ret;
+
+	if (hit) {
+		dp->pae_hit_cnt++;
+		flow_stats_update(&f->stats, 0, packets ? packets : 1, 0,
+				  jiffies, FLOW_ACTION_HW_STATS_DELAYED);
+	}
+	return 0;
+}
+
+static int grx500_ft_block_cb(enum tc_setup_type type, void *type_data,
+			      void *cb_priv)
+{
+	struct grx500_datapath *dp = cb_priv;
+	struct flow_cls_offload *f = type_data;
+
+	if (type != TC_SETUP_CLSFLOWER)
+		return -EOPNOTSUPP;
+
+	switch (f->command) {
+	case FLOW_CLS_REPLACE:
+		return grx500_pae_cls_replace(dp, f);
+	case FLOW_CLS_DESTROY:
+		return grx500_pae_cls_destroy(dp, f);
+	case FLOW_CLS_STATS:
+		return grx500_pae_cls_stats(dp, f);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int grx500_setup_tc(struct net_device *ndev, enum tc_setup_type type,
+			   void *type_data)
+{
+	struct grx500_datapath *dp = grx500_conduit_priv(ndev);
+	struct flow_block_offload *f = type_data;
+	struct flow_block_cb *block_cb;
+
+	if (type != TC_SETUP_FT)
+		return -EOPNOTSUPP;
+
+	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+		return -EOPNOTSUPP;
+
+	switch (f->command) {
+	case FLOW_BLOCK_BIND:
+		dp->pae_bind_cnt++;
+		block_cb = flow_block_cb_lookup(f->block, grx500_ft_block_cb, dp);
+		if (block_cb) {
+			flow_block_cb_incref(block_cb);
+			return 0;
+		}
+		block_cb = flow_block_cb_alloc(grx500_ft_block_cb, dp, dp, NULL);
+		if (IS_ERR(block_cb))
+			return PTR_ERR(block_cb);
+		flow_block_cb_incref(block_cb);
+		flow_block_cb_add(block_cb, f);
+		return 0;
+	case FLOW_BLOCK_UNBIND:
+		block_cb = flow_block_cb_lookup(f->block, grx500_ft_block_cb, dp);
+		if (!block_cb)
+			return 0;
+		if (!flow_block_cb_decref(block_cb))
+			flow_block_cb_remove(block_cb, f);
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static const struct net_device_ops grx500_ops = {
 	.ndo_open = grx500_open,
 	.ndo_stop = grx500_stop,
@@ -1692,6 +2139,7 @@ static const struct net_device_ops grx500_ops = {
 	.ndo_set_rx_mode = grx500_set_rx_mode,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr = eth_validate_addr,
+	.ndo_setup_tc = grx500_setup_tc,
 };
 
 static void grx500_get_drvinfo(struct net_device *ndev,
@@ -1970,8 +2418,28 @@ static ssize_t status_show(struct device *dev,
 				__raw_readl(ring + d * 16 + 12));
 	}
 	len += sysfs_emit_at(buf, len,
-		"rx_bad_descriptor=%u\n",
-		READ_ONCE(dp->rx_bad_descriptor));
+		"rx_bad_descriptor=%u\n"
+		"pae_bind=%u replace_ok=%u replace_err=%u del=%u stats=%u hit=%u last_stage=%u last_err=%d\n",
+		READ_ONCE(dp->rx_bad_descriptor),
+		READ_ONCE(dp->pae_bind_cnt),
+		READ_ONCE(dp->pae_replace_ok),
+		READ_ONCE(dp->pae_replace_err),
+		READ_ONCE(dp->pae_del_cnt),
+		READ_ONCE(dp->pae_stats_cnt),
+		READ_ONCE(dp->pae_hit_cnt),
+		READ_ONCE(dp->pae_last_stage),
+		READ_ONCE(dp->pae_last_err));
+	if (dp->pae) {
+		u32 gctrl0 = 0, gctrl1 = 0, tfcr_num = 0;
+		u16 k12 = 0, v9 = 0;
+		bool vld = false;
+
+		grx500_pae_debug_regs(dp->pae, &gctrl0, &gctrl1, &tfcr_num,
+				      &k12, &v9, &vld);
+		len += sysfs_emit_at(buf, len,
+			"pae_regs gctrl0=%04x gctrl1=%04x tfcr_num=%04x tfcr0_k12=%04x tfcr0_v9=%04x tfcr0_vld=%u\n",
+			gctrl0, gctrl1, tfcr_num, k12, v9, vld);
+	}
 	return len;
 }
 static DEVICE_ATTR_RO(status);
@@ -1990,6 +2458,8 @@ static int grx500_datapath_probe(struct platform_device *pdev)
 	dp->dev = &pdev->dev;
 	spin_lock_init(&dp->tmu_lock);
 	spin_lock_init(&dp->tx_lock);
+	mutex_init(&dp->pae_lock);
+	hash_init(dp->pae_flows);
 	u64_stats_init(&dp->rx_syncp);
 	u64_stats_init(&dp->tx_syncp);
 	atomic_long_set(&dp->tx_timeout_dropped, 0);
@@ -2013,6 +2483,12 @@ static int grx500_datapath_probe(struct platform_device *pdev)
 	ret = grx500_cbm_find_switch_buses(pdev, dp);
 	if (ret)
 		return ret;
+	dp->pae = grx500_pae_init(dp->gswip[1]);
+	if (IS_ERR(dp->pae)) {
+		dev_warn(&pdev->dev, "PAE L3 offload disabled: %ld\n",
+			 PTR_ERR(dp->pae));
+		dp->pae = NULL;
+	}
 	for (i = 0; i < GRX500_CBM_IRQS; i++) {
 		dp->irq[i] = platform_get_irq(pdev, i);
 		if (dp->irq[i] < 0)
@@ -2065,6 +2541,9 @@ err_sysfs:
 static void grx500_datapath_remove(struct platform_device *pdev)
 {
 	struct grx500_datapath *dp = platform_get_drvdata(pdev);
+	struct grx500_pae_flow_entry *entry;
+	struct hlist_node *tmp;
+	int bkt;
 
 	/* Stop the conduit before tearing down shared CBM/TMU and NAPI. */
 	rtnl_lock();
@@ -2073,6 +2552,13 @@ static void grx500_datapath_remove(struct platform_device *pdev)
 	grx500_shutdown(dp);
 	unregister_netdevice(dp->ndev);
 	rtnl_unlock();
+	mutex_lock(&dp->pae_lock);
+	hash_for_each_safe(dp->pae_flows, bkt, tmp, entry, hnode) {
+		hash_del(&entry->hnode);
+		kfree(entry);
+	}
+	mutex_unlock(&dp->pae_lock);
+	grx500_pae_destroy(dp->pae);
 	netif_napi_del(&dp->napi);
 	free_netdev(dp->ndev);
 	device_remove_file(&pdev->dev, &dev_attr_status);
