@@ -305,6 +305,8 @@ static int grx500_dsa_write_vlan_slot(struct grx500_dsa *priv, u16 slot,
 	return grx500_gswip_pce_write(priv->gswip[0], false, &entry);
 }
 
+static void grx500_dsa_port_fast_age(struct dsa_switch *ds, int port);
+
 static int grx500_dsa_port_bridge_join(struct dsa_switch *ds, int port,
 				       struct dsa_bridge bridge,
 				       bool *tx_fwd_offload,
@@ -332,6 +334,10 @@ static int grx500_dsa_port_bridge_join(struct dsa_switch *ds, int port,
 	}
 
 	ret = grx500_gswip_set_pmap(priv->gswip[0], false, priv->br_port_mask);
+	if (ret)
+		return ret;
+
+	ret = grx500_gswip_set_port_learning(priv->gswip[0], false, port, true);
 	if (!ret)
 		*tx_fwd_offload = true;
 	return ret;
@@ -344,6 +350,9 @@ static void grx500_dsa_port_bridge_leave(struct dsa_switch *ds, int port,
 
 	if (port <= 1 || port >= GRX500_DSA_NUM_PORTS)
 		return;
+
+	grx500_gswip_set_port_learning(priv->gswip[0], false, port, false);
+	grx500_dsa_port_fast_age(ds, port);
 
 	priv->br_port_mask &= ~BIT(port);
 	grx500_gswip_set_pmap(priv->gswip[0], false, priv->br_port_mask);

@@ -38,7 +38,10 @@
 #define GRX500_SDMA_PCTRL_FCSIGN	5
 
 #define GRX500_PCE_PCTRL		0x480
+#define GRX500_PCE_PCTRL_1(port)	(0x481 + 10 * (port))
+#define GRX500_PCE_PCTRL_1_LRNLIM_MASK	GENMASK(7, 0)
 #define GRX500_PCE_PCTRL_3		0x483
+#define GRX500_PCE_PCTRL_3_LNDIS	BIT(15)
 #define GRX500_PCE_VCTRL(port)		(0x485 + 10 * (port))
 #define GRX500_PCE_VCTRL_UVR		BIT(0)
 #define GRX500_PCE_VCTRL_VIMR		BIT(3)
@@ -262,7 +265,8 @@ int grx500_gswip_prepare_pmac(struct mii_bus *bus, bool right)
 		grx500_gswip_write(base, GRX500_PCE_PMAP3, BIT(0));
 		for (port = 0; port <= 5; port++)
 			grx500_gswip_update_bits(base, GRX500_PCE_PCTRL_3 + 10 * port,
-						 BIT(15), BIT(15));
+						 GRX500_PCE_PCTRL_3_LNDIS,
+						 GRX500_PCE_PCTRL_3_LNDIS);
 		grx500_gswip_update_bits(base, GRX500_FDMA_PCTRL, BIT(1), 0);
 		grx500_gswip_update_bits(base, GRX500_PCE_PCTRL, BIT(11), BIT(11));
 	} else {
@@ -639,6 +643,27 @@ int grx500_gswip_set_vlan_ctrl(struct mii_bus *bus, bool right, u8 port,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(grx500_gswip_set_vlan_ctrl);
+
+int grx500_gswip_set_port_learning(struct mii_bus *bus, bool right, u8 port,
+				   bool enable)
+{
+	void __iomem *base;
+
+	if (!grx500_gswip_bus_valid(bus, right) || port > (right ? 15 : 5))
+		return -EINVAL;
+	base = bus->priv;
+
+	if (enable)
+		grx500_gswip_update_bits(base, GRX500_PCE_PCTRL_1(port),
+					 GRX500_PCE_PCTRL_1_LRNLIM_MASK,
+					 GRX500_PCE_PCTRL_1_LRNLIM_MASK);
+
+	grx500_gswip_update_bits(base, GRX500_PCE_PCTRL_3 + 10 * port,
+				 GRX500_PCE_PCTRL_3_LNDIS,
+				 enable ? 0 : GRX500_PCE_PCTRL_3_LNDIS);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(grx500_gswip_set_port_learning);
 
 int grx500_gswip_flush_fdb(struct mii_bus *bus, bool right)
 {

@@ -43,6 +43,8 @@ int grx500_gswip_set_stp_state(struct mii_bus *bus, bool right, u8 port,
 int grx500_gswip_set_pmap(struct mii_bus *bus, bool right, u16 port_mask);
 int grx500_gswip_set_vlan_ctrl(struct mii_bus *bus, bool right, u8 port,
 			       bool vlan_aware);
+int grx500_gswip_set_port_learning(struct mii_bus *bus, bool right, u8 port,
+				   bool enable);
 int grx500_gswip_flush_fdb(struct mii_bus *bus, bool right);
 
 #endif
