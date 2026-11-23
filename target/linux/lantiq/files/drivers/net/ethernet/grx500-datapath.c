@@ -4,9 +4,11 @@
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
+#include <linux/grx500-dcdp.h>
 #include <linux/grx500-gswip.h>
 #include <linux/grx500-memory.h>
 #include <linux/grx500-pae.h>
+#include <linux/grx500-umt.h>
 #include <linux/hashtable.h>
 #include <linux/if_vlan.h>
 #include <linux/in.h>
@@ -304,7 +306,11 @@ struct grx500_datapath {
 	u32 pae_hit_cnt;
 	int pae_last_err;
 	u8 pae_last_stage;
+	struct mutex dcdp_lock;
+	struct grx500_dcdp_port dcdp_ports[GRX500_DCDP_MAX_RADIOS];
 };
+
+static struct grx500_datapath *g_grx500_dp;
 
 struct grx500_pae_flow_entry {
 	struct hlist_node hnode;
@@ -866,6 +872,65 @@ static int __maybe_unused grx500_tmu_prepare_lan_queue_maps(struct grx500_datapa
 	return 0;
 }
 
+static int grx500_tmu_setup_flat_path(struct grx500_datapath *dp,
+				      u32 port, u32 queue)
+{
+	u32 sbid = queue - 16;
+	u32 sbin = sbid << 3;
+	const u32 scheduler_output[] = {
+		BIT(31) | port, 255,
+	};
+	const u32 scheduler_input[] = {
+		BIT(31) | queue, 255, 0, 0,
+	};
+	const u32 threshold[] = {
+		BIT(31) | 0x00011320, 0x00120012,
+		0x00240024, 0x0fff0fff, 0x00000004,
+	};
+	int ret;
+
+	ret = grx500_tmu_table_write_words(dp, GRX500_TMU_SBOTR,
+					   GRX500_TMU_SBOTC, BIT(16),
+					   GRX500_TMU_SBC_VALID,
+					   sbid, scheduler_output, 1);
+	if (ret)
+		return ret;
+	ret = grx500_tmu_table_write_words(dp, GRX500_TMU_EPMT,
+					   GRX500_TMU_EPMTC,
+					   GRX500_TMU_EPMTC_EMW,
+					   GRX500_TMU_EPMTC_EMV,
+					   port,
+					   (const u32[]){ BIT(31) | sbid }, 1);
+	if (ret)
+		return ret;
+	ret = grx500_tmu_table_write(dp, GRX500_TMU_QEMT,
+				     GRX500_TMU_QMTC_QEW,
+				     GRX500_TMU_QMTC_QEV,
+				     queue, port);
+	if (ret)
+		return ret;
+	ret = grx500_tmu_table_write(dp, GRX500_TMU_QSMT,
+				     GRX500_TMU_QMTC_QSW,
+				     GRX500_TMU_QMTC_QSV,
+				     queue, sbin);
+	if (ret)
+		return ret;
+	ret = grx500_tmu_table_write_words(dp, GRX500_TMU_SBITR,
+					   GRX500_TMU_SBITC,
+					   GRX500_TMU_SBC_WRITE,
+					   GRX500_TMU_SBC_VALID,
+					   sbin, scheduler_input,
+					   ARRAY_SIZE(scheduler_input));
+	if (ret)
+		return ret;
+	return grx500_tmu_table_write_words(dp, GRX500_TMU_QTHT,
+					    GRX500_TMU_QMTC,
+					    GRX500_TMU_QMTC_QTW,
+					    GRX500_TMU_QMTC_QTV,
+					    queue, threshold,
+					    ARRAY_SIZE(threshold));
+}
+
 static int grx500_tmu_create_lan_paths(struct grx500_datapath *dp)
 {
 	int i, ret;
@@ -879,60 +944,8 @@ static int grx500_tmu_create_lan_paths(struct grx500_datapath *dp)
 			   i == GRX500_LAN_DQM_ROUTES ? dp->cpu_dqm_port : dp->lan_dqm[i].port;
 		u32 queue = i == GRX500_LAN_DQM_ROUTES + 1 ? dp->wan_dqm.tmu_queue :
 			    i == GRX500_LAN_DQM_ROUTES ? dp->cpu_dqm_queue : dp->lan_dqm[i].tmu_queue;
-		u32 sbid = queue - 16;
-		u32 sbin = sbid << 3;
-		const u32 scheduler_output[] = {
-			BIT(31) | port, 255,
-		};
-		const u32 scheduler_input[] = {
-			BIT(31) | queue, 255, 0, 0,
-		};
-		const u32 threshold[] = {
-			BIT(31) | 0x00011320, 0x00120012,
-			0x00240024, 0x0fff0fff, 0x00000004,
-		};
 
-		ret = grx500_tmu_table_write_words(dp, GRX500_TMU_SBOTR,
-						   GRX500_TMU_SBOTC, BIT(16),
-						   GRX500_TMU_SBC_VALID,
-						   sbid, scheduler_output, 1);
-		if (ret)
-			return ret;
-		ret = grx500_tmu_table_write_words(dp, GRX500_TMU_EPMT,
-						   GRX500_TMU_EPMTC,
-						   GRX500_TMU_EPMTC_EMW,
-						   GRX500_TMU_EPMTC_EMV,
-						   port,
-						   (const u32[]){ BIT(31) | sbid }, 1);
-		if (ret)
-			return ret;
-		ret = grx500_tmu_table_write(dp, GRX500_TMU_QEMT,
-					     GRX500_TMU_QMTC_QEW,
-					     GRX500_TMU_QMTC_QEV,
-					     queue, port);
-		if (ret)
-			return ret;
-		ret = grx500_tmu_table_write(dp, GRX500_TMU_QSMT,
-					     GRX500_TMU_QMTC_QSW,
-					     GRX500_TMU_QMTC_QSV,
-					     queue, sbin);
-		if (ret)
-			return ret;
-		ret = grx500_tmu_table_write_words(dp, GRX500_TMU_SBITR,
-						   GRX500_TMU_SBITC,
-						   GRX500_TMU_SBC_WRITE,
-						   GRX500_TMU_SBC_VALID,
-						   sbin, scheduler_input,
-						   ARRAY_SIZE(scheduler_input));
-		if (ret)
-			return ret;
-		ret = grx500_tmu_table_write_words(dp, GRX500_TMU_QTHT,
-						   GRX500_TMU_QMTC,
-						   GRX500_TMU_QMTC_QTW,
-						   GRX500_TMU_QMTC_QTV,
-						   queue,
-						   threshold,
-						   ARRAY_SIZE(threshold));
+		ret = grx500_tmu_setup_flat_path(dp, port, queue);
 		if (ret)
 			return ret;
 	}
@@ -2444,6 +2457,266 @@ static ssize_t status_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(status);
 
+static void grx500_dcdp_set_cbm_wlan_ep(struct grx500_datapath *dp,
+					u32 ep_id, u32 tmu_port)
+{
+	u32 val, mask, shift;
+
+	switch (tmu_port) {
+	case 4:
+		mask = 0x00f00000U;
+		shift = 20;
+		break;
+	case 24:
+		mask = 0x0000f000U;
+		shift = 12;
+		break;
+	case 25:
+		mask = 0x00000f00U;
+		shift = 8;
+		break;
+	case 26:
+		mask = 0x000000f0U;
+		shift = 4;
+		break;
+	default:
+		return;
+	}
+
+	val = __raw_readl(dp->base[GRX500_CBM] + GRX500_CBM_CTRL);
+	val = (val & ~mask) | ((ep_id << shift) & mask);
+	__raw_writel(val, dp->base[GRX500_CBM] + GRX500_CBM_CTRL);
+}
+
+static void grx500_dcdp_set_qidt_ep(struct grx500_datapath *dp,
+				    u32 ep_id, u32 queue)
+{
+	void __iomem *qidt = dp->base[GRX500_QIDT];
+	u32 key;
+
+	for (key = 0; key < 0x4000; key++) {
+		u32 word, shift, value;
+
+		if (((key >> 4) & 0xf) != ep_id)
+			continue;
+		word = key >> 2;
+		shift = (key & 3) * 8;
+		value = __raw_readl(qidt + word * sizeof(u32));
+		value &= ~(0xffu << shift);
+		value |= (queue & 0xffu) << shift;
+		__raw_writel(value, qidt + word * sizeof(u32));
+	}
+}
+
+int grx500_dcdp_register_radio(u32 ep_id, struct net_device *dev,
+			       u32 umt_dst_phys, u32 rx_ring_entries,
+			       struct grx500_dcdp_port **out_port)
+{
+	struct grx500_datapath *dp = READ_ONCE(g_grx500_dp);
+	struct grx500_dcdp_port *port;
+	u32 slot, cbm_pid, tmu_port, tmu_queue;
+	size_t rx_bytes;
+	int ret;
+
+	if (!dp || !dev || !umt_dst_phys || !rx_ring_entries || !out_port)
+		return -EINVAL;
+
+	if (ep_id == GRX500_DCDP_EP_WLAN0) {
+		slot = 0;
+		cbm_pid = 0;
+		tmu_port = 4;
+		tmu_queue = 36;
+	} else if (ep_id == GRX500_DCDP_EP_WLAN1) {
+		slot = 1;
+		cbm_pid = 1;
+		tmu_port = 24;
+		tmu_queue = 37;
+	} else {
+		return -EINVAL;
+	}
+
+	mutex_lock(&dp->dcdp_lock);
+	port = &dp->dcdp_ports[slot];
+	if (port->active) {
+		mutex_unlock(&dp->dcdp_lock);
+		return -EBUSY;
+	}
+	memset(port, 0, sizeof(*port));
+	port->ep_id = ep_id;
+	port->cbm_pid = cbm_pid;
+	port->tmu_port = tmu_port;
+	port->tmu_queue = tmu_queue;
+	port->dev = dev;
+
+	ret = grx500_umt_request(ep_id, cbm_pid, &port->dma_ctrl_id,
+				 &port->dma_cid, &port->umt_id);
+	if (ret)
+		goto err_unlock;
+
+	if (dp->gswip[1]) {
+		ret = grx500_gswip_configure_wlan_port(dp->gswip[1], ep_id,
+						       port->dma_cid);
+		if (ret)
+			goto err_umt_release;
+	}
+
+	grx500_dcdp_set_cbm_wlan_ep(dp, ep_id, tmu_port);
+	__raw_writel(0x107U | ((tmu_port & 0x1fU) << 16),
+		     dp->base[GRX500_DQM] + GRX500_DQM_CPU_CFG +
+		     tmu_port * GRX500_CBM_CPU_PORT_STRIDE);
+
+	ret = grx500_tmu_setup_flat_path(dp, tmu_port, tmu_queue);
+	if (ret)
+		goto err_cbm_clear;
+	grx500_dcdp_set_qidt_ep(dp, ep_id, tmu_queue);
+
+	rx_bytes = (size_t)rx_ring_entries * GRX500_DCDP_RING_DESC_SIZE;
+	port->rx_out.virt = dma_alloc_coherent(dp->dev, rx_bytes,
+					       &port->rx_out.dma, GFP_KERNEL);
+	if (!port->rx_out.virt) {
+		ret = -ENOMEM;
+		goto err_qidt_clear;
+	}
+	port->rx_out.phys = (phys_addr_t)port->rx_out.dma;
+	port->rx_out.entries = rx_ring_entries;
+	port->rx_out.entry_size = GRX500_DCDP_RING_DESC_SIZE;
+
+	port->tx_in.phys = grx500_layout[GRX500_DQM].start +
+			   GRX500_DQM_CPU_DESC +
+			   tmu_port * GRX500_CBM_CPU_PORT_STRIDE;
+	port->tx_in.virt = dp->base[GRX500_DQM] + GRX500_DQM_CPU_DESC +
+			   tmu_port * GRX500_CBM_CPU_PORT_STRIDE;
+	port->tx_in.entries = 32;
+	port->tx_in.entry_size = GRX500_DCDP_RING_DESC_SIZE;
+
+	port->tx_out.phys = grx500_layout[GRX500_DQM].start +
+			    GRX500_DQM_CPU_PTR_RTN +
+			    tmu_port * GRX500_CBM_CPU_PORT_STRIDE;
+	port->tx_out.virt = dp->base[GRX500_DQM] + GRX500_DQM_CPU_PTR_RTN +
+			    tmu_port * GRX500_CBM_CPU_PORT_STRIDE;
+	port->tx_out.entries = 32;
+	port->tx_out.entry_size = GRX500_DCDP_TXOUT_DESC_SIZE;
+
+	ret = grx500_umt_set_mode(port->umt_id, ep_id, 0, 3, umt_dst_phys,
+				  GRX500_DCDP_DEFAULT_UMT_US, true);
+	if (ret)
+		goto err_free_rx;
+	ret = grx500_umt_enable(port->umt_id, ep_id, true);
+	if (ret)
+		goto err_free_rx;
+
+	port->active = true;
+	*out_port = port;
+	mutex_unlock(&dp->dcdp_lock);
+
+	dev_info(dp->dev,
+		 "DCDP radio registered: ep=%u cbm_pid=%u tmu_port=%u q=%u umt=%u dma_cid=%u tx_in=%pa tx_out=%pa rx_out=%pa\n",
+		 port->ep_id, port->cbm_pid, port->tmu_port, port->tmu_queue,
+		 port->umt_id, port->dma_cid, &port->tx_in.phys,
+		 &port->tx_out.phys, &port->rx_out.phys);
+	return 0;
+
+err_free_rx:
+	grx500_umt_enable(port->umt_id, ep_id, false);
+	dma_free_coherent(dp->dev, rx_bytes, port->rx_out.virt,
+			  port->rx_out.dma);
+err_qidt_clear:
+	grx500_dcdp_set_qidt_ep(dp, ep_id, 255);
+err_cbm_clear:
+	grx500_dcdp_set_cbm_wlan_ep(dp, 0, tmu_port);
+err_umt_release:
+	grx500_umt_release(port->umt_id, ep_id);
+err_unlock:
+	memset(port, 0, sizeof(*port));
+	mutex_unlock(&dp->dcdp_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(grx500_dcdp_register_radio);
+
+void grx500_dcdp_unregister_radio(struct grx500_dcdp_port *port)
+{
+	struct grx500_datapath *dp = READ_ONCE(g_grx500_dp);
+	size_t rx_bytes;
+
+	if (!dp || !port)
+		return;
+
+	mutex_lock(&dp->dcdp_lock);
+	if (!port->active) {
+		mutex_unlock(&dp->dcdp_lock);
+		return;
+	}
+
+	grx500_umt_enable(port->umt_id, port->ep_id, false);
+	grx500_dcdp_set_qidt_ep(dp, port->ep_id, 255);
+	grx500_dcdp_set_cbm_wlan_ep(dp, 0, port->tmu_port);
+	grx500_umt_release(port->umt_id, port->ep_id);
+	if (port->rx_out.virt) {
+		rx_bytes = (size_t)port->rx_out.entries * port->rx_out.entry_size;
+		dma_free_coherent(dp->dev, rx_bytes, port->rx_out.virt,
+				  port->rx_out.dma);
+	}
+	memset(port, 0, sizeof(*port));
+	mutex_unlock(&dp->dcdp_lock);
+}
+EXPORT_SYMBOL_GPL(grx500_dcdp_unregister_radio);
+
+int grx500_dcdp_xmit(struct grx500_dcdp_port *port, u16 subif_id,
+		     struct sk_buff *skb)
+{
+	struct grx500_datapath *dp = READ_ONCE(g_grx500_dp);
+	void __iomem *desc;
+	unsigned long irqflags;
+	phys_addr_t frame;
+	u32 addr, len, alloc_ptr = 0;
+	u8 *data;
+	int ret;
+
+	if (!dp || !port || !port->active || !skb)
+		return -EINVAL;
+	if (!dp->started)
+		return -ENETDOWN;
+	if (skb->len > 1536) {
+		dev_kfree_skb_any(skb);
+		return -EMSGSIZE;
+	}
+
+	spin_lock_irqsave(&dp->tx_lock, irqflags);
+	ret = grx500_cbm_cpu_alloc_standard(dp, 0, &frame, &alloc_ptr);
+	spin_unlock_irqrestore(&dp->tx_lock, irqflags);
+	if (ret)
+		return -EBUSY;
+
+	addr = frame + GRX500_CBM_FRAME_OFFSET;
+	len = max_t(u32, skb->len, ETH_ZLEN);
+	data = phys_to_virt(addr);
+	ret = skb_copy_bits(skb, 0, data, skb->len);
+	if (unlikely(ret)) {
+		spin_lock_irqsave(&dp->tx_lock, irqflags);
+		grx500_cbm_cpu_return(dp, 0, frame);
+		spin_unlock_irqrestore(&dp->tx_lock, irqflags);
+		dev_kfree_skb_any(skb);
+		return ret;
+	}
+	if (skb->len < ETH_ZLEN)
+		memset(data + skb->len, 0, ETH_ZLEN - skb->len);
+	dma_sync_single_for_device(dp->dev, frame, 2048, DMA_BIDIRECTIONAL);
+
+	desc = dp->base[GRX500_EQM] + GRX500_EQM_CPU_DESC;
+	spin_lock_irqsave(&dp->tx_lock, irqflags);
+	__raw_writel((u32)subif_id, desc);
+	__raw_writel(port->ep_id << GRX500_TX_DW1_EP_SHIFT, desc + 4);
+	__raw_writel(addr & ~7u, desc + 8);
+	wmb();
+	__raw_writel(BIT(29) | BIT(28) | ((addr & 7) << 23) | len,
+		     desc + 12);
+	spin_unlock_irqrestore(&dp->tx_lock, irqflags);
+
+	dev_consume_skb_any(skb);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(grx500_dcdp_xmit);
+
 static int grx500_datapath_probe(struct platform_device *pdev)
 {
 	struct grx500_datapath *dp;
@@ -2459,6 +2732,7 @@ static int grx500_datapath_probe(struct platform_device *pdev)
 	spin_lock_init(&dp->tmu_lock);
 	spin_lock_init(&dp->tx_lock);
 	mutex_init(&dp->pae_lock);
+	mutex_init(&dp->dcdp_lock);
 	hash_init(dp->pae_flows);
 	u64_stats_init(&dp->rx_syncp);
 	u64_stats_init(&dp->tx_syncp);
@@ -2527,6 +2801,7 @@ static int grx500_datapath_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_register;
 
+	WRITE_ONCE(g_grx500_dp, dp);
 	dev_info(&pdev->dev, "AX50 CPU conduit eth0 registered; shared CBM/TMU starts on open\n");
 	return 0;
 
@@ -2543,7 +2818,13 @@ static void grx500_datapath_remove(struct platform_device *pdev)
 	struct grx500_datapath *dp = platform_get_drvdata(pdev);
 	struct grx500_pae_flow_entry *entry;
 	struct hlist_node *tmp;
-	int bkt;
+	int bkt, i;
+
+	for (i = 0; i < GRX500_DCDP_MAX_RADIOS; i++) {
+		if (dp->dcdp_ports[i].active)
+			grx500_dcdp_unregister_radio(&dp->dcdp_ports[i]);
+	}
+	WRITE_ONCE(g_grx500_dp, NULL);
 
 	/* Stop the conduit before tearing down shared CBM/TMU and NAPI. */
 	rtnl_lock();
