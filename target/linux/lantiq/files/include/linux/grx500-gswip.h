@@ -46,5 +46,7 @@ int grx500_gswip_set_vlan_ctrl(struct mii_bus *bus, bool right, u8 port,
 int grx500_gswip_set_port_learning(struct mii_bus *bus, bool right, u8 port,
 				   bool enable);
 int grx500_gswip_flush_fdb(struct mii_bus *bus, bool right);
+int grx500_gswip_configure_wlan_port(struct mii_bus *bus, u8 port_id,
+				     u8 dma_cid);
 
 #endif

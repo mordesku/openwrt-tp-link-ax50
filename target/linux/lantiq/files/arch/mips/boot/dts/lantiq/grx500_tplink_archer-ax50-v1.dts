@@ -392,6 +392,15 @@
 			};
 		};
 	};
+
+	mcpy: mcpy@a2800000 {
+		compatible = "lantiq,grx500-umt";
+		reg = <0xa2800000 0x1000>;
+		lantiq,umt0-dmacid = <7>;
+		lantiq,umt1-dmacid = <8>;
+		lantiq,umt2-dmacid = <9>;
+		lantiq,umt3-dmacid = <10>;
+	};
 };
 
 &gptc_system {

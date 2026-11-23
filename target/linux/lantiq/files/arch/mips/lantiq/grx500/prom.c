@@ -225,9 +225,54 @@ int get_c0_perfcount_int(void)
 }
 EXPORT_SYMBOL_GPL(get_c0_perfcount_int);
 
+#define GRX500_CM_GCR_REG_BASE(n)	(0x0090 + 16 * (n))
+#define GRX500_CM_GCR_REG_MASK(n)	(0x0098 + 16 * (n))
+#define GRX500_CM_GCR_CMTGT_IOCU2	3
+
+static void __init grx500_cm_setup_ssx7_region(void)
+{
+	int n, target_idx = -1;
+	bool configured = false;
+
+	if (!mips_cm_present() || !mips_gcr_base)
+		return;
+
+	for (n = 0; n < 4; n++) {
+		u32 base = __raw_readl(mips_gcr_base + GRX500_CM_GCR_REG_BASE(n));
+		u32 mask = __raw_readl(mips_gcr_base + GRX500_CM_GCR_REG_MASK(n));
+
+		pr_info("GRX500 CM2 REG%d: base=0x%08x mask=0x%08x\n",
+			n, base, mask);
+		if (base == 0xa0000000U &&
+		    (mask & 0xffff0003U) == (0xf8000000U | GRX500_CM_GCR_CMTGT_IOCU2))
+			configured = true;
+		if (target_idx < 0 && (mask & 0x3U) == 0)
+			target_idx = n;
+	}
+
+	if (configured)
+		return;
+
+	if (target_idx < 0)
+		target_idx = 0;
+
+	/* Vendor prom.c: route 0xa0000000..0xa7ffffff (SSX7: MPE/TOE/MCPY) to IOCU2. */
+	__raw_writel(0xa0000000U, mips_gcr_base + GRX500_CM_GCR_REG_BASE(target_idx));
+	wmb();
+	__raw_writel(0xf8000000U | GRX500_CM_GCR_CMTGT_IOCU2,
+		     mips_gcr_base + GRX500_CM_GCR_REG_MASK(target_idx));
+	wmb();
+	pr_info("GRX500 CM2 REG%d configured for SSX7 IOCU2: base=0x%08x mask=0x%08x\n",
+		target_idx,
+		__raw_readl(mips_gcr_base + GRX500_CM_GCR_REG_BASE(target_idx)),
+		__raw_readl(mips_gcr_base + GRX500_CM_GCR_REG_MASK(target_idx)));
+}
+
 void __init arch_init_irq(void)
 {
 	struct device_node *intc_node;
+
+	grx500_cm_setup_ssx7_region();
 
 	intc_node = of_find_compatible_node(NULL, NULL,
 					    "mti,cpu-interrupt-controller");

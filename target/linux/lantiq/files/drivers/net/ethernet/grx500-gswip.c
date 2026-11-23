@@ -683,5 +683,51 @@ int grx500_gswip_flush_fdb(struct mii_bus *bus, bool right)
 }
 EXPORT_SYMBOL_GPL(grx500_gswip_flush_fdb);
 
+int grx500_gswip_configure_wlan_port(struct mii_bus *bus, u8 port_id,
+				     u8 dma_cid)
+{
+	void __iomem *base;
+	u16 value[5];
+	u16 addr;
+	u8 class, flow;
+	u32 reg;
+	int ret;
+
+	if (!grx500_gswip_bus_valid(bus, true) || port_id < 8 || port_id > 9)
+		return -EINVAL;
+	base = bus->priv;
+
+	/* DirectConnect WAV654 expects raw Ethernet without PMAC header. */
+	memset(value, 0, sizeof(value));
+	for (class = 0; class < 16; class++) {
+		for (flow = 0; flow < 4; flow++) {
+			addr = port_id | (class << 4) | (flow << 8);
+			ret = grx500_gswip_pmac_table_write(base, addr,
+						GRX500_PMAC_EGCFG, value);
+			if (ret)
+				return ret;
+		}
+	}
+
+	/* Ingress PMAC: no PMAC header from CBM, default spid = port_id. */
+	memset(value, 0, sizeof(value));
+	value[1] = ((u16)(port_id & 0xf) << 12) | 0x0080;
+	value[3] = 0xffff;
+	value[4] = BIT(1) | BIT(4) | BIT(6) | BIT(7);
+	ret = grx500_gswip_pmac_table_write(base, dma_cid & 0xf,
+					    GRX500_PMAC_IGCFG, value);
+	if (ret)
+		return ret;
+
+	/* Allow VAP-to-VAP / same-port forwarding and port-map override. */
+	reg = grx500_gswip_read(base, GRX500_PCE_PCTRL_3 + 10 * port_id);
+	grx500_gswip_write(base, GRX500_PCE_PCTRL_3 + 10 * port_id,
+			   reg | BIT(14));
+	reg = grx500_gswip_read(base, 0x544 + 16 * port_id);
+	grx500_gswip_write(base, 0x544 + 16 * port_id, reg | 0xffff);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(grx500_gswip_configure_wlan_port);
+
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("GRX500 GSWIP 3.0 switch fabric helpers");
