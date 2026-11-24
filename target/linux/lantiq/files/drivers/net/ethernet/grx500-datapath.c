@@ -19,6 +19,7 @@
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/ktime.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
@@ -36,6 +37,7 @@
 #include <linux/timer.h>
 #include <linux/u64_stats_sync.h>
 #include <linux/udp.h>
+#include <linux/vmalloc.h>
 #include <net/dsa.h>
 #include <net/flow_offload.h>
 #include <net/pkt_cls.h>
@@ -92,6 +94,11 @@
 #define GRX500_TMU_EPTT		0x320
 #define GRX500_TMU_EPDT		0x330
 #define GRX500_TMU_EPMTC		0x340
+#define GRX500_TMU_CFGCMD		0x720
+#define GRX500_TMU_CFGCMD_SB_INPUT_ON	0x00000000U
+#define GRX500_TMU_CFGCMD_SB_OUTPUT_ON	0x60000000U
+#define GRX500_TMU_CFGCMD_EP_ON		0xb0000000U
+#define GRX500_TMU_CFGCMD_VAL		BIT(16)
 #define GRX500_TMU_EPMTC_EMW	0x00000100
 #define GRX500_TMU_EPMTC_EOW	0x00000200
 #define GRX500_TMU_EPMTC_ETW	0x00000400
@@ -120,6 +127,10 @@
 #define GRX500_EQM_CPU_IRNEN	0x10028
 #define GRX500_DQM_CTRL		0x0
 #define GRX500_DQM_CPU_CFG	0x10000
+#define GRX500_DQM_CPU_DQPC	0x10004
+#define GRX500_DQM_CPU_DPTR	0x10030
+#define GRX500_DQM_CPU_BPRC	0x10034
+#define GRX500_DQM_CPU_RESV2_0	0x10038
 #define GRX500_DQM_CPU_EGP2	0x12000
 #define GRX500_DQM_CPU_PTR_RTN	0x10080
 #define GRX500_DQM_CPU_DESC	0x10100
@@ -872,6 +883,22 @@ static int __maybe_unused grx500_tmu_prepare_lan_queue_maps(struct grx500_datapa
 	return 0;
 }
 
+static int grx500_tmu_cfgcmd(struct grx500_datapath *dp, u32 cmd)
+{
+	void __iomem *reg = dp->base[GRX500_TMU] + GRX500_TMU_CFGCMD;
+	int i;
+
+	__raw_writel(cmd, reg);
+	for (i = 0; i < 10000; i++) {
+		if (__raw_readl(reg) & GRX500_TMU_CFGCMD_VAL)
+			return 0;
+		udelay(1);
+	}
+	dev_warn(dp->dev, "TMU CFGCMD 0x%08x timeout (val=0x%08x)\n",
+		 cmd, __raw_readl(reg));
+	return -ETIMEDOUT;
+}
+
 static int grx500_tmu_setup_flat_path(struct grx500_datapath *dp,
 				      u32 port, u32 queue)
 {
@@ -923,12 +950,28 @@ static int grx500_tmu_setup_flat_path(struct grx500_datapath *dp,
 					   ARRAY_SIZE(scheduler_input));
 	if (ret)
 		return ret;
-	return grx500_tmu_table_write_words(dp, GRX500_TMU_QTHT,
-					    GRX500_TMU_QMTC,
-					    GRX500_TMU_QMTC_QTW,
-					    GRX500_TMU_QMTC_QTV,
-					    queue, threshold,
-					    ARRAY_SIZE(threshold));
+	ret = grx500_tmu_table_write_words(dp, GRX500_TMU_QTHT,
+					   GRX500_TMU_QMTC,
+					   GRX500_TMU_QMTC_QTW,
+					   GRX500_TMU_QMTC_QTV,
+					   queue, threshold,
+					   ARRAY_SIZE(threshold));
+	if (ret)
+		return ret;
+
+	if (__raw_readl(dp->base[GRX500_TMU] + GRX500_TMU_CTRL) & BIT(0)) {
+		ret = grx500_tmu_cfgcmd(dp, GRX500_TMU_CFGCMD_SB_INPUT_ON | sbin);
+		if (ret)
+			return ret;
+		ret = grx500_tmu_cfgcmd(dp, GRX500_TMU_CFGCMD_SB_OUTPUT_ON | sbid);
+		if (ret)
+			return ret;
+		ret = grx500_tmu_cfgcmd(dp, GRX500_TMU_CFGCMD_EP_ON | port);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static int grx500_tmu_create_lan_paths(struct grx500_datapath *dp)
@@ -1400,29 +1443,90 @@ static int grx500_poll(struct napi_struct *napi, int budget)
 		data = phys_to_virt(ptr + offset);
 		/* Pass the full frame (8-byte PMAC prefix + Ethernet frame) to the
 		 * DSA conduit; tag_grx500 strips the PMAC after eth_type_trans().
-		 * napi_alloc_skb() reserves NET_SKB_PAD + NET_IP_ALIGN (2 bytes)
-		 * so L3 remains 4-byte aligned after pulling ETH_HLEN + 8B PMAC.
+		 * For DirectConnect WLAN exceptions (sppid 8/9 from DMA1-TX),
+		 * strip the 8-byte PMAC and deliver directly to the WLAN netdev.
 		 */
-		skb = napi_alloc_skb(napi, len);
-		if (skb) {
-			skb_put_data(skb, data, len);
-			skb->protocol = eth_type_trans(skb, dp->ndev);
-			if (unlikely(!IS_ALIGNED((unsigned long)skb->data, 4))) {
-				u64_stats_update_begin(&dp->rx_syncp);
-				dp->rx_errors++;
-				u64_stats_update_end(&dp->rx_syncp);
-				dev_kfree_skb_any(skb);
-			} else {
-				napi_gro_receive(napi, skb);
-				u64_stats_update_begin(&dp->rx_syncp);
-				dp->rx_packets++;
-				dp->rx_bytes += len;
-				u64_stats_update_end(&dp->rx_syncp);
+		{
+			u8 sppid = data[2] >> 4;
+			struct net_device *wlan_ndev = NULL;
+
+			if (sppid == GRX500_DCDP_EP_WLAN0 ||
+			    sppid == GRX500_DCDP_EP_WLAN1) {
+				const struct ethhdr *eh =
+					(const struct ethhdr *)(data + GRX500_PMAC_SIZE);
+				int i, j;
+
+				for (i = 0; i < GRX500_DCDP_MAX_RADIOS && !wlan_ndev; i++) {
+					struct grx500_dcdp_port *p = &dp->dcdp_ports[i];
+
+					if (!p->active)
+						continue;
+					for (j = 0; j < GRX500_DCDP_MAX_NETDEVS; j++) {
+						u16 sid = 0;
+
+						if (p->netdevs[j].ndev &&
+						    p->netdevs[j].get_subif &&
+						    p->netdevs[j].get_subif(p->netdevs[j].ndev,
+									    eh->h_source,
+									    &sid) == 0) {
+							wlan_ndev = p->netdevs[j].ndev;
+							break;
+						}
+					}
+				}
+				if (!wlan_ndev) {
+					u32 slot = sppid & 1;
+
+					if (dp->dcdp_ports[slot].active &&
+					    dp->dcdp_ports[slot].dev)
+						wlan_ndev = dp->dcdp_ports[slot].dev;
+					else if (dp->dcdp_ports[0].active)
+						wlan_ndev = dp->dcdp_ports[0].dev;
+				}
 			}
-		} else {
-			u64_stats_update_begin(&dp->rx_syncp);
-			dp->rx_dropped++;
-			u64_stats_update_end(&dp->rx_syncp);
+
+			if (wlan_ndev && len > GRX500_PMAC_SIZE) {
+				u32 wlan_len = len - GRX500_PMAC_SIZE;
+
+				skb = napi_alloc_skb(napi, wlan_len);
+				if (skb) {
+					skb_put_data(skb, data + GRX500_PMAC_SIZE,
+						     wlan_len);
+					skb->protocol = eth_type_trans(skb, wlan_ndev);
+					if (unlikely(!IS_ALIGNED((unsigned long)skb->data, 4))) {
+						wlan_ndev->stats.rx_errors++;
+						dev_kfree_skb_any(skb);
+					} else {
+						napi_gro_receive(napi, skb);
+						wlan_ndev->stats.rx_packets++;
+						wlan_ndev->stats.rx_bytes += wlan_len;
+					}
+				} else {
+					wlan_ndev->stats.rx_dropped++;
+				}
+			} else {
+				skb = napi_alloc_skb(napi, len);
+				if (skb) {
+					skb_put_data(skb, data, len);
+					skb->protocol = eth_type_trans(skb, dp->ndev);
+					if (unlikely(!IS_ALIGNED((unsigned long)skb->data, 4))) {
+						u64_stats_update_begin(&dp->rx_syncp);
+						dp->rx_errors++;
+						u64_stats_update_end(&dp->rx_syncp);
+						dev_kfree_skb_any(skb);
+					} else {
+						napi_gro_receive(napi, skb);
+						u64_stats_update_begin(&dp->rx_syncp);
+						dp->rx_packets++;
+						dp->rx_bytes += len;
+						u64_stats_update_end(&dp->rx_syncp);
+					}
+				} else {
+					u64_stats_update_begin(&dp->rx_syncp);
+					dp->rx_dropped++;
+					u64_stats_update_end(&dp->rx_syncp);
+				}
+			}
 		}
 		dma_sync_single_for_device(dp->dev, ptr & ~7u,
 					2048 - (ptr - frame), DMA_BIDIRECTIONAL);
@@ -1729,20 +1833,59 @@ static void grx500_set_rx_mode(struct net_device *ndev)
 	 */
 }
 
+static int grx500_pae_cls_replace(struct grx500_datapath *dp,
+				  struct flow_cls_offload *f);
+static int grx500_pae_cls_destroy(struct grx500_datapath *dp,
+				  struct flow_cls_offload *f);
+
+static bool grx500_dcdp_find_netdev(struct grx500_datapath *dp,
+				    struct net_device *ndev,
+				    struct grx500_dcdp_port **out_port,
+				    grx500_dcdp_get_subif_fn *out_get_subif)
+{
+	int i, j;
+
+	if (!dp || !ndev)
+		return false;
+
+	for (i = 0; i < GRX500_DCDP_MAX_RADIOS; i++) {
+		struct grx500_dcdp_port *p = &dp->dcdp_ports[i];
+
+		if (!p->active)
+			continue;
+		for (j = 0; j < GRX500_DCDP_MAX_NETDEVS; j++) {
+			if (p->netdevs[j].ndev == ndev) {
+				if (out_port)
+					*out_port = p;
+				if (out_get_subif)
+					*out_get_subif = p->netdevs[j].get_subif;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 static int grx500_pae_port_map(struct grx500_datapath *dp,
 			       struct net_device *dev, u16 *port_map)
 {
 	struct dsa_port *p = dsa_port_from_netdev(dev);
+	struct grx500_dcdp_port *dcdp_port = NULL;
 
-	if (IS_ERR(p) || dsa_port_to_conduit(p) != dp->ndev)
+	if (!IS_ERR(p) && dsa_port_to_conduit(p) == dp->ndev) {
+		if (p->index == 1) {
+			*port_map = BIT(GRX500_WAN_ENDPOINT);
+			return 0;
+		}
+		if (p->index >= 2 && p->index <= 5) {
+			*port_map = BIT(p->index);
+			return 0;
+		}
 		return -EOPNOTSUPP;
-
-	if (p->index == 1) {
-		*port_map = BIT(GRX500_WAN_ENDPOINT);
-		return 0;
 	}
-	if (p->index >= 2 && p->index <= 5) {
-		*port_map = BIT(p->index);
+
+	if (grx500_dcdp_find_netdev(dp, dev, &dcdp_port, NULL)) {
+		*port_map = BIT(dcdp_port->ep_id);
 		return 0;
 	}
 	return -EOPNOTSUPP;
@@ -1987,6 +2130,20 @@ static int grx500_pae_cls_replace(struct grx500_datapath *dp,
 	if (memchr_inv(eth_mask + ETH_ALEN, 0xff, ETH_ALEN) == NULL) {
 		memcpy(flow.src_mac, eth_hdr + ETH_ALEN, ETH_ALEN);
 		flow.use_src_mac = true;
+	}
+
+	{
+		grx500_dcdp_get_subif_fn get_subif = NULL;
+
+		if (grx500_dcdp_find_netdev(dp, out_dev, NULL, &get_subif) &&
+		    get_subif) {
+			if (!flow.use_dst_mac)
+				return -EOPNOTSUPP;
+			ret = get_subif(out_dev, flow.dst_mac,
+					&flow.dst_subif_id);
+			if (ret)
+				return ret;
+		}
 	}
 
 	if (has_snat || has_dnat) {
@@ -2312,8 +2469,9 @@ static ssize_t status_show(struct device *dev,
 {
 	struct grx500_datapath *dp = dev_get_drvdata(dev);
 	u32 tmu, cbm, eqm, dqm, igp0, egp2, eqm_pocc, ls_status, ls_irq;
-	u32 eqm_packets, q20_enq, q20_deq, q35_enq, q35_deq;
+	u32 eqm_packets, q20_enq, q20_deq, q35_enq, q35_deq, q36_enq, q36_deq;
 	u32 desc0, desc1, desc2, desc3;
+	u32 umt_regs[8];
 	size_t len;
 	int p2p_ready = 0, i;
 
@@ -2332,6 +2490,8 @@ static ssize_t status_show(struct device *dev,
 	q20_deq = __raw_readl(dp->base[GRX500_QDQCNT] + 20 * sizeof(u32));
 	q35_enq = __raw_readl(dp->base[GRX500_QEQCNT] + 35 * sizeof(u32));
 	q35_deq = __raw_readl(dp->base[GRX500_QDQCNT] + 35 * sizeof(u32));
+	q36_enq = __raw_readl(dp->base[GRX500_QEQCNT] + 36 * sizeof(u32));
+	q36_deq = __raw_readl(dp->base[GRX500_QDQCNT] + 36 * sizeof(u32));
 	desc0 = __raw_readl(dp->base[GRX500_EQM] + GRX500_EQM_CPU_DESC);
 	desc1 = __raw_readl(dp->base[GRX500_EQM] + GRX500_EQM_CPU_DESC + 4);
 	desc2 = __raw_readl(dp->base[GRX500_EQM] + GRX500_EQM_CPU_DESC + 8);
@@ -2344,6 +2504,8 @@ static ssize_t status_show(struct device *dev,
 			     dp->p2p[i].rx_requested &&
 			     dp->p2p[i].buffers_allocated;
 
+	grx500_umt_debug_info(umt_regs);
+
 	len = sysfs_emit(buf,
 		"tmu_ctrl=%08x active=%u\n"
 		"cbm_ctrl=%08x active=%u\n"
@@ -2351,17 +2513,19 @@ static ssize_t status_show(struct device *dev,
 		"dqm_ctrl=%08x enabled=%u\n"
 		"cpu_igp0_cfg=%08x cpu_egp2_cfg=%08x\n"
 		"eqm_cpu_pocc=%08x ls_port_status=%08x ls_irq_status=%08x\n"
-		"eqm_cpu_enqueued=%u q20_enq=%u q20_deq=%u q35_enq=%u q35_deq=%u\n"
+		"eqm_cpu_enqueued=%u q20_enq=%u q20_deq=%u q35_enq=%u q35_deq=%u q36_enq=%u q36_deq=%u\n"
 		"eqm_last_desc=%08x:%08x:%08x:%08x\n"
 		"p2p_dma2rx_to_dma1tx=0-3 ready=%d/4\n"
 		"std_pool=%pa jumbo_pool=%pa cpu_dqm=%u:%u\n"
 		"cbm_sba0=%08x sba1=%08x jba0=%08x jba1=%08x\n"
 		"lan_eqm=%u/%u lan_dqm=%u-%u queues=%u-%u\n"
+		"qidt_ep8=%08x dqm4_cfg=%08x\n"
+		"umt0 gctrl=%08x mux=%08x dest=%08x perd=%08x sw_mode=%08x cnt_ctrl=%08x msg0=%08x msg1=%08x\n"
 		"eqm_irq=%d cpu_dqm_irqs=%d,%d,%d,%d (shared after first port activation)\n",
 		tmu, !!(tmu & 1), cbm, !!(cbm & 1),
 		eqm, !!(eqm & 1), dqm, !!(dqm & 1), igp0, egp2,
 		eqm_pocc, ls_status, ls_irq,
-		eqm_packets, q20_enq, q20_deq, q35_enq, q35_deq,
+		eqm_packets, q20_enq, q20_deq, q35_enq, q35_deq, q36_enq, q36_deq,
 		desc0, desc1, desc2, desc3, p2p_ready,
 		&dp->pool_phys[GRX500_STANDARD_POOL],
 		&dp->pool_phys[GRX500_JUMBO_POOL],
@@ -2375,7 +2539,29 @@ static ssize_t status_show(struct device *dev,
 		dp->lan_dqm[GRX500_LAN_DQM_ROUTES - 1].port,
 		dp->lan_dqm[0].tmu_queue,
 		dp->lan_dqm[GRX500_LAN_DQM_ROUTES - 1].tmu_queue,
+		__raw_readl(dp->base[GRX500_QIDT] + (0x80 >> 2) * sizeof(u32)),
+		__raw_readl(dp->base[GRX500_DQM] + GRX500_DQM_CPU_CFG +
+			    4 * GRX500_CBM_CPU_PORT_STRIDE),
+		umt_regs[0], umt_regs[1], umt_regs[2], umt_regs[3],
+		umt_regs[4], umt_regs[5], umt_regs[6], umt_regs[7],
 			dp->irq[0], dp->irq[1], dp->irq[2], dp->irq[3], dp->irq[4]);
+	{
+		void __iomem *dqm4 = dp->base[GRX500_DQM] +
+				     4 * GRX500_CBM_CPU_PORT_STRIDE;
+		u32 sw[8] = { 0 };
+
+		grx500_umt_sw_debug(0, sw);
+		len += sysfs_emit_at(buf, len,
+			"dqm4_regs cfg=%08x dqpc=%08x dptr=%08x bprc=%08x irncr=%08x irnen=%08x\n"
+			"umt_sw en=%u dq_idx=%u ticks=%u writes=%u last_cnt=%u last_dqpc=%u total=%u dst_pa=%08x\n",
+			__raw_readl(dqm4 + GRX500_DQM_CPU_CFG),
+			__raw_readl(dqm4 + GRX500_DQM_CPU_DQPC),
+			__raw_readl(dqm4 + GRX500_DQM_CPU_DPTR),
+			__raw_readl(dqm4 + GRX500_DQM_CPU_BPRC),
+			__raw_readl(dqm4 + GRX500_DQM_CPU_CFG + 0x20),
+			__raw_readl(dqm4 + GRX500_DQM_CPU_CFG + 0x28),
+			sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]);
+	}
 	len += sysfs_emit_at(buf, len,
 		"rx_ls_port=%u rx_irq=%d cbm_line=%u ls_global=%08x spread=%08x irq_enable=%08x cbm_line_status=%08x enable=%08x\n",
 		GRX500_RX_LS_PORT, dp->irq[GRX500_RX_IRQ_INDEX], GRX500_RX_CBM_LINE,
@@ -2453,6 +2639,29 @@ static ssize_t status_show(struct device *dev,
 			"pae_regs gctrl0=%04x gctrl1=%04x tfcr_num=%04x tfcr0_k12=%04x tfcr0_v9=%04x tfcr0_vld=%u\n",
 			gctrl0, gctrl1, tfcr_num, k12, v9, vld);
 	}
+	if (dp->dcdp_ports[0].active) {
+		u32 cctrl = 0, cdba = 0, cdptnrd = 0, cis = 0, cie = 0;
+
+		if (ltq_dma_chan_get_debug(dp->dcdp_ports[0].dma_ch,
+					   &cctrl, &cdba, &cdptnrd,
+					   &cis, &cie) == 0)
+			len += sysfs_emit_at(buf, len,
+				"dma1tx_ch7 cctrl=%08x cdba=%08x cdptnrd=%08x cis=%08x cie=%08x\n",
+				cctrl, cdba, cdptnrd, cis, cie);
+	}
+	if (dp->gswip[1]) {
+		u8 p;
+
+		for (p = 0; p <= 9; p = (p == 0) ? 8 : p + 1) {
+			u64 st[GRX500_GSWIP_RMON_STATS] = {};
+
+			if (grx500_gswip_get_rmon_stats(dp->gswip[1], true, p, st) == 0)
+				len += sysfs_emit_at(buf, len,
+					"gswipr_p%u rx_u=%llu rx_b=%llu rx_tdrop=%llu rx_fdrop=%llu rx_crc=%llu tx_u=%llu tx_b=%llu tx_drop=%llu\n",
+					p, st[3], st[1], st[5], st[6], st[7],
+					st[2], st[0], st[4]);
+		}
+	}
 	return len;
 }
 static DEVICE_ATTR_RO(status);
@@ -2508,6 +2717,33 @@ static void grx500_dcdp_set_qidt_ep(struct grx500_datapath *dp,
 	}
 }
 
+static void __iomem *grx500_dcdp_map_uncached(phys_addr_t phys, size_t size)
+{
+	unsigned long pfn = PHYS_PFN(phys);
+	size_t off = offset_in_page(phys);
+	unsigned int nr_pages = PAGE_ALIGN(size + off) >> PAGE_SHIFT;
+	struct page **pages;
+	void *vaddr;
+	unsigned int i;
+
+	pages = kmalloc_array(nr_pages, sizeof(*pages), GFP_KERNEL);
+	if (!pages)
+		return NULL;
+	for (i = 0; i < nr_pages; i++)
+		pages[i] = pfn_to_page(pfn + i);
+	vaddr = vmap(pages, nr_pages, VM_MAP, pgprot_noncached(PAGE_KERNEL));
+	kfree(pages);
+	if (!vaddr)
+		return NULL;
+	return (void __iomem *)((u8 *)vaddr + off);
+}
+
+static void grx500_dcdp_unmap_uncached(void __iomem *virt)
+{
+	if (virt)
+		vunmap((void *)((unsigned long)virt & PAGE_MASK));
+}
+
 int grx500_dcdp_register_radio(u32 ep_id, struct net_device *dev,
 			       u32 umt_dst_phys, u32 rx_ring_entries,
 			       struct grx500_dcdp_port **out_port)
@@ -2515,10 +2751,9 @@ int grx500_dcdp_register_radio(u32 ep_id, struct net_device *dev,
 	struct grx500_datapath *dp = READ_ONCE(g_grx500_dp);
 	struct grx500_dcdp_port *port;
 	u32 slot, cbm_pid, tmu_port, tmu_queue;
-	size_t rx_bytes;
 	int ret;
 
-	if (!dp || !dev || !umt_dst_phys || !rx_ring_entries || !out_port)
+	if (!dp || !umt_dst_phys || !rx_ring_entries || !out_port)
 		return -EINVAL;
 
 	if (ep_id == GRX500_DCDP_EP_WLAN0) {
@@ -2543,10 +2778,53 @@ int grx500_dcdp_register_radio(u32 ep_id, struct net_device *dev,
 	}
 	memset(port, 0, sizeof(*port));
 	port->ep_id = ep_id;
+	port->dev = dev;
+
+	/*
+	 * DC_DP_F_SHARED_RES (vendor CDB/DBDC): WAV654 exposes a single
+	 * tx_in/tx_out/rx_out/UMT ring set via DATA_PATH_INIT. When WLAN0
+	 * (ep=8) is already active, WLAN1 (ep=9) shares its CBM/DQM/UMT
+	 * rings and routes ep=9 into the same TMU queue via QIDT.
+	 */
+	if (ep_id == GRX500_DCDP_EP_WLAN1 && dp->dcdp_ports[0].active) {
+		struct grx500_dcdp_port *primary = &dp->dcdp_ports[0];
+
+		port->shared_res = true;
+		port->cbm_pid = primary->cbm_pid;
+		port->tmu_port = primary->tmu_port;
+		port->tmu_queue = primary->tmu_queue;
+		port->umt_id = primary->umt_id;
+		port->dma_ctrl_id = primary->dma_ctrl_id;
+		port->dma_cid = primary->dma_cid;
+		port->tx_in = primary->tx_in;
+		port->tx_out = primary->tx_out;
+		port->rx_out = primary->rx_out;
+
+		if (dp->gswip[1]) {
+			ret = grx500_gswip_configure_wlan_port(dp->gswip[1],
+							       ep_id,
+							       port->dma_cid);
+			if (ret)
+				goto err_unlock;
+		}
+		grx500_dcdp_set_qidt_ep(dp, ep_id, port->tmu_queue);
+
+		port->active = true;
+		*out_port = port;
+		mutex_unlock(&dp->dcdp_lock);
+
+		dev_info(dp->dev,
+			 "DCDP radio registered (shared): ep=%u cbm_pid=%u tmu_port=%u q=%u umt=%u dma_cid=%u tx_in=%pa tx_out=%pa rx_out=%pa\n",
+			 port->ep_id, port->cbm_pid, port->tmu_port,
+			 port->tmu_queue, port->umt_id, port->dma_cid,
+			 &port->tx_in.phys, &port->tx_out.phys,
+			 &port->rx_out.phys);
+		return 0;
+	}
+
 	port->cbm_pid = cbm_pid;
 	port->tmu_port = tmu_port;
 	port->tmu_queue = tmu_queue;
-	port->dev = dev;
 
 	ret = grx500_umt_request(ep_id, cbm_pid, &port->dma_ctrl_id,
 				 &port->dma_cid, &port->umt_id);
@@ -2560,26 +2838,58 @@ int grx500_dcdp_register_radio(u32 ep_id, struct net_device *dev,
 			goto err_umt_release;
 	}
 
+	/* Vendor 7025: allocate DMA1-TX channel (dma_cid=7) as hardware rx_out (dev2soc) ring. */
+	rx_ring_entries = min_t(u32, rx_ring_entries, 2048U);
+	port->dma_ch = _DMA_C(DMA1TX, 0, port->dma_cid);
+	ret = ltq_request_dma(port->dma_ch, "grx500-dcdp");
+	if (ret)
+		goto err_umt_release;
+	ret = ltq_dma_chan_desc_alloc(port->dma_ch, rx_ring_entries);
+	if (ret)
+		goto err_dma_free;
+
 	grx500_dcdp_set_cbm_wlan_ep(dp, ep_id, tmu_port);
-	__raw_writel(0x107U | ((tmu_port & 0x1fU) << 16),
-		     dp->base[GRX500_DQM] + GRX500_DQM_CPU_CFG +
-		     tmu_port * GRX500_CBM_CPU_PORT_STRIDE);
+	/* Vendor 7016 do_port_setting(case 4): reset pointers/counters and 32 descriptors before enabling DQM CPU port. */
+	{
+		void __iomem *dqm = dp->base[GRX500_DQM];
+		u32 off = tmu_port * GRX500_CBM_CPU_PORT_STRIDE;
+		u32 i;
+
+		__raw_writel(0, dqm + GRX500_DQM_CPU_CFG + off);
+		wmb();
+		__raw_writel(0x1fU, dqm + GRX500_DQM_CPU_DPTR + off);
+		__raw_writel(0, dqm + GRX500_DQM_CPU_RESV2_0 + off);
+		__raw_writel(0, dqm + GRX500_DQM_CPU_DQPC + off);
+		__raw_writel(0, dqm + GRX500_DQM_CPU_BPRC + off);
+		wmb();
+		for (i = 0; i < 32; i++) {
+			void __iomem *d = dqm + GRX500_DQM_CPU_DESC + off + i * 16;
+
+			__raw_writel(0, d + 0);
+			__raw_writel(0, d + 4);
+			__raw_writel(0, d + 8);
+			__raw_writel(0, d + 12);
+		}
+		__raw_writel(0x107U | ((tmu_port & 0x1fU) << 16),
+			     dqm + GRX500_DQM_CPU_CFG + off);
+		wmb();
+	}
 
 	ret = grx500_tmu_setup_flat_path(dp, tmu_port, tmu_queue);
 	if (ret)
 		goto err_cbm_clear;
 	grx500_dcdp_set_qidt_ep(dp, ep_id, tmu_queue);
 
-	rx_bytes = (size_t)rx_ring_entries * GRX500_DCDP_RING_DESC_SIZE;
-	port->rx_out.virt = dma_alloc_coherent(dp->dev, rx_bytes,
-					       &port->rx_out.dma, GFP_KERNEL);
+	port->rx_out.phys = (phys_addr_t)ltq_dma_chan_get_desc_phys_base(port->dma_ch);
+	port->rx_out.dma = (dma_addr_t)port->rx_out.phys;
+	port->rx_out.entries = rx_ring_entries;
+	port->rx_out.entry_size = GRX500_DCDP_RING_DESC_SIZE;
+	port->rx_out.virt = grx500_dcdp_map_uncached(port->rx_out.phys,
+						     rx_ring_entries * GRX500_DCDP_RING_DESC_SIZE);
 	if (!port->rx_out.virt) {
 		ret = -ENOMEM;
 		goto err_qidt_clear;
 	}
-	port->rx_out.phys = (phys_addr_t)port->rx_out.dma;
-	port->rx_out.entries = rx_ring_entries;
-	port->rx_out.entry_size = GRX500_DCDP_RING_DESC_SIZE;
 
 	port->tx_in.phys = grx500_layout[GRX500_DQM].start +
 			   GRX500_DQM_CPU_DESC +
@@ -2597,6 +2907,10 @@ int grx500_dcdp_register_radio(u32 ep_id, struct net_device *dev,
 	port->tx_out.entries = 32;
 	port->tx_out.entry_size = GRX500_DCDP_TXOUT_DESC_SIZE;
 
+	grx500_umt_sw_set_dqpc(port->umt_id,
+			       dp->base[GRX500_DQM] + GRX500_DQM_CPU_DQPC +
+			       tmu_port * GRX500_CBM_CPU_PORT_STRIDE);
+
 	ret = grx500_umt_set_mode(port->umt_id, ep_id, 0, 3, umt_dst_phys,
 				  GRX500_DCDP_DEFAULT_UMT_US, true);
 	if (ret)
@@ -2604,6 +2918,10 @@ int grx500_dcdp_register_radio(u32 ep_id, struct net_device *dev,
 	ret = grx500_umt_enable(port->umt_id, ep_id, true);
 	if (ret)
 		goto err_free_rx;
+	ret = ltq_dma_chan_open(port->dma_ch);
+	if (ret)
+		goto err_free_rx;
+	port->dma_ch_open = true;
 
 	port->active = true;
 	*out_port = port;
@@ -2618,12 +2936,14 @@ int grx500_dcdp_register_radio(u32 ep_id, struct net_device *dev,
 
 err_free_rx:
 	grx500_umt_enable(port->umt_id, ep_id, false);
-	dma_free_coherent(dp->dev, rx_bytes, port->rx_out.virt,
-			  port->rx_out.dma);
+	grx500_dcdp_unmap_uncached(port->rx_out.virt);
 err_qidt_clear:
 	grx500_dcdp_set_qidt_ep(dp, ep_id, 255);
 err_cbm_clear:
 	grx500_dcdp_set_cbm_wlan_ep(dp, 0, tmu_port);
+	ltq_dma_chan_desc_free(port->dma_ch);
+err_dma_free:
+	ltq_free_dma(port->dma_ch);
 err_umt_release:
 	grx500_umt_release(port->umt_id, ep_id);
 err_unlock:
@@ -2636,7 +2956,6 @@ EXPORT_SYMBOL_GPL(grx500_dcdp_register_radio);
 void grx500_dcdp_unregister_radio(struct grx500_dcdp_port *port)
 {
 	struct grx500_datapath *dp = READ_ONCE(g_grx500_dp);
-	size_t rx_bytes;
 
 	if (!dp || !port)
 		return;
@@ -2647,15 +2966,26 @@ void grx500_dcdp_unregister_radio(struct grx500_dcdp_port *port)
 		return;
 	}
 
+	if (port->shared_res) {
+		grx500_dcdp_set_qidt_ep(dp, port->ep_id, 255);
+		memset(port, 0, sizeof(*port));
+		mutex_unlock(&dp->dcdp_lock);
+		return;
+	}
+
+	if (port->dma_ch_open) {
+		ltq_dma_chan_close(port->dma_ch);
+		grx500_dcdp_unmap_uncached(port->rx_out.virt);
+		port->rx_out.virt = NULL;
+		ltq_dma_chan_reset(port->dma_ch);
+		ltq_dma_chan_desc_free(port->dma_ch);
+		ltq_free_dma(port->dma_ch);
+		port->dma_ch_open = false;
+	}
 	grx500_umt_enable(port->umt_id, port->ep_id, false);
 	grx500_dcdp_set_qidt_ep(dp, port->ep_id, 255);
 	grx500_dcdp_set_cbm_wlan_ep(dp, 0, port->tmu_port);
 	grx500_umt_release(port->umt_id, port->ep_id);
-	if (port->rx_out.virt) {
-		rx_bytes = (size_t)port->rx_out.entries * port->rx_out.entry_size;
-		dma_free_coherent(dp->dev, rx_bytes, port->rx_out.virt,
-				  port->rx_out.dma);
-	}
 	memset(port, 0, sizeof(*port));
 	mutex_unlock(&dp->dcdp_lock);
 }
@@ -2704,18 +3034,103 @@ int grx500_dcdp_xmit(struct grx500_dcdp_port *port, u16 subif_id,
 
 	desc = dp->base[GRX500_EQM] + GRX500_EQM_CPU_DESC;
 	spin_lock_irqsave(&dp->tx_lock, irqflags);
-	__raw_writel((u32)subif_id, desc);
-	__raw_writel(port->ep_id << GRX500_TX_DW1_EP_SHIFT, desc + 4);
-	__raw_writel(addr & ~7u, desc + 8);
-	wmb();
-	__raw_writel(BIT(29) | BIT(28) | ((addr & 7) << 23) | len,
-		     desc + 12);
+	{
+		u32 dw0 = (u32)subif_id;
+		u32 dw1 = port->ep_id << GRX500_TX_DW1_EP_SHIFT;
+		u32 dw2 = addr & ~7u;
+		u32 dw3 = BIT(29) | BIT(28) | ((addr & 7) << 23) | len;
+
+		__raw_writel(dw0, desc);
+		__raw_writel(dw1, desc + 4);
+		__raw_writel(dw2, desc + 8);
+		wmb();
+		__raw_writel(dw3, desc + 12);
+	}
 	spin_unlock_irqrestore(&dp->tx_lock, irqflags);
 
 	dev_consume_skb_any(skb);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(grx500_dcdp_xmit);
+
+int grx500_dcdp_bind_netdev(struct grx500_dcdp_port *port,
+			    struct net_device *ndev,
+			    grx500_dcdp_get_subif_fn get_subif)
+{
+	struct grx500_datapath *dp = READ_ONCE(g_grx500_dp);
+	int i, free_slot = -1;
+
+	if (!dp || !port || !port->active || !ndev)
+		return -EINVAL;
+
+	mutex_lock(&dp->dcdp_lock);
+	for (i = 0; i < GRX500_DCDP_MAX_NETDEVS; i++) {
+		if (port->netdevs[i].ndev == ndev) {
+			port->netdevs[i].get_subif = get_subif;
+			mutex_unlock(&dp->dcdp_lock);
+			return 0;
+		}
+		if (free_slot < 0 && !port->netdevs[i].ndev)
+			free_slot = i;
+	}
+	if (free_slot < 0) {
+		mutex_unlock(&dp->dcdp_lock);
+		return -ENOSPC;
+	}
+	port->netdevs[free_slot].ndev = ndev;
+	port->netdevs[free_slot].get_subif = get_subif;
+	if (!port->dev)
+		port->dev = ndev;
+	mutex_unlock(&dp->dcdp_lock);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(grx500_dcdp_bind_netdev);
+
+void grx500_dcdp_unbind_netdev(struct net_device *ndev)
+{
+	struct grx500_datapath *dp = READ_ONCE(g_grx500_dp);
+	int i, j;
+
+	if (!dp || !ndev)
+		return;
+
+	mutex_lock(&dp->dcdp_lock);
+	for (i = 0; i < GRX500_DCDP_MAX_RADIOS; i++) {
+		struct grx500_dcdp_port *p = &dp->dcdp_ports[i];
+
+		for (j = 0; j < GRX500_DCDP_MAX_NETDEVS; j++) {
+			if (p->netdevs[j].ndev == ndev) {
+				p->netdevs[j].ndev = NULL;
+				p->netdevs[j].get_subif = NULL;
+			}
+		}
+		if (p->dev == ndev)
+			p->dev = NULL;
+	}
+	mutex_unlock(&dp->dcdp_lock);
+}
+EXPORT_SYMBOL_GPL(grx500_dcdp_unbind_netdev);
+
+int grx500_dcdp_setup_tc(enum tc_setup_type type, void *type_data)
+{
+	struct grx500_datapath *dp = READ_ONCE(g_grx500_dp);
+	struct flow_cls_offload *f = type_data;
+
+	if (!dp || type != TC_SETUP_FT || !f)
+		return -EOPNOTSUPP;
+
+	switch (f->command) {
+	case FLOW_CLS_REPLACE:
+		return grx500_pae_cls_replace(dp, f);
+	case FLOW_CLS_DESTROY:
+		return grx500_pae_cls_destroy(dp, f);
+	case FLOW_CLS_STATS:
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+EXPORT_SYMBOL_GPL(grx500_dcdp_setup_tc);
 
 static int grx500_datapath_probe(struct platform_device *pdev)
 {

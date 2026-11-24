@@ -65,7 +65,7 @@ $(eval $(call KernelPackage,grx500-switch))
 define KernelPackage/wave600-wifi
   SUBMENU:=$(WIRELESS_MENU)
   TITLE:=Intel/MaxLinear Wave600 (WAV654) Wi-Fi 6 driver
-  DEPENDS:=@TARGET_lantiq_xrx500 +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT
+  DEPENDS:=@TARGET_lantiq_xrx500 +kmod-grx500-switch +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT
   KCONFIG:= \
     CONFIG_WAVE600_WIFI \
     CONFIG_CFG80211

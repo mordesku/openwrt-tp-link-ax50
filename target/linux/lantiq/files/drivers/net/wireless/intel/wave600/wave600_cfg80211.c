@@ -1549,7 +1549,7 @@ static int wave600_radio_init(struct wave600_dev *wdev, u8 radio_idx)
 	radio->wdev = wdev;
 	radio->radio_idx = radio_idx;
 	radio->ep = (radio_idx == 0) ? 1 : 0;
-	radio->vap_id = 0; /* primary AP VAP index is 0 on both radios */
+	radio->vap_id = 0; /* primary AP VAP index is 0 on both radios; DC distinguishes radios by ep_id in DW1 */
 	radio->antenna_mask = (radio_idx == 0) ? 0x05 : 0x0A;
 	INIT_DELAYED_WORK(&radio->cac_work, wave600_cac_work);
 	INIT_DELAYED_WORK(&radio->scan_work, wave600_scan_work);

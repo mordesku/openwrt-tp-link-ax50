@@ -26,5 +26,8 @@ int grx500_umt_set_mode(u32 umt_id, u32 ep_id, enum grx500_umt_mode umt_mode,
 			u32 period_us, bool enable);
 int grx500_umt_enable(u32 umt_id, u32 ep_id, bool enable);
 int grx500_umt_release(u32 umt_id, u32 ep_id);
+void grx500_umt_debug_info(u32 out[8]);
+void grx500_umt_sw_set_dqpc(u32 umt_id, void __iomem *dqpc_reg);
+void grx500_umt_sw_debug(u32 umt_id, u32 out[8]);
 
 #endif

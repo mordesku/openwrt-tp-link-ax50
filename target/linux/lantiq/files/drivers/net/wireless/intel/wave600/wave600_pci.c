@@ -84,6 +84,7 @@ static int wave600_pci_probe(struct pci_dev *pdev, const struct pci_device_id *i
 	wdev->pdev = pdev;
 	wdev->dev = &pdev->dev;
 	wdev->bar0 = pcim_iomap_table(pdev)[0];
+	wdev->bar0_phys = pci_resource_start(pdev, 0);
 	wdev->bar0_len = pci_resource_len(pdev, 0);
 
 	pci_set_drvdata(pdev, wdev);

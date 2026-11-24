@@ -616,6 +616,33 @@ u32 ltq_dma_chan_get_desc_vir_base(u32 chan)
 }
 EXPORT_SYMBOL(ltq_dma_chan_get_desc_vir_base);
 
+int ltq_dma_chan_get_debug(u32 chan, u32 *cctrl, u32 *cdba,
+			   u32 *cdptnrd, u32 *cis, u32 *cie)
+{
+	struct dmax_chan *pch = dma_chan_l2p(chan);
+	struct dma_ctrl *pctrl;
+	unsigned long flags;
+
+	if (!pch)
+		return -EINVAL;
+	pctrl = dma_chan_get_controller(pch);
+	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
+	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
+	if (cctrl)
+		*cctrl = ltq_dma_r32(pctrl, DMA_CCTRL);
+	if (cdba)
+		*cdba = ltq_dma_r32(pctrl, DMA_CDBA);
+	if (cdptnrd)
+		*cdptnrd = ltq_dma_r32(pctrl, DMA_CDPTNRD);
+	if (cis)
+		*cis = ltq_dma_r32(pctrl, DMA_CIS);
+	if (cie)
+		*cie = ltq_dma_r32(pctrl, DMA_CIE);
+	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
+	return 0;
+}
+EXPORT_SYMBOL(ltq_dma_chan_get_debug);
+
 /* DMA channel related configuration */
 static void dma_chan_on(struct dmax_chan *ch)
 {
@@ -865,6 +892,7 @@ static void dma_chan_irq_disable(struct dmax_chan *ch)
 	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
 	ltq_dma_w32(pctrl, ch->nr, DMA_CS);
 	ltq_dma_w32(pctrl, 0, DMA_CIE);
+	ltq_dma_w32(pctrl, DMA_CI_ALL, DMA_CIS);
 	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
 }
 
@@ -1671,7 +1699,8 @@ int ltq_dma_chan_irq_callback_cfg(u32 chan, irq_handler_t handler, void *data)
 		return -EINVAL;
 
 	pctrl = dma_chan_get_controller(pch);
-	devm_free_irq(pctrl->dev, pch->irq, (void *)pch);
+	devm_free_irq(pctrl->dev, pch->irq,
+		      (pch->flags & DEVICE_CTRL_CHAN) ? pch->data : (void *)pch);
 	ret = devm_request_irq(pctrl->dev, pch->irq, handler, 0,
 		pch->device_id, data);
 	if (ret)

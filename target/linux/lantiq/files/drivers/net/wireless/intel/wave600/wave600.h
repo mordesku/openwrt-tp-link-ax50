@@ -122,6 +122,7 @@ struct wave600_radio {
 	u8 ep;			/* 1 for Radio 0, 0 for Radio 1 */
 	u8 vap_id;		/* Local VAP index on this radio (0 for primary AP) */
 	u8 antenna_mask;	/* 0x05 for Radio 0, 0x0A for Radio 1 */
+	struct grx500_dcdp_port *dcdp_port;	/* per-radio DirectConnect port (ep 8/9) */
 
 	struct wiphy *wiphy;
 	struct net_device *ndev;
@@ -170,11 +171,15 @@ struct wave600_radio {
 	u32 scan_freq;
 };
 
+struct grx500_dcdp_port;
+
 struct wave600_dev {
 	struct pci_dev *pdev;
 	struct device *dev;
 	void __iomem *bar0;
+	phys_addr_t bar0_phys;
 	resource_size_t bar0_len;
+	struct grx500_dcdp_port *dcdp_port;
 
 	/* Device state and recovery */
 	enum wave600_state state;

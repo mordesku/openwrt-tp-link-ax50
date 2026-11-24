@@ -110,6 +110,9 @@ struct wave600_dma {
 	void *dc_tx_out;
 	dma_addr_t dc_tx_out_dma;
 	u32 dc_ring_size;
+	u32 dc_rx_read;
+	u32 dc_irq_stuck;
+	u32 dc_irq_suppress;
 
 	/* SHRAM RD pool geometry (CHI sRdPOOL) */
 	u32 rd_pool_num;

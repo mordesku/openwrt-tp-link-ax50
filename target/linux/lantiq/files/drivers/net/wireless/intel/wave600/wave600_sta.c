@@ -94,6 +94,8 @@ static void wave600_teardown_station(struct wave600_radio *radio, struct wave600
 
 	sid = sta->sid;
 	ether_addr_copy(del_mac, sta->mac);
+	/* Remove from driver table first so TX/DCDP stops using this SID immediately. */
+	wave600_del_sta_entry(radio, del_mac);
 
 	dev_dbg(wdev->dev, "Radio %u teardown station %pM (sid %u)\n",
 		radio->radio_idx, del_mac, sid);
@@ -148,9 +150,6 @@ static void wave600_teardown_station(struct wave600_radio *radio, struct wave600
 	else if (rcfm.status)
 		dev_warn(wdev->dev, "Radio %u REMOVE_SID rejected by FW: status=%u\n",
 			 radio->radio_idx, rcfm.status);
-
-	/* 4. Delete entry from local driver table */
-	wave600_del_sta_entry(radio, del_mac);
 }
 
 int wave600_cfg80211_add_station(struct wiphy *wiphy,

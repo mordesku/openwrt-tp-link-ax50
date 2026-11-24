@@ -115,7 +115,10 @@ static int wave600_fw_stage_all(struct wave600_dev *wdev)
 		return ret;
 
 	/* 3. Host Interface firmware */
-	ret = wave600_fw_load_file(wdev, WAVE600_FW_HOST_IF,
+	ret = wave600_fw_load_file(wdev,
+				   !wdev->aux ?
+				   WAVE600_FW_HOST_IF_DC_MODE0 :
+				   WAVE600_FW_HOST_IF,
 				   WAVE600_IFCPU_IRAM_START, WAVE600_IFCPU_IRAM_SIZE);
 	if (ret)
 		return ret;

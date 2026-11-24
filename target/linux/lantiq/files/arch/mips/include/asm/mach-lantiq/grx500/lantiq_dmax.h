@@ -936,6 +936,8 @@ extern int ltq_dma_chan_psudo_irq_handler_callback_cfg(u32 chan,
  * to caller to manipulate the DMA related stuff by itself
  */
 extern dma_addr_t ltq_dma_chan_get_desc_phys_base(u32 chan);
+extern int ltq_dma_chan_get_debug(u32 chan, u32 *cctrl, u32 *cdba,
+				  u32 *cdptnrd, u32 *cis, u32 *cie);
 
 /*!
  * \fn u32 ltq_dma_chan_get_desc_vir_base(u32 chan)

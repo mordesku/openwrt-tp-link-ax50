@@ -27,6 +27,8 @@
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/grx500-dcdp.h>
+#include <lantiq_dmax.h>
 #include <linux/skbuff.h>
 #include <linux/dma-mapping.h>
 #include <linux/pci.h>
@@ -829,25 +831,134 @@ int wave600_dma_mgmt_tx_eapol(struct wave600_radio *radio, const u8 *buf, size_t
 	return 0;
 }
 
+static int wave600_dma_rx_dc_mode0(struct wave600_dma *dma, int budget)
+{
+	struct wave600_dev *wdev = dma->wdev;
+	struct grx500_dcdp_port *port = wdev->dcdp_port;
+	void __iomem *descs;
+	int processed = 0;
+	u32 recycled = 0;
+
+	if (!port || !port->active || !port->rx_out.virt)
+		return 0;
+
+	/*
+	 * Hardware DMA1-TX mode: WAV654 writes rx_out descriptors directly
+	 * into the DMA1-TX channel ring, which feeds CBM -> GSWIP-R PAE.
+	 * port->rx_out.virt is uncached (ioremap) so we can read/clear
+	 * individual 16-byte descriptors without 32-byte cache-line collisions.
+	 * Reclaim descriptors already consumed by DMA1-TX (dw3 OWN bit
+	 * cleared to 0, dw3 != 0) and return the count to rx_ring.in_cntr.
+	 */
+	descs = (void __iomem *)port->rx_out.virt;
+	while (processed < budget) {
+		u32 idx = dma->dc_rx_read;
+		void __iomem *d = descs + idx * 16;
+		u32 dw2 = __raw_readl(d + 8);
+
+		if ((dw2 & BIT(31)) || !dw2)
+			break;
+
+		__raw_writel(0, d + 8);
+		__raw_writel(0, d + 12);
+
+		dma->dc_rx_read = (idx + 1) % port->rx_out.entries;
+		recycled++;
+		processed++;
+	}
+
+	if (recycled > 0 && dma->rx.in_cntr) {
+		wmb();
+		__raw_writel(recycled, dma->rx.in_cntr);
+		mmiowb();
+	}
+
+	if (processed > 0) {
+		u32 hds = ring_hds_to_process(&dma->rx);
+
+		if (hds > 0)
+			ring_clear_interrupt(&dma->rx, min_t(u32, processed, hds));
+	}
+	return processed;
+}
+
 static int wave600_dma_poll(struct napi_struct *napi, int budget)
 {
 	struct wave600_dma *dma = container_of(napi, struct wave600_dma, napi);
 	struct wave600_dev *wdev = dma->wdev;
+	bool dc_mode = wdev->dcdp_port && wdev->dcdp_port->active;
 	int work;
 
 	/* Drain IPC confirmations/indications while NAPI holds HOST_IRQ_MASK at 0 */
 	wave600_ipc_service_control(wdev);
-	wave600_dma_tx_clean(dma, WAVE600_DMA_RING_SIZE);
+	if (!dc_mode)
+		wave600_dma_tx_clean(dma, WAVE600_DMA_RING_SIZE);
 	wave600_dma_mgmt_tx_clean(dma, WAVE600_DMA_MGMT_RING_SIZE);
 	wave600_dma_mgmt_rx(dma, WAVE600_DMA_MGMT_RING_SIZE);
-	work = wave600_dma_rx(dma, budget);
+	if (dc_mode)
+		work = wave600_dma_rx_dc_mode0(dma, budget);
+	else
+		work = wave600_dma_rx(dma, budget);
 
 	if (work < budget) {
 		if (napi_complete_done(napi, work)) {
-			/* Re-enable host interrupts (vendor mask 0x2F) */
+			u32 mask = WAVE600_IRQ_ALL;
+
+			if (dc_mode) {
+				u32 irq_st = wave600_read32(wdev,
+						WAVE600_MAC_GEN_HOST_IRQ_STATUS);
+				u32 stuck = irq_st &
+					    (WAVE600_IRQ_RX | WAVE600_IRQ_TXOUT);
+
+				if (work == 0 && stuck) {
+					if (dma->dc_irq_stuck == 0) {
+						u32 *descs = (u32 *)wdev->dcdp_port->rx_out.virt;
+						const struct wave600_chi_ring *txc = &wdev->chi.basic.tx_ring;
+						const struct wave600_chi_ring *rxc = &wdev->chi.basic.rx_ring;
+
+						dev_info_once(wdev->dev,
+							      "DC_MODE_0 stuck IRQ diag: HOST_IRQ_STATUS=0x%08x rx_st=%u tx_st=%u tx_in=%u tx_in_st=%u tx_out=%u rx_in=%u rx_out=%u dc_rx_read=%u rx_out[0]=%08x,%08x,%08x,%08x rx_out[1]=%08x,%08x,%08x,%08x\n",
+							      irq_st,
+							      ring_hds_to_process(&dma->rx),
+							      ring_hds_to_process(&dma->tx),
+							      wave600_read32(wdev, txc->in_counter_addr),
+							      wave600_read32(wdev, txc->in_status_addr),
+							      wave600_read32(wdev, txc->out_counter_addr),
+							      wave600_read32(wdev, rxc->in_counter_addr),
+							      wave600_read32(wdev, rxc->out_counter_addr),
+							      dma->dc_rx_read,
+							      descs[0], descs[1], descs[2], descs[3],
+							      descs[4], descs[5], descs[6], descs[7]);
+					}
+					if (++dma->dc_irq_stuck >= 8) {
+						dma->dc_irq_suppress |= stuck;
+						dev_warn_once(wdev->dev,
+							      "DC_MODE_0: suppressing stuck IRQ bits 0x%08x (HOST_IRQ_STATUS=0x%08x, rx_st=%u, tx_st=%u)\n",
+							      dma->dc_irq_suppress,
+							      irq_st,
+							      ring_hds_to_process(&dma->rx),
+							      ring_hds_to_process(&dma->tx));
+					}
+				} else {
+					dma->dc_irq_stuck = 0;
+				}
+				mask &= ~dma->dc_irq_suppress;
+			}
+
+			/* Re-enable host interrupts (vendor mask 0x2F minus suppressed) */
 			wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK,
-					WAVE600_IRQ_ALL);
+					mask);
 			mmiowb();
+
+			if (dc_mode && wdev->dcdp_port->rx_out.virt) {
+				void __iomem *ro = (void __iomem *)wdev->dcdp_port->rx_out.virt;
+				u32 dw2;
+
+				ltq_dma_chan_irq_enable(wdev->dcdp_port->dma_ch);
+				dw2 = __raw_readl(ro + dma->dc_rx_read * 16 + 8);
+				if (dw2 && !(dw2 & BIT(31)))
+					napi_schedule(&dma->napi);
+			}
 		}
 	}
 
@@ -942,6 +1053,36 @@ netdev_tx_t wave600_dma_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		}
 	}
 
+	if (radio->dcdp_port && radio->dcdp_port->active) {
+		u16 subif_id = ((u16)radio->vap_id << 8) | 0xffu;
+		u32 skb_len = skb->len;
+		int ret;
+
+		if (!is_multicast_ether_addr(skb->data)) {
+			int sid = wave600_radio_find_sid(radio, skb->data);
+			struct wave600_station *sta = wave600_find_sta(radio, skb->data);
+
+			if (sid >= 0)
+				subif_id = ((u16)radio->vap_id << 8) | ((u16)sid & 0xffu);
+			if (sta) {
+				sta->tx_packets++;
+				sta->tx_bytes += skb_len;
+			}
+		}
+		ret = grx500_dcdp_xmit(radio->dcdp_port, subif_id, skb);
+		if (ret == 0) {
+			dma->tx_packets++;
+			ndev->stats.tx_packets++;
+			ndev->stats.tx_bytes += skb_len;
+			return NETDEV_TX_OK;
+		}
+		if (ret == -EBUSY)
+			dev_kfree_skb_any(skb);
+		dma->tx_dropped++;
+		ndev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
+
 	dma_addr = dma_map_single(wdev->dev, skb->data, skb->len,
 				  DMA_TO_DEVICE);
 	if (dma_mapping_error(wdev->dev, dma_addr))
@@ -1029,8 +1170,8 @@ drop:
 /* DATA_PATH_INIT (0x040E) - bind all four rings to the firmware       */
 /* ------------------------------------------------------------------ */
 
-/* Vendor DC_DP_RING_HW_MODE0 ring geometry (hw_mmb.c 7614-7616) */
-#define WAVE600_DC_RING_SIZE		512
+/* Vendor DC_DP_RING_HW_MODE0 ring geometry (hw_mmb.c 7614-7616, mhi_umi.h GEN5_*_RING_SIZE=4096) */
+#define WAVE600_DC_RING_SIZE		4096
 #define WAVE600_DC_HD_SIZE		16	/* GRX350_HW_HD_SIZE (4*4) */
 #define WAVE600_DC_HD_TXOUT_SIZE		4	/* GRX350_HW_HD_TXOUT_SIZE (4*1) */
 #define WAVE600_DATA_PATH_MODE_DC_NONE		0	/* mhi_umi.h DataPathMode_e: pure SW rings */
@@ -1081,26 +1222,41 @@ static int wave600_dma_data_path_init(struct wave600_dma *dma)
 	 * HOST_TO_MAC32 = cpu_to_le32, mtlkinc.h); the firmware programs
 	 * its ring engines from these exact values.
 	 */
-	p.tx_in_ring_start = cpu_to_le32((u32)dma->tx.dma);
-	p.tx_in_ring_size_bytes = cpu_to_le32(dma->tx.size * hd_sz);
-	p.tx_out_ring_start = cpu_to_le32((u32)dma->tx.dma);
-	p.tx_out_ring_size_bytes = cpu_to_le32(dma->tx.size * hd_sz);
-	p.rx_in_ring_start = cpu_to_le32((u32)dma->rx.dma);
-	p.rx_in_ring_size_bytes = cpu_to_le32(dma->rx.size * hd_sz);
-	p.rx_out_ring_start = cpu_to_le32((u32)dma->rx.dma);
-	p.rx_out_ring_size_bytes = cpu_to_le32(dma->rx.size * hd_sz);
+	if (wdev->dcdp_port && wdev->dcdp_port->active) {
+		struct grx500_dcdp_port *port = wdev->dcdp_port;
+
+		p.tx_in_ring_start = cpu_to_le32((u32)port->tx_in.phys);
+		p.tx_in_ring_size_bytes = cpu_to_le32(port->tx_in.entries * WAVE600_DC_HD_SIZE);
+		p.tx_out_ring_start = cpu_to_le32((u32)port->tx_out.phys);
+		p.tx_out_ring_size_bytes = cpu_to_le32(port->tx_out.entries * WAVE600_DC_HD_TXOUT_SIZE);
+		p.rx_in_ring_start = 0;
+		p.rx_in_ring_size_bytes = 0;
+		p.rx_out_ring_start = cpu_to_le32((u32)port->rx_out.phys);
+		p.rx_out_ring_size_bytes = cpu_to_le32(port->rx_out.entries * WAVE600_DC_HD_SIZE);
+		p.data_path_mode = WAVE600_DATA_PATH_MODE_DC_MODE_0;
+		p.ep3_msb = (0x0f & port->ep_id) >> 1;
+	} else {
+		p.tx_in_ring_start = cpu_to_le32((u32)dma->tx.dma);
+		p.tx_in_ring_size_bytes = cpu_to_le32(dma->tx.size * hd_sz);
+		p.tx_out_ring_start = cpu_to_le32((u32)dma->tx.dma);
+		p.tx_out_ring_size_bytes = cpu_to_le32(dma->tx.size * hd_sz);
+		p.rx_in_ring_start = cpu_to_le32((u32)dma->rx.dma);
+		p.rx_in_ring_size_bytes = cpu_to_le32(dma->rx.size * hd_sz);
+		p.rx_out_ring_start = cpu_to_le32((u32)dma->rx.dma);
+		p.rx_out_ring_size_bytes = cpu_to_le32(dma->rx.size * hd_sz);
+		p.data_path_mode = WAVE600_DATA_PATH_MODE_DC_NONE;
+		p.ep3_msb = 7;			/* vendor ep3Msb = 7 (hybrid log line 77) */
+	}
 	p.mang_tx_ring_start = cpu_to_le32((u32)dma->mgmt_tx.dma);
 	p.mang_tx_ring_size_bytes = cpu_to_le32(dma->mgmt_tx.size * hd_sz);
 	p.mang_rx_ring_start = cpu_to_le32((u32)dma->mgmt_rx.dma);
 	p.mang_rx_ring_size_bytes = cpu_to_le32(dma->mgmt_rx.size * hd_sz);
 	p.host_endianess_mode = 1;	/* HOST_ENDIANESS_MODE_BE (rule 22) */
 	p.hd_own_bit_value = 1;		/* WLAN_HOST_OWN_BIT_VALUE */
-	p.data_path_mode = WAVE600_DATA_PATH_MODE_DC_NONE;
 	p.cbm_fragmentation_wa_enable = 0;
 	p.fw_interface = wdev->radio_idx;
 	p.logger_max_stream_number = 1;	/* vendor rtlog default (old fixed 1) */
 	p.logger_rx_sid = cpu_to_le16(127); /* vendor HOST_TO_MAC16(127) */
-	p.ep3_msb = 7;			/* vendor ep3Msb = 7 (hybrid log line 77) */
 
 	return wave600_ipc_cmd(wdev, WAVE600_UM_MAN_DATA_PATH_INIT_REQ,
 			       WAVE600_MC_MAN_DATA_PATH_INIT_CFM,
@@ -1125,10 +1281,17 @@ static int wave600_netdev_stop(struct net_device *ndev)
 	return 0;
 }
 
+static int wave600_ndo_setup_tc(struct net_device *ndev, enum tc_setup_type type,
+				void *type_data)
+{
+	return grx500_dcdp_setup_tc(type, type_data);
+}
+
 const struct net_device_ops wave600_netdev_ops = {
 	.ndo_open = wave600_netdev_open,
 	.ndo_stop = wave600_netdev_stop,
 	.ndo_start_xmit = wave600_dma_start_xmit,
+	.ndo_setup_tc = wave600_ndo_setup_tc,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr = eth_validate_addr,
 };
@@ -1254,6 +1417,11 @@ void wave600_dma_reset_rings(struct wave600_dev *wdev)
 	for (i = 0; i < WAVE600_DMA_RING_SIZE; i++)
 		dma->tx_free_bds[i] = WAVE600_DMA_RING_SIZE - 1 - i;
 	dma->tx_free_top = WAVE600_DMA_RING_SIZE;
+	dma->dc_rx_read = 0;
+	if (wdev->dcdp_port && wdev->dcdp_port->rx_out.virt)
+		memset(wdev->dcdp_port->rx_out.virt, 0,
+		       (size_t)wdev->dcdp_port->rx_out.entries *
+		       wdev->dcdp_port->rx_out.entry_size);
 	dev_info(wdev->dev, "DMA host descriptor rings reset for recovery\n");
 }
 
@@ -1314,6 +1482,135 @@ __maybe_unused static int dc_rings_alloc(struct wave600_dev *wdev, struct wave60
  * later in card finalize (wave600_dma_data_path_start, vendor step
  * HW_DATA_PATH).
  */
+static ssize_t dc_diag_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct wave600_dev *wdev = pci_get_drvdata(pdev);
+	struct wave600_dma *dma;
+	const struct wave600_chi_basic *b;
+	int len = 0, i;
+
+	if (!wdev)
+		return -ENODEV;
+	dma = &wdev->dma;
+	b = &wdev->chi.basic;
+
+	len += sysfs_emit_at(buf, len,
+		"irq status=%08x mask=%08x phi=%08x vec=%08x suppress=%08x stuck=%u\n"
+		"bar0=%pa dp_ready=%u stats rx=%u tx=%u tx_done=%u tx_drop=%u dc_rx_read=%u\n"
+		"chi_tx in=%06x in_st=%06x out=%06x out_st=%06x be_in=%06x be_out=%06x\n"
+		"chi_rx in=%06x in_st=%06x out=%06x out_st=%06x be_in=%06x be_out=%06x\n",
+		wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_STATUS),
+		wave600_read32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK),
+		wave600_read32(wdev, WAVE600_MAC_GEN_PHI_IRQ),
+		wave600_read32(wdev, WAVE600_SOC_PCIE_INTR_VEC),
+		dma->dc_irq_suppress, dma->dc_irq_stuck,
+		&wdev->bar0_phys, dma->data_path_ready,
+		dma->rx_packets, dma->tx_packets, dma->tx_done,
+		dma->tx_dropped, dma->dc_rx_read,
+		b->tx_ring.in_counter_addr, b->tx_ring.in_status_addr,
+		b->tx_ring.out_counter_addr, b->tx_ring.out_status_addr,
+		b->tx_ring.in_counter_addr_be, b->tx_ring.out_freed_counter_addr_be,
+		b->rx_ring.in_counter_addr, b->rx_ring.in_status_addr,
+		b->rx_ring.out_counter_addr, b->rx_ring.out_status_addr,
+		b->rx_ring.in_counter_addr_be, b->rx_ring.out_freed_counter_addr_be);
+
+	for (i = 0; i < 2; i++) {
+		struct wave600_radio *r = &wdev->radios[i];
+		struct net_device *nd = r->ndev;
+
+		if (nd)
+			len += sysfs_emit_at(buf, len,
+				"radio%d=%s vap=%u up=%u carrier=%u qstop=%u rx=%lu tx=%lu drop=%lu\n",
+				i, nd->name, r->vap_id, !!netif_running(nd),
+				!!netif_carrier_ok(nd), !!netif_queue_stopped(nd),
+				nd->stats.rx_packets, nd->stats.tx_packets,
+				nd->stats.tx_dropped);
+	}
+
+	if (dma->rd_pool_off && dma->rd_size) {
+		for (i = 0; i < 2; i++)
+			len += sysfs_emit_at(buf, len,
+				"rd_pool[%d] addr=%08x idx=%u\n", i,
+				__raw_readl(wdev->bar0 + dma->rd_pool_off + i * dma->rd_size + dma->rd_payload_off),
+				__raw_readl(wdev->bar0 + dma->rd_pool_off + i * dma->rd_size + dma->rd_idx_off));
+	}
+
+	len += sysfs_emit_at(buf, len,
+		"tx  in=%08x in_st=%08x out=%08x out_st=%08x be_in=%08x be_out=%08x\n"
+		"rx  in=%08x in_st=%08x out=%08x out_st=%08x be_in=%08x be_out=%08x\n"
+		"mtx in=%08x in_st=%08x out=%08x out_st=%08x\n"
+		"mrx in=%08x in_st=%08x out=%08x out_st=%08x\n",
+		wave600_read32(wdev, b->tx_ring.in_counter_addr),
+		wave600_read32(wdev, b->tx_ring.in_status_addr),
+		wave600_read32(wdev, b->tx_ring.out_counter_addr),
+		wave600_read32(wdev, b->tx_ring.out_status_addr),
+		b->tx_ring.in_counter_addr_be ? wave600_read32(wdev, b->tx_ring.in_counter_addr_be) : 0,
+		b->tx_ring.out_freed_counter_addr_be ? wave600_read32(wdev, b->tx_ring.out_freed_counter_addr_be) : 0,
+		wave600_read32(wdev, b->rx_ring.in_counter_addr),
+		wave600_read32(wdev, b->rx_ring.in_status_addr),
+		wave600_read32(wdev, b->rx_ring.out_counter_addr),
+		wave600_read32(wdev, b->rx_ring.out_status_addr),
+		b->rx_ring.in_counter_addr_be ? wave600_read32(wdev, b->rx_ring.in_counter_addr_be) : 0,
+		b->rx_ring.out_freed_counter_addr_be ? wave600_read32(wdev, b->rx_ring.out_freed_counter_addr_be) : 0,
+		wave600_read32(wdev, b->mang_tx_ring.in_counter_addr),
+		wave600_read32(wdev, b->mang_tx_ring.in_status_addr),
+		wave600_read32(wdev, b->mang_tx_ring.out_counter_addr),
+		wave600_read32(wdev, b->mang_tx_ring.out_status_addr),
+		wave600_read32(wdev, b->mang_rx_ring.in_counter_addr),
+		wave600_read32(wdev, b->mang_rx_ring.in_status_addr),
+		wave600_read32(wdev, b->mang_rx_ring.out_counter_addr),
+		wave600_read32(wdev, b->mang_rx_ring.out_status_addr));
+
+	if (wdev->dcdp_port) {
+		struct grx500_dcdp_port *p = wdev->dcdp_port;
+
+		len += sysfs_emit_at(buf, len,
+			"dcdp active=%u ep=%u pid=%u tmu_port=%u q=%u umt=%u dma_cid=%u tx_in=%pa tx_out=%pa rx_out=%pa\n",
+			p->active, p->ep_id, p->cbm_pid, p->tmu_port,
+			p->tmu_queue, p->umt_id, p->dma_cid,
+			&p->tx_in.phys, &p->tx_out.phys, &p->rx_out.phys);
+
+		if (p->tx_in.virt) {
+			void __iomem *ti = p->tx_in.virt;
+
+			for (i = 0; i < 32; i++)
+				len += sysfs_emit_at(buf, len,
+					"tx_in[%02d]=%08x %08x %08x %08x\n",
+					i,
+					__raw_readl(ti + i * 16),
+					__raw_readl(ti + i * 16 + 4),
+					__raw_readl(ti + i * 16 + 8),
+					__raw_readl(ti + i * 16 + 12));
+		}
+		if (p->rx_out.virt) {
+			void __iomem *ro = (void __iomem *)p->rx_out.virt;
+			u32 n = p->rx_out.entries ? p->rx_out.entries : 1;
+			int off;
+
+			len += sysfs_emit_at(buf, len,
+				"arc_mips_ctl lm0=%08x lm1=%08x um=%08x\n",
+				wave600_read32(wdev, WAVE600_SYS_IF_LM0_MIPS_CTL),
+				wave600_read32(wdev, WAVE600_SYS_IF_LM1_MIPS_CTL),
+				wave600_read32(wdev, WAVE600_SYS_IF_UM_MIPS_CTL));
+			for (off = -2; off <= 2; off++) {
+				u32 idx = (dma->dc_rx_read + n + off) % n;
+				void __iomem *d = ro + idx * 16;
+
+				len += sysfs_emit_at(buf, len,
+					"rx_out[%u]=%08x %08x %08x %08x\n",
+					idx,
+					__raw_readl(d), __raw_readl(d + 4),
+					__raw_readl(d + 8), __raw_readl(d + 12));
+			}
+		}
+	}
+
+	return len;
+}
+static DEVICE_ATTR_RO(dc_diag);
+
 int wave600_dma_init(struct wave600_dev *wdev)
 {
 	struct wave600_dma *dma = &wdev->dma;
@@ -1364,6 +1661,30 @@ int wave600_dma_init(struct wave600_dev *wdev)
 		goto err_pool;
 	}
 
+	if (!wdev->aux && wdev->bar0_phys && wdev->chi.basic.tx_ring.in_counter_addr) {
+		u32 umt_dst = (u32)(wdev->bar0_phys +
+				    wdev->chi.basic.tx_ring.in_counter_addr);
+		int i;
+
+		for (i = 0; i < 2; i++) {
+			u32 ep = (i == 0) ? GRX500_DCDP_EP_WLAN0 : GRX500_DCDP_EP_WLAN1;
+			int dc_ret = grx500_dcdp_register_radio(ep, NULL, umt_dst,
+								  WAVE600_DC_RING_SIZE,
+								  &wdev->radios[i].dcdp_port);
+			if (dc_ret) {
+				dev_warn(wdev->dev,
+					 "DirectConnect DC_MODE_0 radio%d unavailable (%d), using DC_NONE\n",
+					 i, dc_ret);
+				wdev->radios[i].dcdp_port = NULL;
+			}
+		}
+		/* Primary port for shared rx_out ring and UMI config */
+		wdev->dcdp_port = wdev->radios[0].dcdp_port;
+	}
+
+	if (!wdev->aux)
+		device_create_file(wdev->dev, &dev_attr_dc_diag);
+
 	return 0;
 
 err_pool:
@@ -1402,6 +1723,23 @@ int wave600_dma_data_path_start(struct wave600_dev *wdev)
  * Bind the AP netdevs (created by the cfg80211 layer, which owns their
  * lifecycle) to the DMA layer: NAPI, carrier state and TX queues.
  */
+static int wave600_dcdp_get_subif(struct net_device *ndev, const u8 *mac,
+				  u16 *subif_id)
+{
+	struct wave600_radio *radio = wave600_ndev_to_radio(ndev);
+	int sid;
+
+	if (!radio || !mac || !subif_id)
+		return -EINVAL;
+
+	sid = wave600_radio_find_sid(radio, mac);
+	if (sid < 0)
+		return -ENOENT;
+
+	*subif_id = ((u16)radio->vap_id << 8) | ((u16)sid & 0xffu);
+	return 0;
+}
+
 void wave600_dma_attach(struct wave600_dev *wdev)
 {
 	struct wave600_dma *dma = &wdev->dma;
@@ -1414,6 +1752,9 @@ void wave600_dma_attach(struct wave600_dev *wdev)
 		struct net_device *ndev = wdev->radios[i].ndev;
 
 		if (ndev) {
+			if (wdev->radios[i].dcdp_port && wdev->radios[i].dcdp_port->active)
+				grx500_dcdp_bind_netdev(wdev->radios[i].dcdp_port, ndev,
+							wave600_dcdp_get_subif);
 			netif_carrier_off(ndev);
 			netif_tx_stop_all_queues(ndev);
 			netif_start_queue(ndev);
@@ -1421,14 +1762,33 @@ void wave600_dma_attach(struct wave600_dev *wdev)
 	}
 }
 
+static irqreturn_t wave600_dcdp_dma_irq(int irq, void *dev_id)
+{
+	struct wave600_dev *wdev = dev_id;
+	struct wave600_dma *dma = &wdev->dma;
+
+	if (wdev->dcdp_port && wdev->dcdp_port->active)
+		ltq_dma_chan_irq_disable(wdev->dcdp_port->dma_ch);
+	if (dma->data_path_ready && dma->napi_added)
+		napi_schedule(&dma->napi);
+	return IRQ_HANDLED;
+}
+
 void wave600_dma_enable_napi(struct wave600_dev *wdev)
 {
 	struct wave600_dma *dma = &wdev->dma;
 
+	dma->dc_rx_read = 0;
 	init_dummy_netdev(&dma->napi_dev);
 	netif_napi_add(&dma->napi_dev, &dma->napi, wave600_dma_poll);
 	napi_enable(&dma->napi);
 	dma->napi_added = true;
+	if (wdev->dcdp_port && wdev->dcdp_port->active) {
+		if (ltq_dma_chan_irq_callback_cfg(wdev->dcdp_port->dma_ch,
+						  wave600_dcdp_dma_irq,
+						  wdev) == 0)
+			ltq_dma_chan_irq_enable(wdev->dcdp_port->dma_ch);
+	}
 }
 
 void wave600_dma_stop_netdev(struct wave600_dev *wdev)
@@ -1436,16 +1796,20 @@ void wave600_dma_stop_netdev(struct wave600_dev *wdev)
 	struct wave600_dma *dma = &wdev->dma;
 	int i;
 
+	if (wdev->dcdp_port && wdev->dcdp_port->active)
+		ltq_dma_chan_irq_disable(wdev->dcdp_port->dma_ch);
 	if (dma->napi_added) {
+		dma->napi_added = false;
 		napi_disable(&dma->napi);
 		netif_napi_del(&dma->napi);
-		dma->napi_added = false;
 	}
 	for (i = 0; i < 2; i++) {
 		struct net_device *ndev = wdev->radios[i].ndev;
 
-		if (ndev)
+		if (ndev) {
+			grx500_dcdp_unbind_netdev(ndev);
 			netif_tx_disable(ndev);
+		}
 	}
 }
 
@@ -1454,6 +1818,20 @@ void wave600_dma_cleanup(struct wave600_dev *wdev)
 	struct wave600_dma *dma = &wdev->dma;
 	int i;
 
+	if (!wdev->aux)
+		device_remove_file(wdev->dev, &dev_attr_dc_diag);
+
+	if (wdev->dcdp_port || wdev->radios[1].dcdp_port) {
+		for (i = 0; i < 2; i++) {
+			if (wdev->radios[i].ndev)
+				grx500_dcdp_unbind_netdev(wdev->radios[i].ndev);
+			if (wdev->radios[i].dcdp_port) {
+				grx500_dcdp_unregister_radio(wdev->radios[i].dcdp_port);
+				wdev->radios[i].dcdp_port = NULL;
+			}
+		}
+		wdev->dcdp_port = NULL;
+	}
 	dma->data_path_ready = false;
 	rx_bufs_free(dma, dma->rx_bufs, dma->rd_pool_num);
 	rx_bufs_free(dma, dma->mgmt_bufs, dma->rd_mgmt_num);

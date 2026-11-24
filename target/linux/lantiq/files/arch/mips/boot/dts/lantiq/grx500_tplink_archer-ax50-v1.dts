@@ -17,6 +17,7 @@
 		dma2 = &dma1rx;
 		dma3 = &dma2tx;
 		dma4 = &dma2rx;
+		dma5 = &dma3;
 		led-boot = &led_power;
 		led-failsafe = &led_power;
 		led-running = &led_power;
@@ -261,6 +262,23 @@
 		lantiq,dma-polling-cnt = <24>;
 		lantiq,dma-chan-fc = <0>;
 		lantiq,dma-desc-fod = <1>;
+		lantiq,dma-desc-in-sram = <1>;
+		lantiq,dma-drb = <0>;
+		lantiq,dma-byte-en = <1>;
+		lantiq,budget = <20>;
+		status = "okay";
+	};
+
+	dma3: dma@1e300000 {
+		compatible = "lantiq,dma-grx500";
+		reg = <0x1e300000 0x100000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 77 IRQ_TYPE_LEVEL_HIGH>;
+		lantiq,dma-pkt-arb = <2>;
+		lantiq,dma-burst = <16>;
+		lantiq,dma-polling-cnt = <24>;
+		lantiq,dma-chan-fc = <0>;
+		lantiq,dma-desc-fod = <0>;
 		lantiq,dma-desc-in-sram = <1>;
 		lantiq,dma-drb = <0>;
 		lantiq,dma-byte-en = <1>;

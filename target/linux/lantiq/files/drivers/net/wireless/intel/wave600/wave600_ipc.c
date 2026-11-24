@@ -594,7 +594,8 @@ static void wave600_ipc_tasklet_fn(struct tasklet_struct *t)
 		return;
 
 	/* Re-enable host interrupts (vendor single-IRQ legacy mask MTLK_IRQ_ALL) */
-	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK, WAVE600_IRQ_ALL);
+	wave600_write32(wdev, WAVE600_MAC_GEN_HOST_IRQ_MASK,
+			WAVE600_IRQ_ALL & ~wdev->dma.dc_irq_suppress);
 	mmiowb();
 }
 
