@@ -44,6 +44,8 @@ static struct wave600_station *wave600_add_sta_entry(struct wave600_radio *radio
 		sta->sid = sid;
 		sta->connect_time = ktime_get_seconds();
 		sta->last_rx = jiffies;
+		sta->last_fw_tsf = 0;
+		sta->last_fw_rx_time = 0;
 		return sta;
 	}
 

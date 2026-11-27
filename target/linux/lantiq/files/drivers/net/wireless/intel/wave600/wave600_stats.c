@@ -663,8 +663,17 @@ void wave600_stats_update_telemetry(struct wave600_dev *wdev)
 
 				u32 prate_word = le32_to_cpu(sstatus->phy_rate);
 				u32 hw_r = (prate_word >> 4) & 0x1FFFF;
+				u32 fw_tsf = le32_to_cpu(sstatus->last_tsf);
+				u32 fw_rx_time = le32_to_cpu(sstatus->per_client_rx_time_usage);
+
 				if (hw_r > 0 && hw_r < 0x1FFFF)
 					sta->rx_bitrate = hw_r;
+				if ((fw_tsf && fw_tsf != sta->last_fw_tsf) ||
+				    (fw_rx_time && fw_rx_time != sta->last_fw_rx_time)) {
+					sta->last_fw_tsf = fw_tsf;
+					sta->last_fw_rx_time = fw_rx_time;
+					sta->last_rx = jiffies;
+				}
 			}
 
 			/* Decode TX Link Adaptation metrics from stats->db */

@@ -36,6 +36,8 @@ struct wave600_station {
 	bool valid;
 	u32 connect_time;
 	unsigned long last_rx;
+	u32 last_fw_tsf;
+	u32 last_fw_rx_time;
 	s8 signal;
 	s8 signal_avg;
 	bool is_authorized;
